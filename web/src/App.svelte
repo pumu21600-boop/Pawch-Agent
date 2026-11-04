@@ -552,21 +552,38 @@
       const d = await r.json();
       if (!r.ok || d.error) throw new Error(d.error || `HTTP ${r.status}`);
       wsModalOpen = false;
-      // 工作区变了：会话/消息/圆环全部重置，重新拉列表（各会话缓冲与排队一并清掉）
       setCurSession(null);
-      // 在跑的流一并断开登记（服务端那轮继续跑——SSE 断 ≠ 取消，坑 26）。不清的话
-      // 切回来 loadSession 走「本地缓冲」分支，拿到的是刚被清空的缓冲，历史全不见
-      // （2026-09-27 真机实测「切界面丢对话内容」）；断开后对账轮询会把跑完的内容补回来。
-      const deadStreams = Object.values(streams);
-      streams = {};
+      // 工作区变了：会话/消息/圆环重置，重新拉列表。
+      // **例外：还在跑的会话原样留着**（流 + 缓冲 + 排队 + 账本）——切工作区只是换视图，
+      // 不是取消（SSE 断 ≠ 取消，服务端那轮还在跑）。以前一律 abort+清空，切回来看到的是
+      // 落盘快照：界面显示本轮已结束（带统计行），服务端却还在跑，引导按钮也跟着失效
+      // （2026-11-05 真机：操作电脑自己切走工作区，人就没法引导了）。
+      const liveStreams = {};
+      const liveMsgs = {};
+      const liveOut = {};
+      const liveUsage = {};
+      const liveGuided = {};
+      for (const k of Object.keys(streams)) {
+        const st = streams[k];
+        if (!st) continue;
+        // '@new' 不保留：会话 id 还没到手，rekey 会把它当成当前会话切过去（跨工作区串台）
+        if (k === '@new') {
+          try { st.controller.abort(); } catch {}
+          continue;
+        }
+        liveStreams[k] = st;
+        if (sessionMsgs[k]) liveMsgs[k] = sessionMsgs[k];
+        if (outbox[k]) liveOut[k] = outbox[k];
+        if (usageBySession[k]) liveUsage[k] = usageBySession[k];
+        if (guided[k]) liveGuided[k] = guided[k];
+      }
+      streams = liveStreams;
       streaming = false;
       controller = null;
-      for (const st of deadStreams) {
-        try { st.controller.abort(); } catch {}
-      }
-      sessionMsgs = {};
-      outbox = {};
-      usageBySession = {}; // 旧项目的会话账本一并清
+      sessionMsgs = liveMsgs;
+      outbox = liveOut;
+      usageBySession = liveUsage;
+      guided = liveGuided;
       syncCur();
       restoreUsage('@new');
       await loadSettings();
