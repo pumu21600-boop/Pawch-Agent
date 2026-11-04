@@ -1,0 +1,104 @@
+# 施工单 001 配置
+# base_url 从本文件读；也可用环境变量 DEEPSEEK_BASE_URL 覆盖（商汤中转等渠道，不用改代码）
+
+[paths]
+# 应用数据目录：settings / 会话 / 日志 / 记忆 / 插件 / 插件数据 / 技能 / 缓存 都在这里。
+# 空 = 用首次启动时用户选择的目录（默认建议 %USERPROFILE%\.pawch-agent）；
+# 手工填写则优先生效（覆盖首次选择）。选完不需要改本文件，也能随时改成任意可写目录。
+data_dir = ""
+
+[server]
+host = "127.0.0.1"
+# 主服务端口（用户习惯地址；前端热更服务器见 dev.bat，走 5174 并反代到这里）
+port = 5173
+
+[gateway]
+# DeepSeek 官方渠道
+base_url = "https://api.deepseek.com"
+model = "deepseek-chat"
+# 换渠道示例（形如 OpenAI 兼容的 /chat/completions 前缀）：
+# base_url = "https://<渠道域名>/v1"
+# 本地限流：每分钟最多发起多少次模型请求；0=不限。超出时请求排队等待（不报错）
+max_rpm = 0
+# 降级链：主渠道当轮调用失败时按序切换的配置（写 settings 里的配置名，逗号分隔多个）
+# fallback_configs = ["配置 2", "商汤主力"]
+
+# 角色映射：辅助功能用专用渠道（写 settings 里的配置名或配置 id）；
+# 未配置的角色回落主渠道。EMBEDDING 不走主渠道兜底——未配置时记忆库用本地哈希向量。
+[roles]
+# summary = "配置 2"   # 滚动摘要专用渠道
+# title = "配置 2"     # 会话标题生成专用渠道
+# embedding = "配置 2" # 向量嵌入专用渠道（须支持 OpenAI 兼容 /embeddings）
+# budget = "配置 2"    #  降级渠道：单任务累计 token 超 [hooks] budget_tokens 后，剩余步骤改走它
+# subagent = "配置 2"  #  子代理专用渠道（未配 = 回落主渠道；主会话旗舰、子代理跑量用便宜模型）
+
+# 子代理并行度（docs/subagent-draft.md 第 1 节）
+[subagent]
+# 全局并发子代理上限（0 = 不允许派发子代理）
+max_concurrent = 3
+# 单个父任务的活跃子代理上限（满员进队列等，出队即跑，不丢不串）
+per_parent = 2
+
+[cost]
+# 成本台账红线：全局花费上限（美元，硬闸）。台账累计花费达到即拒绝新的模型请求
+# （主对话与摘要/标题等辅助调用同一道闸），调高上限即恢复；0 = 不限（默认）。
+# 单价表在同级 prices.json（美元 / 1M tokens，带生效时间；缺省全部记录未计价）。
+spend_cap_usd = 0.0
+
+# 提示缓存保留档（缓存命中率旋钮，默认 short）：
+#   short = 标准保留（Anthropic ephemeral 5 分钟 / OpenAI 默认 5-10 分钟）
+#   long  = 长保留（Anthropic ttl 1h / OpenAI 24h）——仅官方端点认，其余静默降级 short
+#   none  = 不发任何缓存标记（断点 / prompt_cache_key / TTL 全不出现）
+# 命中率的大头在前缀稳定（system 提示与工具定义逐字节不变），保留档只决定缓存条目
+# 活多久：暂停超过保留时长后的第一轮会重新写一次缓存，之后又全命中。
+cache_retention = "short"
+
+[logging]
+dir = "logs"
+file = "agent.jsonl"
+# 单文件轮转上限（MB）：超过就归档成 agent.jsonl.1 再开新文件；0=不轮转
+max_mb = 20
+# 归档保留份数：agent.jsonl.1（最新）… agent.jsonl.N（最旧），更旧的丢弃；0=归档即删
+keep_archives = 3
+
+[agent]
+# 核心循环（施工单 003）
+# 单任务模型决策步数上限：0 = 不限（大项目 100+ 次工具调用是常态，
+# 上限只防死循环，而防死循环有取消/重复调用保护/花费硬闸三道缰绳，不该由步数砍任务）
+max_steps = 0
+tool_result_max_chars = 8000
+# 审批默认档（四档，前端可即时切换）：read-only / sandbox / auto / full-access
+# 只读=写/执行逐次询问 · 沙箱=只在沙箱执行，工作区与电脑都不改 ·
+# 自动=可动工作区与整台电脑（越界写按高危先问） · 完全访问=全免审 + 本机直跑（需 allow_unsandboxed）
+default_approval = "auto"
+# 完全访问（脱沙箱）总开关：true 后前端才允许切「完全访问」档（完整用户权限，命令继承你的全部环境）
+allow_unsandboxed = true
+# 完全访问档下，执行类命令是否仍要审批（false=连审批一起跳过，Codex Full Access 等价）
+unsandboxed_approval = false
+# 019：沙箱隔离模式与网络出向见下方 [sandbox] 节
+
+[sandbox]
+# 019：隔离模式（实验特性）："restricted"（默认，受限 token 权限笼）| "appcontainer"（LowBox + 能力 SID）
+# appcontainer 模式：默认断网（无 INTERNET_CLIENT 能力）；工作区目录自动授 ACE；异常时切回 restricted 即可
+# mode = "restricted"  # 切 appcontainer：mode = "appcontainer"（实验特性，真机验证 cmd/git 可用、默认断网）
+# allow_network = false
+
+[context]
+# 上下文预算：全 messages 超过此 token 估算值才触发裁剪
+budget_tokens = 96000
+recent_tool_results_kept = 6
+# 单条工具结果字符硬上限：超限按头 60%/尾 40% 压缩并标注（0=关闭）
+max_tool_result_chars = 16000
+
+[recovery]
+# 恢复与续命：danger≥1 工具执行前拍影子仓库检查点（<workspace>/.agent/shadow）
+checkpoint_enabled = true
+
+[memory]
+# 记忆 v1：总开关（false 时 events.log/index/AGENTS.md 注入/滚动摘要全停）
+enabled = true
+# 敏感落盘：false（默认）时 events.log 里的 sk-/Bearer/api_key 打码后才写
+persist_sensitive = false
+# 自动记忆 profile.md 的字符硬顶（一把尺子，约 2.5k-3.3k token）；预警线 = 80%（2000）。
+# 到顶后 agent 拒绝继续写，用户三选一：压缩旧条目 / 归档到文件 / 调这个值（重启生效）
+profile_max_chars = 2500

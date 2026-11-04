@@ -1,0 +1,1382 @@
+//! 网关 —— OpenAI 兼容 /chat/completions 单实现（施工单 001）+ 模型列表获取。
+//!
+//! base_url / model / api_key 全部由调用方（设置系统）动态传入，不再写死。
+//! api_key 只出现在内存中的 Authorization 头，绝不写日志/文件。
+//! 采样参数、本地限流（max_rpm）、embeddings 接口。
+//! 思考参数按「端点探测（compat）+ reasoning_effort 档位解析（effort）」组装，词表与规则
+//! 移植自 OpenClaw v2026.8.2 packages/ai（此后按厂商规范与实测多轮修订）；响应端支持
+//! reasoning_content/reasoning/reasoning_text/reasoning_details 四字段 + 14 种思考标签剥离；
+//! 发送前按端点契约净化历史（回放字段/developer 角色/空消息过滤）。
+//! （施工单 030）：**计量收口在网关单点**——stream_chat / complete 是全部模型流量的
+//! 唯一出入口，每次调用记一条用量台账（token 三路分计量 + 状态 + 延迟），
+//! 并在发送前过「全局花费上限」硬闸。
+
+use std::sync::{Arc, RwLock};
+use std::time::Instant;
+
+use anyhow::{Context, anyhow};
+use futures_util::StreamExt;
+use serde_json::{Value, json};
+
+use crate::core::cancel::CancelFlag;
+use crate::observability::{self, EventType};
+
+pub mod anthropic;
+pub mod compat;
+pub mod effort;
+pub mod providers;
+pub mod replay;
+pub mod tags;
+
+pub mod openai;
+mod accounting;
+
+pub use accounting::*;
+pub use openai::*;
+
+#[cfg(test)]
+mod tests;
+use compat::{CacheRetention, Compat, Protocol, ThinkingFormat};
+use providers::ProviderPreset;
+use tags::TagSplit;
+
+/// 从字节缓冲头部切出第一行（含 '\n'）并解码为 String；没有完整行则返回 None。
+/// 跨分片的 UTF-8 字符（汉字 3 字节被网络分片切开）不完整时留在 buf 里等后续
+/// 字节——逐分片 `from_utf8_lossy` 会把它们碎成 U+FFFD 永久进正文（N1）。
+pub(crate) fn take_line(buf: &mut Vec<u8>) -> Option<String> {
+    let pos = buf.iter().position(|&b| b == b'\n')?;
+    let raw: Vec<u8> = buf.drain(..=pos).collect();
+    let decoded = String::from_utf8_lossy(&raw[..raw.len() - 1]); // 末字节是 '\n'
+    Some(decoded.trim_end_matches('\r').to_string())
+}
+
+pub struct Gateway {
+    /// 热可重建的 HTTP 客户端：reqwest 在构建时固化系统代理设置，
+    /// 之后 Clash 开/关/换节点不会自动跟进。网络层失败时 rebuild_client()
+    /// 重新读系统代理，服务不用重启就能自愈。
+    client: RwLock<reqwest::Client>,
+    /// 环回渠道专用客户端（no_proxy）：本地模型服务（ollama/lmstudio/mnn/
+    /// llamacpp 预设全是 127.0.0.1/localhost 端点）经代理必坏——代理连自己的
+    /// localhost 回 502，用户却看到「渠道返回 502」。reqwest 默认不排除环回
+    /// （注释里写了多年的「ProxyOverride 环回绕代理」其实从未实现），2026-10-08
+    /// 补上：base_url 是环回主机时 send() 换这个客户端。
+    loopback_client: reqwest::Client,
+    /// 本地限流：Some=请求间最小间隔（60/max_rpm 秒，向上取整），None=不限。
+    throttle: Option<Throttle>,
+    /// 思考参数自适应降级登记：渠道 400 拒收思考字段后剥参重试成功，
+    /// 这里记下「base_url|model」，后续请求直接不发思考字段（每轮渠道组装时出人话提示）。
+    thinking_degraded: RwLock<std::collections::HashSet<String>>,
+}
+
+/// 请求体的 JSONL 摘要（完整体走 `observability::debug` 控制台，见调用处注释）。
+///
+/// 为什么必须摘要：完整 body 含 messages 全历史 + tools，长任务单条 2MB+，每步一条
+/// 就把 20MB 轮转上限撞穿——归档只留 3 份，`task.start` 被删掉而后续工具事件还在，
+/// 时间线任务边界丢失（2026-10-06 真机实测「刷不出来」根因）。
+///
+/// 摘要保留排查需要的全部维度：模型、条数、字符数、工具数、以及每条消息的角色与
+/// 字符数（定位「哪一轮把历史撑大了」看这个就够，不必翻完整体）。
+fn request_summary(body: &Value) -> Value {
+    let msgs = body.get("messages").and_then(Value::as_array);
+    let tools = body.get("tools").and_then(Value::as_array);
+    let per_msg: Vec<Value> = msgs
+        .map(|m| {
+            m.iter()
+                .map(|x| {
+                    json!({
+                        "role": x.get("role").and_then(Value::as_str).unwrap_or(""),
+                        "chars": x.get("content").and_then(Value::as_str).map(|s| s.chars().count())
+                            .or_else(|| x.get("content").map(|c| c.to_string().chars().count()))
+                            .unwrap_or(0),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({
+        "model": body.get("model").and_then(Value::as_str).unwrap_or(""),
+        "stream": body.get("stream"),
+        "messages": msgs.map(|m| m.len()).unwrap_or(0),
+        "message_chars": per_msg.iter().map(|m| m["chars"].as_u64().unwrap_or(0)).sum::<u64>(),
+        "per_message": per_msg,
+        "tools": tools.map(|t| t.len()).unwrap_or(0),
+    })
+}
+
+/// 请求参数：全部可选，None=不发字段走渠道默认。
+/// 思考接线不再自带厂商字段——由 compat 按端点探测；用户设置只有开/关 + 档位。
+#[derive(Debug, Clone)]
+pub struct ChatParams {
+    pub max_tokens: Option<u64>,
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    /// 思考档位请求：Some("on")/Some("off")/Some("low"|"medium"|"high"|"xhigh"|"max"|"minimal")；
+    /// None=渠道默认（不发思考参数）。on 在 effort 侧解析为 medium，布尔/对象侧一律开。
+    pub thinking: Option<String>,
+    /// 渠道配置的 thinking_format 覆盖（providers.json 预设或设置面板）；None=端点探测。
+    pub thinking_format: Option<ThinkingFormat>,
+    /// 端点探测线索：渠道预设 id 与实际 base_url（build_body 内部探测用）。
+    pub provider_id: Option<String>,
+    pub base_url: Option<String>,
+    /// A3 能力标记「工具调用」闭环（施工单 012）：false 时核心循环不携带 tools 参数，
+    /// 模型无法发起新工具调用；历史消息里的 tool_calls 回放不受影响。默认 true。
+    pub tools_enabled: bool,
+    /// 能力标记「图片解析」（用户手勾的 caps.vision）：决定 tool 结果里的截图怎么投递。
+    /// true=模型能看图（OpenAI 协议下图片挪进紧随其后的 user 消息；Anthropic 原生
+    /// 放在 tool_result 里）；false=核心循环先找视觉角色转文字，再不行才压平成人话。
+    /// 判据是**模型能力**，不是协议/渠道——协议只决定图放在哪个字段（2026-11-02 统一）。
+    pub vision: bool,
+    /// 提示缓存保留档（[cost] cache_retention）：决定是否发 cache_control 断点 /
+    /// prompt_cache_key / 长保留 TTL。默认 Short（对齐 pi-ai 的 cacheRetention 默认档）。
+    pub cache_retention: CacheRetention,
+}
+
+impl Default for ChatParams {
+    fn default() -> Self {
+        Self {
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            thinking: None,
+            thinking_format: None,
+            provider_id: None,
+            base_url: None,
+            tools_enabled: true,
+            vision: false,
+            cache_retention: CacheRetention::Short,
+        }
+    }
+}
+
+/// 提示缓存保留档（config.toml [cost] cache_retention）：进程级单值，启动时装载，
+/// 与 `usage::set_cap` 同款生命周期（config.toml 本就重启生效）。
+/// 各处组装 ChatParams 时读它——渠道级无单独档位，缓存是账号级前缀属性。
+static CACHE_RETENTION: std::sync::RwLock<CacheRetention> = std::sync::RwLock::new(CacheRetention::Short);
+
+pub fn set_cache_retention(r: CacheRetention) {
+    if let Ok(mut g) = CACHE_RETENTION.write() {
+        *g = r;
+    }
+}
+
+pub fn cache_retention() -> CacheRetention {
+    CACHE_RETENTION.read().map(|g| *g).unwrap_or(CacheRetention::Short)
+}
+
+impl ChatParams {
+    /// 从供应商预设取覆盖字段（用户设置字段由调用方另行填入）。
+    pub fn from_preset(p: &ProviderPreset) -> Self {
+        Self {
+            thinking_format: p.thinking_format,
+            provider_id: Some(p.id.clone()),
+            ..Default::default()
+        }
+    }
+}
+
+/// 本地限流器：请求间保证最小间隔，排队等待而非拒绝。
+struct Throttle {
+    min_interval: std::time::Duration,
+    last: tokio::sync::Mutex<Option<Instant>>,
+}
+
+impl Throttle {
+    fn new(max_rpm: u32) -> Self {
+        // ceil(60_000 / rpm) ms；rpm=0 不该走到这（Gateway 里已判空）
+        let ms = (60_000f64 / max_rpm.max(1) as f64).ceil() as u64;
+        Self { min_interval: std::time::Duration::from_millis(ms.max(1)), last: tokio::sync::Mutex::new(None) }
+    }
+
+    async fn gate(&self) {
+        let wait = {
+            let mut last = self.last.lock().await;
+            let w = match *last {
+                Some(t) => self
+                    .min_interval
+                    .checked_sub(t.elapsed())
+                    .unwrap_or(std::time::Duration::ZERO),
+                None => std::time::Duration::ZERO,
+            };
+            if w.is_zero() {
+                *last = Some(Instant::now());
+            }
+            w
+        };
+        if !wait.is_zero() {
+            observability::event(
+                EventType::State,
+                json!({ "kind": "gateway.throttle", "wait_ms": wait.as_millis() as u64 }),
+            );
+            tokio::time::sleep(wait).await;
+            // 睡完补记时间戳，保证下一发的间隔基准
+            *self.last.lock().await = Some(Instant::now());
+        }
+    }
+}
+
+fn build_client() -> reqwest::Client {
+    // 构建失败（TLS 后端异常等）不该 panic 拖垮整个服务：退回默认配置的客户端，
+    // 超时/连接超时用默认值，比「网关起不来」好得多。
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .connect_timeout(std::time::Duration::from_secs(15))
+        // HTTP/1.1 固定（2026-11-01）：同渠道同模型、同一台机器上，ZCode（Node/undici，
+        // 只会 HTTP/1.1）的长流一次没断过，而本进程跑 reqwest 默认协商 HTTP/2（实测该
+        // 渠道 ALPN 返回 h2），69 秒 / 2.6MB 的长流被对端 RST 掉。h2 的长连接在国内到
+        // Cloudflare 的链路上更容易被中间盒/边缘重置。SSE 走 h1.1 完全够用（体量差异
+        // 只在多路复用，单流没有收益），降级到 ZCode 同款传输层换稳定。
+        .http1_only()
+        .build()
+        .unwrap_or_else(|e| {
+            crate::observability::try_event(
+                crate::observability::EventType::State,
+                serde_json::json!({ "kind": "gateway.client_fallback", "error": e.to_string() }),
+            );
+            reqwest::Client::new()
+        })
+}
+
+/// 环回专用客户端：显式清掉所有代理并关掉系统代理自动探测——本地模型端点
+/// （127.0.0.1/localhost/::1）的请求永不经代理。
+fn build_loopback_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .no_proxy()
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// 已收到的 usage 三元组：取消/打断/读流失败时也要记账，别丢掉已经产生的费用。
+fn partial_tokens(t: &AssistantTurn) -> (u64, u64, u64) {
+    (t.prompt_tokens.unwrap_or(0), t.completion_tokens.unwrap_or(0), t.cached_tokens.unwrap_or(0))
+}
+
+/// 日志/事件里的 URL 脱敏：剥掉 `user:pass@` 凭据段，避免账号密码落进日志与台账
+/// （2026-11-02 审计：base_url 里嵌的凭据原来会原样写进 ledger.jsonl 和事件）。
+fn redact_url(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(mut u) if !u.username().is_empty() || u.password().is_some() => {
+            let _ = u.set_username("");
+            let _ = u.set_password(None);
+            u.to_string()
+        }
+        _ => url.to_string(),
+    }
+}
+
+/// base_url 是否指向环回主机（本地模型服务）：是则 send() 换 loopback_client。
+/// 本地端点经代理必坏（代理连自己的 localhost，回 502），而 reqwest 默认不排除
+/// 环回——注释里写了多年的「ProxyOverride 环回绕代理」其实从未实现，2026-10-08 补。
+fn is_loopback_base_url(base_url: &str) -> bool {
+    let after_scheme = base_url
+        .trim()
+        .split_once("://")
+        .map(|(_, r)| r)
+        .unwrap_or_else(|| base_url.trim());
+    let host = after_scheme.split('/').next().unwrap_or("");
+    let host = host.rsplit('@').next().unwrap_or(host); // 剥 user:pass@
+    // [::1]:8080 先去括号；其余按第一个 : 剥端口（IPv6 无括号形态不常见，不特殊处理）
+    let host = if let Some(rest) = host.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        host.split(':').next().unwrap_or(host)
+    };
+    let host = host.trim().to_lowercase();
+    if host == "localhost" || host == "::1" {
+        return true;
+    }
+    // 127.0.0.0/8：四段全数字且首段是 127
+    let mut it = host.split('.');
+    it.next() == Some("127") && it.clone().count() == 3 && it.all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// 网络错误的完整因果链（2026-11-01 实锤修）：reqwest 0.12 的 Display 即使带 `{:#}`
+/// 也只打「error decoding response body」这类泛化文案（源码 error.rs 里 Display 从不
+/// 打印 source，只补一个 url），底层真正原因——连接被重置 / 提前 EOF / HTTP2 流错误——
+/// 只能沿 `source()` 手动往下走。长流中断的排查全靠这一行，别改回 `{e:#}`。
+fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = e.to_string();
+    let mut cur = std::error::Error::source(e);
+    let mut depth = 0;
+    while let Some(s) = cur {
+        if depth >= 6 {
+            break;
+        }
+        let msg = s.to_string();
+        if !msg.is_empty() && !out.contains(&msg) {
+            out.push_str(" <- ");
+            out.push_str(&msg);
+        }
+        cur = std::error::Error::source(s);
+        depth += 1;
+    }
+    if out.trim().is_empty() {
+        return format!("{e:?}");
+    }
+    out
+}
+
+/// 聚合后的模型回复（核心循环用）：正文 / 思考 / 工具调用。
+#[derive(Debug, Clone, Default)]
+pub struct AssistantTurn {
+    pub content: String,
+    pub reasoning: String,
+    pub tool_calls: Vec<ToolCall>,
+    /// 渠道返回的用量（：缓存命中率展示用；台账分计量）
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub cached_tokens: Option<u64>,
+    /// 结束原因（："length"=输出被 max_tokens 截断，核心循环据此提示用户）
+    pub finish_reason: Option<String>,
+    /// 思考流的时间跨度：首个 reasoning 分片与最后一个分片的到达时刻（「思考 · 持续了 N 秒」用）
+    pub reasoning_first_at: Option<std::time::Instant>,
+    pub reasoning_last_at: Option<std::time::Instant>,
+    /// 流式计时（2026-10-26 消息信息卡）：首个任意分片到达 = 首包延迟口径；
+    /// 正文首/末分片 = 输出耗时口径；流正常结束时刻 = 总生成窗口收尾（单分片回答
+    /// 的正文跨度是 0，输出耗时回落它，信息卡不会显示 0ms）。
+    pub first_chunk_at: Option<std::time::Instant>,
+    pub content_first_at: Option<std::time::Instant>,
+    pub content_last_at: Option<std::time::Instant>,
+    pub finished_at: Option<std::time::Instant>,
+}
+
+impl AssistantTurn {
+    /// 思考持续毫秒：首尾分片的时间差；没有思考（或只有一个分片）返回 None
+    pub fn reasoning_ms(&self) -> Option<u64> {
+        match (self.reasoning_first_at, self.reasoning_last_at) {
+            (Some(a), Some(b)) => {
+                let ms = b.duration_since(a).as_millis() as u64;
+                if ms > 0 { Some(ms) } else { None }
+            }
+            _ => None,
+        }
+    }
+    /// 首包延迟毫秒（相对请求发出时刻 call_started）；没收到任何分片返回 None
+    pub fn ttft_ms(&self, call_started: std::time::Instant) -> Option<u64> {
+        self.first_chunk_at
+            .and_then(|t| t.checked_duration_since(call_started))
+            .map(|d| d.as_millis() as u64)
+    }
+    /// 输出耗时毫秒：正文首→流结束（单分片回答正文跨度≈0 时它就是总生成窗口）；
+    /// 没有正文时回落思考跨度（弱模型常只有 reasoning）；都没计时返回 None。
+    pub fn gen_ms(&self) -> Option<u64> {
+        let span = match (self.content_first_at, self.finished_at) {
+            (Some(a), Some(b)) => b.checked_duration_since(a),
+            _ => match (self.content_first_at, self.content_last_at) {
+                (Some(a), Some(b)) => b.checked_duration_since(a),
+                _ => None,
+            },
+        }
+        .or_else(|| match (self.reasoning_first_at, self.reasoning_last_at) {
+            (Some(a), Some(b)) => b.checked_duration_since(a),
+            _ => None,
+        });
+        span.map(|d| d.as_millis() as u64)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+pub enum ChatOutcome {
+    Done(AssistantTurn),
+    /// 2026-10-22「立即发送」打断：流式输出被用户插话中断，已收到的半截内容
+    /// 落在这里（tool_calls 已清空——半截的工具调用不可靠，丢弃）；调用方把
+    /// 半截落地后**继续本轮**（下一个决策点取走打断指令），与 Cancelled（终止
+    /// 整轮）的本质区别。
+    Interrupted(AssistantTurn),
+    Cancelled,
+}
+
+impl Gateway {
+    pub fn new() -> Self {
+        Self {
+            client: RwLock::new(build_client()),
+            loopback_client: build_loopback_client(),
+            throttle: None,
+            thinking_degraded: RwLock::new(std::collections::HashSet::new()),
+        }
+    }
+
+    /// 该渠道（base_url|model）是否已被登记为「端点拒收思考参数」。
+    pub fn thinking_is_degraded(&self, base_url: &str, model: &str) -> bool {
+        self.thinking_degraded
+            .read()
+            .map(|s| s.contains(&Self::degrade_key(base_url, model)))
+            .unwrap_or(false)
+    }
+
+    fn mark_thinking_degraded(&self, base_url: &str, model: &str) {
+        if let Ok(mut s) = self.thinking_degraded.write() {
+            s.insert(Self::degrade_key(base_url, model));
+        }
+    }
+
+    fn degrade_key(base_url: &str, model: &str) -> String {
+        format!("{}|{}", base_url.trim(), model.trim())
+    }
+
+    /// 请求体是否携带思考字段（两协议：thinking 对象 / enable_thinking / reasoning_effort / 聊天模板）。
+    fn body_has_thinking_params(body: &Value) -> bool {
+        ["thinking", "enable_thinking", "reasoning_effort", "chat_template_kwargs"]
+            .iter()
+            .any(|k| body.get(*k).is_some())
+    }
+
+    /// 打开本地限流：max_rpm>0 时生效。启动时由 main 配置一次（Arc 包装前）。
+    pub fn set_max_rpm(&mut self, max_rpm: u32) {
+        if max_rpm > 0 && self.throttle.is_none() {
+            self.throttle = Some(Throttle::new(max_rpm));
+        }
+    }
+
+    /// 发请求前过本地限流（max_rpm=0 时直通）。
+    async fn gate(&self) {
+        if let Some(t) = &self.throttle {
+            t.gate().await;
+        }
+    }
+
+    /// 重建 HTTP 客户端（重新读系统代理）。网络层失败时由 send() 路径调用；
+    /// 集成测试（tests/gateway_retry.rs）也直接调它来驱动阶段切换。
+    pub fn rebuild_client_for_test(&self) -> reqwest::Client {
+        let fresh = build_client();
+        if let Ok(mut slot) = self.client.write() {
+            *slot = fresh.clone();
+        }
+        fresh
+    }
+
+    fn rebuild_client(&self) -> reqwest::Client {
+        let fresh = self.rebuild_client_for_test();
+        observability::event(
+            EventType::State,
+            json!({ "kind": "gateway.client_rebuild", "note": "网络层失败后重建 HTTP 客户端（重读系统代理）" }),
+        );
+        fresh
+    }
+
+    /// 等一个 future，同时监听取消标志：取消先到返回 None（调用方据此收尾）。
+    /// 网关里所有「可能长时间不返回」的等待（发请求/等响应头/等分片）都要过它——
+    /// 否则渠道静默时点「停止」只能干等到超时（2026-10-20 修）。
+    async fn or_cancel<T>(cancel: &CancelFlag, fut: impl std::future::Future<Output = T>) -> Option<T> {
+        tokio::select! {
+            () = cancel.cancelled() => None,
+            v = fut => Some(v),
+        }
+    }
+
+    /// 发请求；两类自愈：
+    /// 1. 网络层失败（连接/超时类）→ 重建客户端重试一次（Clash 开关热恢复）；
+    /// 2. 渠道 429 → 指数退避重试最多 3 次（尊重 Retry-After 头，缺省 1s/2s/4s），
+    ///    仍 429 才把错误抛给上层。用户不该看见瞬时限流。
+    ///
+    /// `base_url` 决定用哪个客户端：环回主机（本地模型服务）永不走代理。
+    async fn send(
+        &self,
+        base_url: &str,
+        build: impl Fn(reqwest::Client) -> reqwest::RequestBuilder,
+    ) -> anyhow::Result<reqwest::Response> {
+        self.gate().await;
+        let mut attempt_429 = 0u32;
+        let mut attempt_5xx = 0u32;
+        // 环回渠道（本地模型端点）：代理必坏，用 no_proxy 客户端
+        let pick = |g: &Gateway| {
+            if is_loopback_base_url(base_url) {
+                g.loopback_client.clone()
+            } else {
+                g.client.read().ok().map(|c| c.clone()).unwrap_or_else(build_client)
+            }
+        };
+        loop {
+            let client = pick(self);
+            match build(client).send().await {
+                Ok(r) => {
+                    if r.status() == reqwest::StatusCode::TOO_MANY_REQUESTS && attempt_429 < 3 {
+                        attempt_429 += 1;
+                        let wait = r
+                            .headers()
+                            .get("retry-after")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| s.trim_end_matches('s').parse::<u64>().ok())
+                            .map(|s| s.min(30))
+                            .unwrap_or(2u64.pow(attempt_429 - 1));
+                        observability::event(
+                            EventType::State,
+                            json!({ "kind": "gateway.retry_429", "attempt": attempt_429, "wait_ms": wait * 1000 }),
+                        );
+                        observability::debug(&format!("[gateway] 429 限流，{wait}s 后第 {attempt_429} 次重试"));
+                        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                        continue;
+                    }
+                    // 2026-10-31 用户渠道实锤：上游网关间歇 502（同一渠道在 ZCode 里稳、
+                    // 在这里老断）。5xx 是网关/上游瞬态故障，此刻还没读响应体，重试安全。
+                    // 每次请求最多重试 1 次、退避 1.2s——Billing/401 这类非 5xx 不进来。
+                    if r.status().is_server_error() && attempt_5xx < 1 {
+                        attempt_5xx += 1;
+                        let code = r.status().as_u16();
+                        observability::event(
+                            EventType::State,
+                            json!({ "kind": "gateway.retry_5xx", "status": code, "attempt": attempt_5xx }),
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+                        continue;
+                    }
+                    return Ok(r);
+                }
+                Err(e) if e.is_connect() || e.is_timeout() || e.is_request() => {
+                    // 网络类失败：热重建客户端再试一次（成败都收口，不回到循环头）。
+                    // 环回渠道不走代理，重建只对默认客户端有意义——重试若换回默认
+                    // 客户端会把本地端点又拽进代理（502），这里保持用环回客户端。
+                    let fresh = if is_loopback_base_url(base_url) {
+                        self.loopback_client.clone()
+                    } else {
+                        self.rebuild_client()
+                    };
+                    match build(fresh).send().await {
+                        Ok(r) => return Ok(r),
+                        Err(e) => return Err(anyhow!(e.to_string())),
+                    }
+                }
+                Err(e) => return Err(anyhow!(e.to_string())),
+            }
+        }
+    }
+
+    fn chat_url(base_url: &str) -> String {
+        let b = base_url.trim().trim_end_matches('/');
+        if b.ends_with("/chat/completions") {
+            return b.to_string();
+        }
+        // 带查询串的完整端点：原样用（再拼 path 会拼到 ? 后面，必坏）
+        if b.contains('?') {
+            return b.to_string();
+        }
+        // 只给了主机（https://api.openai.com）→ 补 /v1；给了路径（/v1、
+        // /api/paas/v4 这类网关前缀）就原样拼——否则官方 OpenAI 地址会 404
+        // （2026-11-02 审计：之前只补 /chat/completions，两协议行为不一致）。
+        let path_is_root = url::Url::parse(b)
+            .map(|u| u.path().is_empty() || u.path() == "/")
+            .unwrap_or(false);
+        if path_is_root {
+            format!("{b}/v1/chat/completions")
+        } else {
+            format!("{b}/chat/completions")
+        }
+    }
+
+    fn models_url(base_url: &str) -> String {
+        let b = base_url.trim().trim_end_matches('/');
+        if b.ends_with("/models") {
+            return b.to_string();
+        }
+        if b.contains('?') {
+            return b.to_string();
+        }
+        let path_is_root = url::Url::parse(b)
+            .map(|u| u.path().is_empty() || u.path() == "/")
+            .unwrap_or(false);
+        if path_is_root {
+            format!("{b}/v1/models")
+        } else {
+            format!("{b}/models")
+        }
+    }
+
+    /// 按协议取对话端点 URL：OpenAI /chat/completions；Anthropic /v1/messages。
+    fn request_url(base_url: &str, protocol: Protocol) -> String {
+        match protocol {
+            Protocol::OpenAiCompletions => Self::chat_url(base_url),
+            Protocol::AnthropicMessages => anthropic::messages_url(base_url),
+        }
+    }
+
+    /// 按协议挂鉴权：OpenAI Authorization Bearer；Anthropic x-api-key + anthropic-version。
+    fn auth(rb: reqwest::RequestBuilder, api_key: &str, protocol: Protocol) -> reqwest::RequestBuilder {
+        match protocol {
+            Protocol::OpenAiCompletions => rb.bearer_auth(api_key),
+            Protocol::AnthropicMessages => rb
+                .header("x-api-key", api_key)
+                .header("anthropic-version", anthropic::ANTHROPIC_VERSION),
+        }
+    }
+
+    /// GET {base}/models → 模型 id 列表（OpenAI 兼容）。
+    pub async fn list_models(&self, base_url: &str, api_key: &str) -> anyhow::Result<Vec<String>> {
+        // Anthropic /v1/models 的 data[].id 与 OpenAI 同形，仅 URL 与鉴权头不同
+        let protocol = if anthropic::is_anthropic_endpoint(None, Some(base_url)) {
+            Protocol::AnthropicMessages
+        } else {
+            Protocol::OpenAiCompletions
+        };
+        let url = match protocol {
+            Protocol::AnthropicMessages => anthropic::models_url(base_url),
+            Protocol::OpenAiCompletions => Self::models_url(base_url),
+        };
+        observability::event(EventType::State, json!({ "kind": "gateway.request", "url": redact_url(&url), "body": json!(null) }));
+        observability::debug(&format!("[gateway] GET {url}"));
+
+        let response = self
+            .send(base_url, |c| Self::auth(c.get(&url), api_key, protocol))
+            .await
+            .with_context(|| format!("请求渠道失败: {}（网络层不通：检查 Clash/系统代理；若程序刚重新构建过，可能是安全软件拦了新程序的联网）", redact_url(&url)))?;
+
+        let status = response.status();
+        observability::event(EventType::State, json!({ "kind": "gateway.response", "status": status.as_u16() }));
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            observability::event(
+                EventType::Error,
+                json!({ "kind": "gateway.error", "status": status.as_u16(), "body": text }),
+            );
+            return Err(anyhow!("渠道返回 {status}: {text}"));
+        }
+
+        let data: Value = response.json().await.context("解析模型列表失败")?;
+        let mut ids: Vec<String> = data
+            .pointer("/data")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m.pointer("/id").and_then(Value::as_str).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        ids.sort();
+        ids.dedup();
+        observability::debug(&format!("[gateway] models: {ids:?}"));
+        Ok(ids)
+    }
+
+    /// 非流式单轮补全（滚动摘要 /  标题生成 / 媒体旁路用）：返回 choices[0].message.content。
+    /// 不查取消标志（摘要失败由调用方降级），超时走客户端全局 600s。
+    /// 与流式同一道计量（台账 + 花费硬闸），ctx.purpose 区分用途。
+    pub async fn complete(
+        &self,
+        ctx: &UsageCtx,
+        base_url: &str,
+        model: &str,
+        api_key: &str,
+        messages: &Value,
+        params: &ChatParams,
+    ) -> anyhow::Result<String> {
+        let started = Instant::now();
+        let compat = compat::resolve(
+            params.provider_id.as_deref(),
+            params.base_url.as_deref().or(Some(base_url.trim())),
+            model,
+            params.thinking_format,
+        );
+        let url = Self::request_url(base_url, compat.protocol);
+        // 降级登记：该端点已确认拒收思考字段 → 本请求直接不发（人话提示由每轮渠道组装时出）
+        let degraded = self.thinking_is_degraded(base_url, model);
+        let eff_params = if degraded {
+            let mut p = params.clone();
+            p.thinking = None;
+            p
+        } else {
+            params.clone()
+        };
+        let mut outgoing = messages.clone();
+        replay::apply_outgoing_transforms(&mut outgoing, model, &compat);
+        let body = build_body_with_compat(model, &outgoing, false, &eff_params, None, &compat, &ctx.session_id);
+        // 同主渠道：JSONL 只留摘要。aux 体量本就小（摘要/标题），但滚雪球时（prior_summary
+        // 越带越大）一样能把日志顶爆，规则统一不搞双标
+        observability::event(
+            EventType::State,
+            json!({ "kind": "gateway.request", "url": redact_url(&url), "body": request_summary(&body), "purpose": "aux" }),
+        );
+        // 红线1：花费上限硬闸——辅助调用与主流程同一道闸
+        if let Some(msg) = crate::usage::cap_block() {
+            observability::event(
+                EventType::State,
+                json!({ "kind": "cost.cap_blocked", "session": ctx.session_id, "purpose": ctx.purpose, "model": model, "spend_usd": crate::usage::spend_total(), "cap_usd": crate::usage::cap_value() }),
+            );
+            return Err(anyhow!(msg));
+        }
+        let mut response = match self
+            .send(base_url, |c| Self::auth(c.post(&url), api_key, compat.protocol).json(&body))
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                record_usage(ctx, base_url, params.provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("error", format!("{e:#}")));
+                return Err(anyhow!("请求渠道失败: {}", redact_url(&url)));
+            }
+        };
+        // 思考参数自适应降级：400 且请求带思考字段 → 剥参重试一次；
+        // 成功则登记该渠道（后续请求不再发思考字段），失败则抛出重试的真实错误
+        if response.status().as_u16() == 400 && !degraded && Self::body_has_thinking_params(&body) {
+            let text = response.text().await.unwrap_or_default();
+            observability::event(
+                EventType::State,
+                json!({ "kind": "gateway.thinking_degrade_retry", "status": 400, "url": redact_url(&url), "model": model, "error_body": text.chars().take(300).collect::<String>() }),
+            );
+            let retry_params = {
+                let mut p = params.clone();
+                p.thinking = None;
+                p
+            };
+            let retry_body = build_body_with_compat(model, &outgoing, false, &retry_params, None, &compat, &ctx.session_id);
+            response = match self
+                .send(base_url, |c| Self::auth(c.post(&url), api_key, compat.protocol).json(&retry_body))
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    record_usage(ctx, base_url, params.provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("error", format!("{e:#}")));
+                    return Err(anyhow!("请求渠道失败: {}", redact_url(&url)));
+                }
+            };
+            if response.status().is_success() {
+                self.mark_thinking_degraded(base_url, model);
+                observability::event(
+                    EventType::State,
+                    json!({ "kind": "gateway.thinking_degraded", "url": redact_url(&url), "model": model, "note": "端点拒收思考参数，剥参重试成功；该渠道后续请求不再发送思考字段" }),
+                );
+            }
+        }
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            record_usage(ctx, base_url, params.provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("error", format!("渠道返回 {status}")));
+            return Err(anyhow!("渠道返回 {status}: {text}"));
+        }
+        let data: Value = response.json().await.context("解析补全响应失败")?;
+        if let Some(err) = data.get("error") {
+            let msg = err.get("message").and_then(Value::as_str).unwrap_or_default();
+            record_usage(ctx, base_url, params.provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("error", format!("渠道业务错误: {msg}")));
+            return Err(anyhow!("渠道业务错误: {msg} (raw: {err})"));
+        }
+        // 台账：usage 三路分计量（渠道不回 usage 时记 0，请求与延迟照记）
+        let (p, c, k) = usage_triple(&data);
+        record_usage(ctx, base_url, params.provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::ok((p, c, k)));
+        // 取正文：Anthropic content[] 拼 text 块（思考走独立块不混正文）；OpenAI choices[0].message.content
+        let raw = match compat.protocol {
+            Protocol::AnthropicMessages => data
+                .get("content")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                        .filter_map(|b| b.get("text").and_then(Value::as_str))
+                        .collect::<String>()
+                })
+                .unwrap_or_default(),
+            Protocol::OpenAiCompletions => data
+                .pointer("/choices/0/message/content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        };
+        if compat.protocol == Protocol::AnthropicMessages {
+            return Ok(raw);
+        }
+        // 反代 <think> 当正文吐：剥离标签，摘要只要正文
+        let mut ts = TagSplit::default();
+        let (_, mut clean) = ts.feed(&raw);
+        let (_, tail) = ts.finish();
+        clean.push_str(&tail);
+        Ok(clean)
+    }
+
+    /// 向量嵌入（EMBEDDING 角色预留，OpenAI 兼容 /embeddings）。
+    /// 记忆 v1 不消费；语义检索需求真实出现后由上层接线。
+    pub async fn embed(
+        &self,
+        base_url: &str,
+        model: &str,
+        api_key: &str,
+        input: &[String],
+    ) -> anyhow::Result<Vec<Vec<f64>>> {
+        if api_key.trim().is_empty() {
+            return Err(anyhow!("API key 未设置，无法调用 embeddings"));
+        }
+        let b = base_url.trim().trim_end_matches('/');
+        let url = format!("{b}/embeddings");
+        let body = json!({ "model": model, "input": input });
+        observability::event(EventType::State, json!({ "kind": "gateway.request", "url": redact_url(&url), "purpose": "embedding", "inputs": input.len() }));
+        let response = self
+            .send(base_url, |c| c.post(&url).bearer_auth(api_key).json(&body))
+            .await
+            .with_context(|| format!("请求渠道失败: {}", redact_url(&url)))?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(anyhow!("渠道返回 {status}: {text}"));
+        }
+        let data: Value = response.json().await.context("解析 embeddings 响应失败")?;
+        let vecs: Vec<Vec<f64>> = data
+            .pointer("/data")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .map(|d| {
+                        d.get("embedding")
+                            .and_then(Value::as_array)
+                            .map(|a| a.iter().filter_map(Value::as_f64).collect())
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if vecs.is_empty() {
+            return Err(anyhow!("embeddings 响应不含向量"));
+        }
+        Ok(vecs)
+    }
+}
+
+/// 一轮模型调用的目标渠道（降级链/角色映射的基本单位）。
+#[derive(Debug, Clone, Default)]
+pub struct Channel {
+    pub base_url: String,
+    pub model: String,
+    pub api_key: String,
+    pub params: ChatParams,
+}
+
+impl Channel {
+    pub fn new(base_url: &str, model: &str, api_key: &str, params: ChatParams) -> Self {
+        Self {
+            base_url: base_url.to_string(),
+            model: model.to_string(),
+            api_key: api_key.to_string(),
+            params,
+        }
+    }
+}
+
+impl Gateway {
+    /// 一轮模型调用 → 流式输出并聚合结果。
+    ///
+    /// 每个分片：1) 写 model_chunk 到 JSONL；2) 回调 on_chunk 转发给前端。
+    /// 开始前与每个分片前都查取消标志（核心循环同款检查点）。
+    /// ctx 带归属信息（会话/用途/父任务），本方法内完成台账记录与花费硬闸。
+    #[allow(clippy::too_many_arguments)] // 中断臂参数是打断分家的必要面（run_chain 同款豁免）
+    pub async fn stream_chat(
+        self: &Arc<Self>,
+        ctx: &UsageCtx,
+        channel: &Channel,
+        messages: &Value,
+        tools: Option<&Value>,
+        cancel: &CancelFlag,
+        interrupt: Option<&CancelFlag>,
+        on_chunk: impl Fn(&Value),
+    ) -> anyhow::Result<ChatOutcome> {
+        let base_url = &channel.base_url;
+        let model = &channel.model;
+        let started = Instant::now();
+        let provider_id = channel.params.provider_id.clone();
+        // 红线1：花费上限硬闸——降级链每次尝试都过同一道闸
+        if let Some(msg) = crate::usage::cap_block() {
+            observability::event(
+                EventType::State,
+                json!({ "kind": "cost.cap_blocked", "session": ctx.session_id, "purpose": ctx.purpose, "model": model, "spend_usd": crate::usage::spend_total(), "cap_usd": crate::usage::cap_value() }),
+            );
+            return Err(anyhow!(msg));
+        }
+        // key 可空的预设（本地推理服务：Ollama/LM Studio 等）不再硬拦空 key——
+        // providers.json 的 key_optional 之前只透传给前端、网关没判，形同虚设
+        // （2026-11-02 审计）。
+        let key_optional = channel
+            .params
+            .provider_id
+            .as_deref()
+            .and_then(providers::find)
+            .is_some_and(|p| p.key_optional);
+        if !key_optional && channel.api_key.trim().is_empty() {
+            let msg = "API key 未设置：请在设置面板填写并保存（或设环境变量 DEEPSEEK_API_KEY）";
+            observability::event(EventType::Error, json!({ "message": msg }));
+            return Err(anyhow!(msg));
+        }
+
+        // 每轮模型决策前先查取消标志
+        if cancel.is_set() {
+            observability::event(EventType::State, json!({ "kind": "cancel", "phase": "before_request" }));
+            return Ok(ChatOutcome::Cancelled);
+        }
+
+        let compat = compat::resolve(
+            channel.params.provider_id.as_deref(),
+            Some(base_url.trim()),
+            &channel.model,
+            channel.params.thinking_format,
+        );
+        let url = Self::request_url(base_url, compat.protocol);
+        // 降级登记：该端点已确认拒收思考字段 → 本请求直接不发（人话提示由每轮渠道组装时出）
+        let degraded = self.thinking_is_degraded(base_url, model);
+        let eff_params = if degraded {
+            let mut p = channel.params.clone();
+            p.thinking = None;
+            p
+        } else {
+            channel.params.clone()
+        };
+        let mut outgoing = messages.clone();
+        replay::apply_outgoing_transforms(&mut outgoing, &channel.model, &compat);
+        // 思考预算扩容：思考开启时上游把思考+正文算进同一个 max_tokens，用户配的
+        // 「最大输出长度」会被思考吃掉导致正文莫名截断——发送值加思考余量（端点硬上限
+        // 拒收时下方回退原值重试）。思考关闭/未配 max_tokens 时等价原值。
+        let mut send_params = eff_params.clone();
+        let inflated = match (eff_params.max_tokens, effective_max_tokens(&eff_params)) {
+            (Some(orig), Some(eff)) if eff != orig => {
+                send_params.max_tokens = Some(eff);
+                observability::event(
+                    EventType::State,
+                    json!({ "kind": "gateway.max_tokens_inflated", "url": redact_url(&url), "model": model, "configured": orig, "sent": eff }),
+                );
+                true
+            }
+            _ => false,
+        };
+        let body = build_body_with_compat(model, &outgoing, true, &send_params, tools, &compat, &ctx.session_id);
+
+        // 硬约束：debug 日志输出实际请求体（body 不含 key）
+        // JSONL 里只留摘要：完整请求体（messages 历史 + tools）单条就能到 2MB+，
+        // 长任务每步一条，20MB 的轮转上限几次就撞穿——task.start 被归档删掉而后续
+        // 事件还留在仅存的 3 份里，时间线的任务边界就没了（2026-10-06 真机实测
+        // 「时间线刷不出来」的根因）。完整体照旧走 debug（控制台），排查不缺料。
+        observability::event(
+            EventType::State,
+            json!({ "kind": "gateway.request", "url": redact_url(&url), "body": request_summary(&body), "reasoning": {
+                "protocol": compat.protocol.as_str(),
+                "thinking_format": compat.thinking_format.as_str(),
+                "thinking": channel.params.thinking,
+            } }),
+        );
+        observability::debug(&format!("[gateway] POST {}", redact_url(&url)));
+        observability::debug(&format!("[gateway] request body: {body}"));
+
+        // 等响应头同样要能被「停止」打断：渠道完全无响应时这里会一直等客户端
+        // 总超时（600s），期间 cancel 标志无从检查（2026-10-20 修）。
+        let sent = Self::or_cancel(
+            cancel,
+            self.send(base_url, |c| Self::auth(c.post(&url), &channel.api_key, compat.protocol).json(&body)),
+        )
+        .await;
+        let Some(sent) = sent else {
+            observability::event(
+                EventType::State,
+                json!({ "kind": "cancel", "phase": "awaiting_response", "url": redact_url(&url) }),
+            );
+            record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("cancelled", "用户取消".into()));
+            return Ok(ChatOutcome::Cancelled);
+        };
+        let mut response = match sent {
+            Ok(r) => r,
+            Err(e) => {
+                record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("error", format!("{e:#}")));
+                return Err(anyhow!(
+                    "请求渠道失败: {}（{:#}；网络层不通：检查 Clash/系统代理；若程序刚重新构建过，可能是安全软件拦了新程序的联网）",
+                    redact_url(&url),
+                    e
+                ));
+            }
+        };
+
+        // 思考参数自适应降级：400 且请求带思考字段 → 剥参重试一次；
+        // 成功则登记该渠道（后续请求不再发思考字段），失败则抛出重试的真实错误
+        let mut degrade_retried = false;
+        if response.status().as_u16() == 400 && !degraded && Self::body_has_thinking_params(&body) {
+            degrade_retried = true;
+            let text = response.text().await.unwrap_or_default();
+            observability::event(
+                EventType::State,
+                json!({ "kind": "gateway.thinking_degrade_retry", "status": 400, "url": redact_url(&url), "model": model, "error_body": text.chars().take(300).collect::<String>() }),
+            );
+            let retry_params = {
+                let mut p = channel.params.clone();
+                p.thinking = None;
+                p
+            };
+            let retry_body = build_body_with_compat(model, &outgoing, true, &retry_params, tools, &compat, &ctx.session_id);
+            let sent = Self::or_cancel(
+                cancel,
+                self.send(base_url, |c| Self::auth(c.post(&url), &channel.api_key, compat.protocol).json(&retry_body)),
+            )
+            .await;
+            let Some(sent) = sent else {
+                record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("cancelled", "用户取消".into()));
+                return Ok(ChatOutcome::Cancelled);
+            };
+            response = match sent {
+                Ok(r) => r,
+                Err(e) => {
+                    record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("error", format!("{e:#}")));
+                    return Err(anyhow!(
+                        "请求渠道失败: {}（{:#}；网络层不通：检查 Clash/系统代理；若程序刚重新构建过，可能是安全软件拦了新程序的联网）",
+                        redact_url(&url),
+                        e
+                    ));
+                }
+            };
+            if response.status().is_success() {
+                self.mark_thinking_degraded(base_url, model);
+                observability::event(
+                    EventType::State,
+                    json!({ "kind": "gateway.thinking_degraded", "url": redact_url(&url), "model": model, "note": "端点拒收思考参数，剥参重试成功；该渠道后续请求不再发送思考字段" }),
+                );
+            }
+        }
+
+        // 扩容回退：扩容后的 max_tokens 超出该模型硬上限被 400 拒收 → 用配置原值
+        // 重试一次（思考参数不动；剥参重试已跑过则不重复——它本来就用的原值）
+        if response.status().as_u16() == 400 && inflated && !degrade_retried {
+            let text = response.text().await.unwrap_or_default();
+            observability::event(
+                EventType::State,
+                json!({ "kind": "gateway.max_tokens_inflate_retry", "status": 400, "url": redact_url(&url), "model": model, "error_body": text.chars().take(300).collect::<String>() }),
+            );
+            let retry_body = build_body_with_compat(model, &outgoing, true, &eff_params, tools, &compat, &ctx.session_id);
+            let sent = Self::or_cancel(
+                cancel,
+                self.send(base_url, |c| Self::auth(c.post(&url), &channel.api_key, compat.protocol).json(&retry_body)),
+            )
+            .await;
+            let Some(sent) = sent else {
+                record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("cancelled", "用户取消".into()));
+                return Ok(ChatOutcome::Cancelled);
+            };
+            response = match sent {
+                Ok(r) => r,
+                Err(e) => {
+                    record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("error", format!("{e:#}")));
+                    return Err(anyhow!(
+                        "请求渠道失败: {}（{:#}；网络层不通：检查 Clash/系统代理；若程序刚重新构建过，可能是安全软件拦了新程序的联网）",
+                        redact_url(&url),
+                        e
+                    ));
+                }
+            };
+            if response.status().is_success() {
+                observability::event(
+                    EventType::State,
+                    json!({ "kind": "gateway.max_tokens_inflate_fallback", "url": redact_url(&url), "model": model, "note": "扩容值超出模型硬上限，已回退配置原值" }),
+                );
+            }
+        }
+
+        let status = response.status();
+        observability::event(EventType::State, json!({ "kind": "gateway.response", "status": status.as_u16() }));
+        observability::debug(&format!("[gateway] response status: {status}"));
+        // 断流现场取证（2026-11-01）：协议版本与关键响应头挂在响应对象上，读完就没了——
+        // 先抄下来，读流出错时一并写进日志。是上游 RST 还是提前 EOF、有没有中转兜底，
+        // 全靠这几个字段判断（没有它们只有一句「读流失败」，查不了）。
+        let http_version = format!("{:?}", response.version());
+        let header_summary = ["server", "cf-ray", "content-type", "content-encoding", "transfer-encoding", "connection"]
+            .iter()
+            .filter_map(|k| response.headers().get(*k).and_then(|v| v.to_str().ok()).map(|v| format!("{k}={v}")))
+            .collect::<Vec<_>>()
+            .join("; ");
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            observability::event(
+                EventType::Error,
+                json!({ "kind": "gateway.error", "status": status.as_u16(), "body": text }),
+            );
+            record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("error", format!("渠道返回 {status}")));
+            return Err(anyhow!("渠道返回 {status}: {text}"));
+        }
+
+        // 200 但不是事件流（中转忽略 stream:true 回一个普通 JSON / HTML 错误页）：
+        // 不能当空流解析成「成功空回答」，直接报可诊断的人话。
+        let ctype = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if ctype.contains("text/html") || ctype.contains("application/json") {
+            let text = response.text().await.unwrap_or_default();
+            record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("error", format!("渠道返回非事件流（{ctype}）")));
+            anyhow::bail!(
+                "渠道返回的不是事件流（Content-Type: {ctype}）：{}。请重试或更换渠道。",
+                text.chars().take(300).collect::<String>()
+            );
+        }
+
+        // —— SSE 解析：按行切，data: 前缀取 JSON；聚合 content/reasoning/tool_calls ——
+        // 分片间 120s 无数据即报错（渠道/代理断流时不再干等总超时 600s）
+        const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+        let mut stream = response.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        // SSE 事件缓冲：一个事件的多个 `data:` 行按规范以 \n 拼接，空行派发
+        let mut event_data: String = String::new();
+        // 断流时「收到多少才断」是判断截断点的关键证据：同一渠道反复断在同一位置
+        // = 上游有输出上限；每次位置都不同 = 链路抖动
+        let mut bytes_in: usize = 0;
+        let mut done = false;
+        let mut agg = StreamAgg::new();
+        // 解析失败的分片数：整条流结束时若什么都没攒到（无正文/思考/工具调用），
+        // 说明关键分片（典型是携带 tool_calls 的那个）被吞了——必须报错而不是
+        // 当「模型给了空回答」静默结束（2026-10-08 修）。
+        let mut parse_failures = 0usize;
+        // Anthropic 协议：事件流经 SseTranslator 合成回 OpenAI delta 分片再进同一聚合器
+        let mut translator = anthropic::SseTranslator::default();
+        let is_anthropic = compat.protocol == Protocol::AnthropicMessages;
+        // 打断信号（「立即发送」）：None = 该调用不支持打断（摘要/标题等辅助调用）。
+        // 用一个进程级永不置位的信号兜底，select! 不用分叉两套写法。
+        static NEVER_INTERRUPT: std::sync::OnceLock<CancelFlag> = std::sync::OnceLock::new();
+        let interrupt = interrupt.unwrap_or_else(|| NEVER_INTERRUPT.get_or_init(CancelFlag::new));
+        loop {
+            // 等下一个分片：空闲超时、「停止」与「立即发送打断」同时监听——渠道静默
+            // 不回分片时，原先只在拿到分片后才查 cancel，停止按钮要干等到 120s 空闲
+            // 超时才生效（2026-10-20 修，对照工具侧的 select! 写法）。
+            let item = tokio::select! {
+                () = cancel.cancelled() => {
+                    observability::event(
+                        EventType::State,
+                        json!({ "kind": "cancel", "phase": "streaming", "chunks": agg.chunk_count }),
+                    );
+                    record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err_with("cancelled", "用户取消".into(), partial_tokens(&agg.turn)));
+                    return Ok(ChatOutcome::Cancelled);
+                }
+                () = interrupt.cancelled() => {
+                    // 「立即发送」：流式让位——半截内容带出（tool_calls 丢弃），调用方
+                    // 落地半截后继续本轮（下一个决策点取走打断指令）
+                    observability::event(
+                        EventType::State,
+                        json!({ "kind": "interrupt", "phase": "streaming", "chunks": agg.chunk_count }),
+                    );
+                    record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::ok(partial_tokens(&agg.turn)));
+                    agg.finish();
+                    let mut turn = agg.turn;
+                    turn.tool_calls.clear();
+                    return Ok(ChatOutcome::Interrupted(turn));
+                }
+                item = tokio::time::timeout(IDLE_TIMEOUT, stream.next()) => match item {
+                    Ok(item) => item,
+                    Err(_) => anyhow::bail!("模型流超时：120 秒无新数据（渠道或代理可能断流，可重试）"),
+                },
+            };
+            let eof = item.is_none();
+            if eof {
+                // 上游最后一行可能没有换行符：补成完整行；再补一个空行触发已缓冲事件
+                // 派发（2026-11-02 审计：末行无 \n 会被静默丢弃，整条流只有一行时全丢）。
+                if !buf.is_empty() {
+                    if !buf.ends_with(b"\n") {
+                        buf.push(b'\n');
+                    }
+                    buf.push(b'\n');
+                } else if !event_data.is_empty() {
+                    buf.push(b'\n');
+                }
+            }
+            // 2026-11-01 二次修：上一次补强只给了「error decoding response body」——
+            // reqwest 的 Display 根本不打 source（见 error_chain 注释），真因照样丢。
+            // 这里把错误链 + 协议版本 + 已收数据量 + 耗时 + 响应头一次性写进日志和
+            // 错误气泡：是上游 RST、提前 EOF 还是 h2 流错误，一眼能分。
+            let bytes = match item {
+                None => Default::default(), // EOF：只处理上面补出的末行/空行
+                Some(Ok(b)) => b,
+                Some(Err(e)) => {
+                    let detail = format!(
+                        "读流失败：{}（{http_version}，已收 {} 分片 / {} 字节，{:.1} 秒{}）",
+                        error_chain(&e),
+                        agg.chunk_count,
+                        bytes_in,
+                        started.elapsed().as_secs_f32(),
+                        if header_summary.is_empty() {
+                            String::new()
+                        } else {
+                            format!("；响应头 {header_summary}")
+                        },
+                    );
+                    observability::event(
+                        EventType::Error,
+                        json!({
+                            "kind": "gateway.stream_read_error",
+                            "message": detail,
+                            "timeout": e.is_timeout(),
+                            "decode": e.is_decode(),
+                            "body": e.is_body(),
+                            "connect": e.is_connect(),
+                            "http_version": http_version,
+                            "chunks": agg.chunk_count,
+                            "bytes_in": bytes_in,
+                            "elapsed_ms": started.elapsed().as_millis() as u64,
+                            "headers": header_summary,
+                        }),
+                    );
+                    record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("error", format!("读流失败: {}", error_chain(&e))));
+                    anyhow::bail!(detail);
+                }
+            };
+            bytes_in += bytes.len();
+            buf.extend_from_slice(&bytes);
+            // 按字节缓冲、按行解码（take_line）：分片边界不保证 UTF-8 字符完整，
+            // 逐分片 from_utf8_lossy 会把跨片的汉字碎成 U+FFFD 永久进正文（N1）
+            while let Some(line) = take_line(&mut buf) {
+                if line.is_empty() {
+                    // 空行 = 派发已缓冲事件（SSE 规范）；没有缓冲就是普通心跳空行
+                    if event_data.is_empty() {
+                        continue;
+                    }
+                } else if let Some(d) = line.strip_prefix("data:") {
+                    // event: 行直接忽略——Anthropic data 自带 type，OpenAI 只认 data:
+                    let d = d.trim();
+                    if d.is_empty() {
+                        continue;
+                    }
+                    // 一个事件的多个 data: 行按规范以 \n 拼接，空行再派发
+                    if !event_data.is_empty() {
+                        event_data.push('\n');
+                    }
+                    event_data.push_str(d);
+                    continue;
+                } else {
+                    continue;
+                }
+                let data = std::mem::take(&mut event_data);
+                // [DONE] 两种协议都认（2026-10-08 修：Anthropic 官方不发，但 OpenAI
+                // 形状的中继/代理会补发；原先 !is_anthropic 才特判，导致 Anthropic 渠道
+                // 收到 [DONE] 进解析失败计数，整条流只有它时还触发误导性报错）
+                if data == "[DONE]" {
+                    done = true;
+                    break;
+                }
+                let mut chunk: Value = match serde_json::from_str(&data) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        observability::event(
+                            EventType::Error,
+                            json!({ "message": format!("解析 SSE 分片失败: {e}"), "raw": &data }),
+                        );
+                        parse_failures += 1;
+                        continue;
+                    }
+                };
+                // 每个分片前查取消标志
+                if cancel.is_set() {
+                    observability::event(
+                        EventType::State,
+                        json!({ "kind": "cancel", "phase": "streaming", "chunks": agg.chunk_count }),
+                    );
+                    record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err_with("cancelled", "用户取消".into(), partial_tokens(&agg.turn)));
+                    return Ok(ChatOutcome::Cancelled);
+                }
+                // 200 流里夹带的错误（中转/队列服务的 finish_reason=error + error 对象）：
+                // 旧逻辑当普通分片吞掉，最终空回答、界面转圈后没动静。这里直接上抛，
+                // 由 server 层落成 [错误] 气泡，用户能看到真实原因（2026-10-27 真机实锤）。
+                if let Some(msg) = openai::sse_error_message(&chunk) {
+                    record_usage(
+                        ctx,
+                        base_url,
+                        provider_id.as_deref(),
+                        model,
+                        started.elapsed().as_millis() as u64,
+                        UsageOutcome::err("error", msg.clone()),
+                    );
+                    observability::event(
+                        EventType::Error,
+                        json!({ "kind": "gateway.stream_error", "message": msg.clone(), "raw": &data }),
+                    );
+                    anyhow::bail!("渠道流式错误: {msg}");
+                }
+                if is_anthropic {
+                    match translator.translate(&chunk) {
+                        Ok(anthropic::Translated::Chunk(mut synthetic)) => {
+                            agg.feed(&mut synthetic, &data);
+                            on_chunk(&synthetic);
+                        }
+                        Ok(anthropic::Translated::Done) => {
+                            done = true;
+                            break;
+                        }
+                        Ok(anthropic::Translated::Ignore) => {}
+                        Err(msg) => {
+                            record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("error", format!("渠道流式错误: {msg}")));
+                            anyhow::bail!("渠道流式错误: {msg}");
+                        }
+                    }
+                } else {
+                    agg.feed(&mut chunk, &data);
+                    on_chunk(&chunk);
+                }
+            }
+            if done || eof {
+                break;
+            }
+        }
+        agg.finish();
+        let turn = agg.turn;
+        // 干净 EOF 但没有结束标记（[DONE]/finish_reason）：上游或代理把流掐在分片边界，
+        // 半截回答不能当最终答案落盘（2026-11-02 审计）。报错让上层走同渠道重试。
+        if !done && turn.finish_reason.is_none() {
+            record_usage(
+                ctx,
+                base_url,
+                provider_id.as_deref(),
+                model,
+                started.elapsed().as_millis() as u64,
+                UsageOutcome::err("error", "流在结束标记前中断".into()),
+            );
+            anyhow::bail!(
+                "渠道流在结束标记前中断（未收到 [DONE] 或 finish_reason），回答可能不完整；已丢弃本轮内容以便重试"
+            );
+        }
+        let nothing = turn.tool_calls.is_empty()
+            && turn.content.trim().is_empty()
+            && turn.reasoning.trim().is_empty();
+        if nothing && parse_failures == 0 {
+            // 200 非 SSE / HTML 错误页 / 中转吞流：没有正文、思考、工具调用。
+            // 不能再记 ok 给用户一个空气泡（2026-11-02 审计）。
+            record_usage(
+                ctx,
+                base_url,
+                provider_id.as_deref(),
+                model,
+                started.elapsed().as_millis() as u64,
+                UsageOutcome::err("error", "渠道返回空响应".into()),
+            );
+            anyhow::bail!(
+                "渠道返回空响应（没有正文/思考/工具调用）：可能是 200 非事件流（HTML 错误页/普通 JSON），或中转吞流。请重试或更换渠道"
+            );
+        }
+        // 2026-10-08 修：有分片解析失败、且整条流什么都没攒到（无正文/思考/工具调用）时，
+        // 关键分片（典型是携带 tool_calls 的那个）被吞了——报错让用户看见，而不是
+        // 当「模型给了空回答」静默结束。有部分可用内容时不影响（坏行丢弃即可）。
+        if parse_failures > 0
+            && turn.tool_calls.is_empty()
+            && turn.content.trim().is_empty()
+            && turn.reasoning.trim().is_empty()
+        {
+            record_usage(
+                ctx,
+                base_url,
+                provider_id.as_deref(),
+                model,
+                started.elapsed().as_millis() as u64,
+                UsageOutcome::err("error", format!("{parse_failures} 个 SSE 分片解析失败且无可用内容")),
+            );
+            anyhow::bail!(
+                "渠道返回了无法解析的数据（{parse_failures} 个分片解析失败，且未收到任何正文/工具调用）：\
+                 可能是中转代理在 data: 行前后注入了文本，或流被截断。请重试或更换渠道。"
+            );
+        }
+        // 台账：成功调用记 usage 三路（渠道不回 usage 时 token 记 0，请求与延迟照记）
+        record_usage(
+            ctx,
+            base_url,
+            provider_id.as_deref(),
+            model,
+            started.elapsed().as_millis() as u64,
+            UsageOutcome::ok((
+                turn.prompt_tokens.unwrap_or(0),
+                turn.completion_tokens.unwrap_or(0),
+                turn.cached_tokens.unwrap_or(0),
+            )),
+        );
+        observability::event(
+            EventType::State,
+            json!({ "kind": "gateway.stream_end", "chunks": agg.chunk_count, "done": done, "tool_calls": turn.tool_calls.len() }),
+        );
+        Ok(ChatOutcome::Done(turn))
+    }
+}

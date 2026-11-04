@@ -1,0 +1,35 @@
+{
+  "providers": [
+    {
+      "id": "openai_compat",
+      "name": "OpenAI兼容",
+      "default_base_url": "",
+      "default_model": "",
+      "key_optional": true
+    },
+    {
+      "id": "anthropic",
+      "name": "Anthropic兼容",
+      "default_base_url": "https://api.anthropic.com",
+      "default_model": ""
+    },
+    {
+      "id": "deepseek",
+      "name": "DeepSeek",
+      "default_base_url": "https://api.deepseek.com",
+      "default_model": "deepseek-chat"
+    },
+    {
+      "id": "stepfun",
+      "name": "StepFun",
+      "default_base_url": "https://api.stepfun.com/v1",
+      "default_model": ""
+    },
+    {
+      "id": "zhipu",
+      "name": "GLM",
+      "default_base_url": "https://open.bigmodel.cn/api/paas/v4",
+      "default_model": "GLM-5.3-Flash"
+    }
+  ]
+}

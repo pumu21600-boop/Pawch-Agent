@@ -1,0 +1,101 @@
+name: CI
+
+# 提交/PR 自动跑三件事：clippy 零告警、全量测试、前端构建。
+# 本地等价命令（提交前自查）：
+#   cargo clippy --all-targets -- -D warnings
+#   cargo test --no-fail-fast
+#   cd web && npm ci && npm run build
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust（clippy + 测试）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 工具链由 rust-toolchain.toml 钉死（stable-x86_64-pc-windows-msvc）
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: clippy（告警即失败）
+        run: cargo clippy --all-targets -- -D warnings
+
+      # 沙箱探针的 find_hog() 依赖 target/debug/sandbox_hog.exe，
+      # 而 cargo test / clippy 都不产普通 bin，必须显式构建（否则 CI 干净环境必挂）
+      - name: 构建二进制（沙箱探针依赖 target/debug 产物）
+        run: cargo build --bins
+
+      # 沙箱探针要真拉起受限进程（内存上限探针 60s），单独给时间预算。
+      # 托管 runner 起不了受限 token 子进程（cmd/git 未执行即 exit 0xC0000142），
+      # 探针测试会宿主自检后跳过并留原因（probes::restricted_host_limitation），本机仍全量执行
+      - name: 测试（全量，不 fail-fast）
+        run: cargo test --no-fail-fast
+        timeout-minutes: 25
+
+  frontend:
+    name: 前端（单测 + 构建）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 安装依赖
+        working-directory: web
+        run: npm ci
+
+      # 2026-10-30 起前端有纯逻辑单测（node:test，零额外依赖）：聊天分段/合并、
+      # 工具人话化、markdown 安全渲染。UI 改排布最容易回归的就是这些规则。
+      - name: 前端单测
+        working-directory: web
+        run: npm test
+
+      # 前端没有浏览器单测框架，这类回归靠静态体检兜：「fetch 之后忘 .json()」这个 bug 类
+      # 在本仓复发过两次（Response 当数据用 → 界面静默显示空值；Response 进
+      # postMessage → 插件面板整块瘫），脚本就是为它建的，必须进门禁
+      - name: fetch 解析体检
+        run: node scripts/check_fetch_json.mjs
+
+      - name: 构建（产物 web/dist，服务直接托管）
+        working-directory: web
+        run: npm run build
+
+      # {@html} 生成的 markdown 元素没有 Svelte 作用域类，样式必须 :global()；
+      # 写错时构建不报错、界面静默退化成默认样式（2026-10-30 实锤），所以构建后验产物。
+      - name: markdown 样式产物检查
+        run: node scripts/check_md_css.mjs
+
+  # 桌面壳是独立 crate（start.bat 日常入口会一并起它，内置浏览器就是壳里的 child
+  # webview），但它不参与根 crate 的 clippy/test——之前 CI 里连编译都没验证过，
+  # 编不过只会在用户机器上炸。这里补一道最小编译门禁。
+  desktop:
+    name: 桌面壳（构建）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop
+
+      - name: 构建壳
+        working-directory: desktop
+        run: cargo build

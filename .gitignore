@@ -1,0 +1,37 @@
+# target/
+desktop/target/
+/target
+/logs/
+/web/node_modules/
+/web/dist/
+/settings.json
+_check*.ps1
+
+# P6 恢复与续命产物
+/.agent/
+/.pawch-agent/
+HANDOFF.md
+.workbuddy/
+desktop/target/
+.attachments/
+
+# 内置运行时（随包携带的 MinGit 压缩包；打包时由 scripts/bundle_git.ps1 下载/校验）
+/runtime/
+
+# 发布打包产物（scripts/package_release.ps1 输出）
+/dist/
+# 安装器产物（scripts/build-installer.ps1 输出；installer 源码入库，产物不入库）
+/dist-installer/
+/installer/target/
+/installer/payload.zip
+target-smoke/
+
+# 本地探测/工具状态（不入库）
+/.probe-browser/
+/.zcode/
+/probe.xlsx
+/probe2.xlsx
+/settings.json.bak
+
+# computer 工具的运行期截图（用户/面板看，不入库）
+/screenshots/

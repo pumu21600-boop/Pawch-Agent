@@ -1,0 +1,1596 @@
+//! /api/chat 流式对话 + 请求级参数组装 + 取消（自 server.rs 按域拆出）
+
+use super::*;
+use super::gate::ChatGate;
+use super::memory::read_system_prompt;
+use super::subagent;
+use crate::core::steer::SteerMode;
+mod cancel;
+mod identity;
+mod media;
+mod turn;
+
+pub(crate) use cancel::*;
+pub(crate) use identity::clear_cache as clear_identity_cache;
+pub(crate) use media::*;
+pub(crate) use turn::*;
+
+
+#[derive(Debug, Deserialize)]
+pub struct ChatRequest {
+    /// 单轮消息（messages 为空时使用，兼容内置回退页）
+    #[serde(default)]
+    pub message: String,
+    /// 完整消息数组（role: user/assistant/tool），非空则优先
+    #[serde(default)]
+    pub messages: Option<Vec<Value>>,
+    /// 多模态媒体附件（图片、视频、音频）
+    #[serde(default)]
+    pub attachments: Option<Vec<MediaAttachment>>,
+    /// 请求级覆盖：非空优先于已保存设置（页面当前选择即时生效）
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub base_url: String,
+    /// 可选的请求级 key 覆盖（仅内存）；为空则用已保存设置
+    #[serde(default)]
+    pub api_key: String,
+    /// 审批档位覆盖（四档）：read-only / sandbox / auto / full-access（旧档名自动映射；缺省用配置默认）
+    #[serde(default)]
+    pub approval_mode: String,
+    /// 多会话：消息落进哪条会话；缺省自动新建（前端从 SSE `session` 事件拿回 id）
+    #[serde(default)]
+    pub session_id: String,
+    /// 027：同会话正在跑时这条消息怎么处理——false（缺省）= 排队，等这一轮跑完自动发；
+    /// true = 引导：并进正在跑的那一轮，模型下一个决策点就看到（不打断、不另起一轮）
+    #[serde(default)]
+    pub steer: bool,
+    /// 2026-10-22「立即发送」分家：true = 打断——置位打断信号（审批/工具/流式让位），
+    /// 消息并入本轮继续。与 steer 的区别就是「打断 vs 不打断」；都不带 = 排队。
+    #[serde(default)]
+    pub interrupt: bool,
+    /// B1：Plan 档（true=只读+先出计划；请求级字段，前端随会话持久化到 localStorage）
+    #[serde(default)]
+    pub plan_mode: bool,
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 本轮上下文 = 会话文件里的历史 + 本条新用户消息（见 chat() 里「历史的事实源」那段）。
+/// 文件末尾已经是同一条用户消息（同一条重发）就不重复接，免得上下文里同一句话出现两遍。
+/// 接不上（请求尾不是用户消息且 message 为空）时按原样返回文件历史，宁可少接不乱接。
+fn merge_file_history(mut file_msgs: Vec<Value>, req_history: &[Value], message: &str) -> Vec<Value> {
+    let mut tail = req_history
+        .last()
+        .filter(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+        .cloned()
+        .or_else(|| (!message.trim().is_empty()).then(|| json!({ "role": "user", "content": message })));
+    if let Some(last) = tail.as_mut() {
+        // 发送时间随消息落盘（2026-10-27）：前端气泡本来有 ts，但历史请求里没有，
+        // 重开/切回会话后用户消息的时间就消失了。模型请求侧由 sanitize 剥掉 ts。
+        if last.get("ts").and_then(Value::as_u64).is_none() {
+            last["ts"] = json!(now_ms());
+        }
+        let already = file_msgs
+            .last()
+            .map(|p| p.get("role").and_then(Value::as_str) == Some("user") && p.get("content") == last.get("content"))
+            .unwrap_or(false);
+        if !already {
+            file_msgs.push(last.clone());
+        }
+    }
+    file_msgs
+}
+
+/// 把投影通知（文档收件/媒体转接结果）并进最后一条 user 消息。
+/// 纯函数（可单测）：2026-10-08 修——原先是 handler 里的内联块，且无条件把
+/// content 整体换成字符串，第 1 步挂上去的原生多模态 parts（图片/音频）被静默
+/// 丢掉（「截图 + 合同.pdf」同发时模型只收到文档通知，截图从未进入上下文）。
+/// 数组形态：所有 text part 合成一条（投影在前、原正文在后），非 text part
+/// （image_url/input_audio/video_url）原样保留；字符串形态维持旧行为。
+fn apply_projections_to_last_user(history: &mut [Value], projections: &[String]) {
+    if projections.is_empty() {
+        return;
+    }
+    let Some(last_msg) = history.iter_mut().rev().find(|m| m["role"] == "user") else {
+        return;
+    };
+    match &last_msg["content"] {
+        Value::Array(arr) => {
+            let mut parts = arr.clone();
+            let orig = parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
+            parts.retain(|p| p.get("type").and_then(Value::as_str) != Some("text"));
+            let combined = if orig.trim().is_empty() {
+                projections.join("\n\n")
+            } else {
+                format!("{}\n\n{}", projections.join("\n\n"), orig.trim())
+            };
+            parts.insert(0, json!({ "type": "text", "text": combined }));
+            last_msg["content"] = json!(parts);
+        }
+        _ => {
+            let orig = last_msg["content"].as_str().unwrap_or("").trim().to_string();
+            let combined = if orig.is_empty() {
+                projections.join("\n\n")
+            } else {
+                format!("{}\n\n{}", projections.join("\n\n"), orig)
+            };
+            last_msg["content"] = json!(combined);
+        }
+    }
+}
+
+/// 消息信息卡的「来源配置」随消息一起落盘（2026-11-01）。
+///
+/// 核心层生成的 stats 只有模型/供应商，配置名（设置里那条「商汤」「硅基流动」）只有
+/// 服务端知道；原来只在流式事件里补，落盘的副本没有 → 刷新/切回会话后信息卡那一行
+/// 全是「—」。这里在 Snapshot 落盘前补齐；已有值的消息不动（可能是别的配置）。
+fn stamp_stats_config(messages: &mut [Value], config: &str) {
+    if config.is_empty() {
+        return;
+    }
+    for m in messages.iter_mut() {
+        if let Some(st) = m.get_mut("stats").and_then(Value::as_object_mut) {
+            st.entry("config".to_string()).or_insert_with(|| json!(config));
+        }
+    }
+}
+
+/// 一轮对话任务的 panic 兜底（2026-10-30）：此前整轮跑在裸 `tokio::spawn` 里，
+/// JoinHandle 被丢弃，任何 panic 只会让 SSE sender 被 drop → 流静默结束、`done`
+/// 事件从未发出 → 前端把空回答气泡删掉，用户看到「消息发出去，什么都没了」。
+///
+/// 现在把任务体包进 `catch_unwind`：捕到 panic 就发一条 `error` 事件（前端显示
+/// 错误气泡）+ 一条 `done`（前端正常收尾），并落一条 JSONL（kind=chat.turn_panicked）。
+/// 返回值仅供测试断言（None = 正常结束）。
+pub(super) async fn run_turn_guarded<F, S>(
+    session: &str,
+    mut send: S,
+    fut: F,
+) -> Option<String>
+where
+    F: std::future::Future<Output = ()>,
+    S: FnMut(Value),
+{
+    use futures_util::FutureExt;
+    match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
+        Ok(()) => None,
+        Err(payload) => {
+            let detail = panic_payload_text(payload.as_ref());
+            observability::try_event(EventType::Error, panic_event(session, &detail));
+            send(json!({
+                "session": session,
+                "error": format!(
+                    "本轮任务异常终止（内部错误）：{detail}。这条消息没有丢，可以直接重发；若反复出现，请把日志里的 chat.turn_panicked 记录一并反馈。"
+                ),
+            }));
+            send(json!({ "done": true }));
+            Some(detail)
+        }
+    }
+}
+
+/// 对话轮 panic 的 JSONL 记录（形状单测钉住；全局 panic hook 用另一条 `kind=panic`）。
+pub(super) fn panic_event(session: &str, detail: &str) -> Value {
+    json!({ "kind": "chat.turn_panicked", "session": session, "error": detail })
+}
+
+/// panic payload → 人话（`&str` / `String`；其它类型给固定说明）。
+fn panic_payload_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "未知 panic（payload 不是字符串）".to_string())
+}
+
+/// 流式对话：base_url/model/key 全部来自已保存设置（请求级 api_key 可覆盖）。
+pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -> Response {
+    let message = req.message.trim().to_string();
+    let req_model = req.model.trim().to_string();
+    let req_base_url = req.base_url.trim().to_string();
+    let req_api_key = req.api_key.trim().to_string();
+    let attachments = req.attachments.unwrap_or_default();
+    let history: Vec<Value> = match &req.messages {
+        Some(m) if !m.is_empty() => m.clone(),
+        _ => {
+            if message.is_empty() {
+                vec![]
+            } else {
+                vec![json!({ "role": "user", "content": message })]
+            }
+        }
+    };
+    let (tx, rx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
+    let gateway = state.gateway.clone();
+    let cancel_registry = state.cancel.clone();
+    let steer_queue = state.steer.clone();
+    let s = state.settings.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let active_cfg = s.active_or_default().clone();
+    let cfg = (*state.agent_cfg).clone();
+    let sandbox_cfg = (*state.sandbox_cfg).clone();
+    // 上下文预算：当前模型设了上下文长度就用它（覆盖全局 [context].budget_tokens）
+    let ctx_cfg = {
+        let mut c = (*state.context_cfg).clone();
+        if let Some(cl) = active_cfg.context_length {
+            c.budget_tokens = cl;
+        }
+        c
+    };
+    // AGENTS.md 双层注入（全局在前、项目在后）；记忆层随工作区热重开
+    let approvals = state.approvals.clone();
+    let session = state.session.clone();
+    let mem = state.memory.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let rec_cfg = (*state.recovery_cfg).clone();
+    // 多会话：请求带了合法 id 就用，没带就新建（前端从首个 SSE 事件拿 id）
+    let session_id = {
+        let sid = req.session_id.trim().to_string();
+        let valid = !sid.is_empty()
+            && sid.len() <= 64
+            && sid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+        if valid { sid } else { session.new_id() }
+    };
+    // 025：同一会话已在跑一轮 → **不拒收**：文本消息进追加队列，运行中的那一轮在下一个
+    // 决策点就会看到（原轮不打断、不另起一轮，会话文件保持单写者）。判定与登记仍在同一把
+    // 锁内（try_begin），并发请求不会双双通过检查；登记好的标志随任务移交 RAII 守卫
+    // CancelRun，任务结束（含提前 return / panic）自动注销。
+    // 例外：带附件的追加暂不支持（媒体流水线在轮首一次性构建），明确拒绝而不是悄悄丢附件。
+    // M2：这里的 history 在「接管」分支里会被换成会话快照 + 队列消息，故为可变绑定。
+    let mut history = history;
+    // 历史的事实源是**会话文件**，不是请求里的 messages（2026-10-05 真机实锤）。
+    // 前端只带气泡正文（role+content）：工具调用/思考/用时是挂在气泡上的界面字段，
+    // 序列化时不进请求。若照单全收请求的 messages 当本轮上下文，之后每次 Snapshot
+    // 落盘都按它整卷重写会话文件——每起一轮就把上一轮的工具卡/思考/用时抹掉，
+    // 只剩正在跑的那一轮（重启后只有最后一条能展开，前面全是光秃秃的文字）。
+    // 所以：文件里有历史就用文件，只把本条新用户消息接上去；文件空/新会话再说。
+    if let Some(f) = session.get(&session_id) {
+        history = merge_file_history(f.messages, &history, &message);
+    }
+    // 新会话没有文件可合并（history 直接来自请求）：补上本条 user 的发送时间，
+    // 免得第一条消息重开后再也看不到时间。模型请求侧由 sanitize 剥掉。
+    if let Some(obj) = history
+        .iter_mut()
+        .rev()
+        .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+        .and_then(Value::as_object_mut)
+    {
+        obj.entry("ts").or_insert_with(|| json!(now_ms()));
+    }
+    let mut run_flag = state.cancel.try_begin(&session_id);
+    if run_flag.is_none() {
+        let text = if !message.is_empty() {
+            message.clone()
+        } else {
+            history
+                .iter()
+                .rev()
+                .find(|m| m["role"] == "user")
+                .and_then(|m| m["content"].as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        };
+        if text.is_empty() && attachments.is_empty() {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": "消息为空" }))).into_response();
+        }
+        // 防线（2026-09-27 前端重发风暴教训）：单会话排队上限。正常永远到不了——
+        // 每条消息客户端只发一次；堆到上限说明客户端在循环重发，拒收并给人话，
+        // 别让队列被灌到几千条后一次性排进模型上下文。
+        if state.steer.pending(&session_id) >= 32 {
+            observability::event(
+                EventType::State,
+                json!({ "kind": "chat.queue_full", "session": session_id, "pending": state.steer.pending(&session_id) }),
+            );
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({
+                    "error": format!("会话 {session_id} 的排队消息已堆到上限（32 条）：客户端可能在循环重发。请点「停止」清空队列后再发。")
+                })),
+            )
+                .into_response();
+        }
+        // 027 + 2026-10-22 三级分家：缺省 = 排队（这一轮跑完自动接着发）；
+        // steer=true = 引导（并入本轮，不打断，模型下一个决策点看到）；
+        // interrupt=true = 立即发送（打断信号置位：审批/工具/流式三个等待点让位，
+        // 消息并入本轮继续——打断不是停，是「放下手里的、马上听我的」）。
+        let mode = if req.interrupt {
+            SteerMode::Interrupt
+        } else if req.steer {
+            SteerMode::Steer
+        } else {
+            SteerMode::Queued
+        };
+        let immediate = mode != SteerMode::Queued;
+        // 2026-11-03：引导/立即发送支持附件。媒体流水线在这里（读请求时）一次性
+        // 构好 content——原生支持就内联内容块，文档/不支持的媒体落盘 + 文本通知；
+        // 核心循环只负责把 content 原样并进本轮，不再二次处理。
+        let content = if attachments.is_empty() {
+            json!(text.clone())
+        } else {
+            let fallback = if text.is_empty() { "请查看附带的媒体文件" } else { text.as_str() };
+            steer_content_with_attachments(fallback, &attachments, &active_cfg.capabilities).await
+        };
+        let pending = state.steer.push_content(&session_id, text, content, mode);
+        observability::event(
+            EventType::State,
+            json!({
+                "kind": "chat.steered",
+                "session": session_id,
+                "mode": match mode { SteerMode::Interrupt => "interrupt", SteerMode::Steer => "immediate", SteerMode::Queued => "queue" },
+                "pending": pending,
+            }),
+        );
+        let (stx, srx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
+        let notice = match mode {
+            SteerMode::Interrupt => {
+                "已中断当前操作并并入本轮：新指令立即生效".to_string()
+            }
+            SteerMode::Steer => {
+                "已引导：不打断当前操作，跑完这步就并入（本条不进对话气泡，静默生效）".to_string()
+            }
+            SteerMode::Queued => {
+                "已排队：当前这一轮结束后自动发送（想马上生效，点这条消息上的「立即发送」或「引导」）"
+                    .to_string()
+            }
+        };
+        let flag = if immediate { "steered" } else { "queued" };
+        // M2 收口：入队的这一刻，上一轮可能刚好收尾（它的收尾 drain 已经跑过）——
+        // 那样这条就没人取了。再抢一次占位：抢到 = 确实已结束 → 本次请求直接把队列
+        // 里的消息跑掉（不让消息悬在队列里等下一次活动）；抢不到 = 真的还在跑，照常回执。
+        if let Some(f) = state.cancel.try_begin(&session_id) {
+            let extra = state.steer.drain_all(&session_id);
+            let snap = session.get(&session_id).map(|s| s.messages).unwrap_or_default();
+            let mut merged = if snap.is_empty() { history.clone() } else { snap };
+            for s in &extra {
+                merged.push(match s.mode {
+                    SteerMode::Interrupt => json!({ "role": "user", "content": s.content.clone(), "interrupted": true, "ts": now_ms() }),
+                    _ => json!({ "role": "user", "content": s.content.clone(), "steered": true, "ts": now_ms() }),
+                });
+            }
+            observability::event(
+                EventType::State,
+                json!({ "kind": "chat.takeover", "session": session_id, "count": extra.len() }),
+            );
+            history = merged;
+            run_flag = Some(f);
+        } else {
+            let _ = stx.send(Ok(json_event(json!({ "session": session_id.clone() }))));
+            let _ = stx.send(Ok(json_event(json!({ flag: true, "notice": notice }))));
+            let _ = stx.send(Ok(json_event(json!({ "done": true }))));
+            return Sse::new(UnboundedReceiverStream::new(srx)).into_response();
+        }
+    }
+    // 构造上不可达（占位/接管必得其一）；显式 500 而不是 expect——新增分支忘接
+    // run_flag 时，panic 拖垮的是整个 agent 进程（F12）
+    let Some(run_flag) = run_flag else {
+        observability::event(
+            EventType::Error,
+            json!({ "kind": "chat.run_flag_missing", "session": session_id }),
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "服务内部状态异常：会话占位缺失，请重发这条消息" })),
+        )
+            .into_response();
+    };
+    // 滚动摘要：从会话文件带出旧摘要继续压
+    let prior_summary = session.get(&session_id).and_then(|f| f.summary);
+    // 子代理派发器：主对话任务才挂（子代理自己的无头轮不挂——v1 不支持嵌套）。
+    // 在 spawn 前构建：dispatcher 持 AppState 克隆，任务里随 LoopChannels 带进核心循环。
+    let subagents: Option<Arc<dyn crate::core::subagent::SubagentRunner>> =
+        Some(Arc::new(subagent::SubagentDispatcher {
+            state: state.clone(),
+            limits: (*state.subagent_cfg).clone(),
+            // 「跟随父对话」模式依据：本轮的请求级三元组原样带给子代理（空=激活配置）
+            parent_model: req.model.clone(),
+            parent_base_url: req.base_url.clone(),
+            parent_api_key: req.api_key.clone(),
+        }));
+    // 子代理 token 并入本任务预算的水印（只计自己没计过的增量）
+    let subagent_seen = std::sync::atomic::AtomicU64::new(subagent::subagent_tokens(&session_id));
+    // 审批档位归一化（四档）：旧档名映射保留兼容 → 写入共享档位供 gate 活读。
+    // full-access 需 config 总开关，没开就降级为 auto 并告知前端（档位与实际权限保持一致）。
+    let allow_unsandboxed = cfg.allow_unsandboxed;
+    let (mode, mode_notice) = normalize_mode(&cfg, &req.approval_mode);
+    if let Some(n) = mode_notice {
+        let _ = tx.send(Ok(json_event(json!({ "notice": n }))));
+    }
+    // M1：档位写进**本会话**（不再写全局默认，否则并发多会话会互相覆盖——
+    // 后到者生效可能让另一个会话以比预期更宽松的档位执行）
+    if let Ok(mut m) = state.session_approval.write() {
+        m.insert(session_id.clone(), mode.clone());
+    }
+
+    // 审计 07：SSE 断线感知——send 失败即对端没了（关网页/断网/刷新）。
+    // cancel_on_disconnect 开 → 看门狗取消本轮；关（默认）→ 任务跑完，刷新可续聊。
+    let peer_gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // 任务结束标志（看门狗退出用；None = 本功能关着）。2026-10-08 修（M2）：
+    // 任务正常跑完后 tx 随任务 drop、不再有 send，peer_gone 永远为 false →
+    // 看门狗每 2s 空转到页面关闭，每个请求泄漏一个永久任务。
+    let mut watchdog_done: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> = None;
+    let cancel_on_disconnect = state
+        .settings
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .features
+        .cancel_on_disconnect;
+    if cancel_on_disconnect {
+        let watch_reg = state.cancel.clone();
+        let watch_sid = session_id.clone();
+        let watch_gone = peer_gone.clone();
+        let task_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watch_done = task_done.clone();
+        watchdog_done = Some(task_done);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                // 顺序要害：**先查结束再查断线**——任务结束后 flag 可能已被同会话
+                // 新一轮 try_begin 复用，这时的 cancel 会误杀新轮（客户端在 done
+                // 之后才掉线的场景）。
+                if watch_done.load(std::sync::atomic::Ordering::Relaxed) {
+                    break; // 本轮已结束：不收尾（flag 可能属于新一轮）
+                }
+                if watch_gone.load(std::sync::atomic::Ordering::Relaxed) {
+                    watch_reg.cancel(&watch_sid);
+                    break;
+                }
+            }
+        });
+    }
+    // 2026-10-30：整轮任务套 catch_unwind——panic 不再让 SSE 静默结束（前端空白气泡），
+    // 而是转成 error 事件 + JSONL（见 run_turn_guarded）。
+    let guard_tx = tx.clone();
+    let guard_session = session_id.clone();
+    tokio::spawn(async move {
+        // 取消登记在 handler 入口已占位。守卫必须在**任务体第一行**就接管——放在
+        // 任务体内部的话，之前任何一处 panic 都会带着仍然登记着的会话一起 unwind，
+        // 留下「永远在跑」的僵尸（2026-10-30 真机 panic 自检实锤）。
+        let initial_run = CancelRun::from_flag(cancel_registry.clone(), &guard_session, run_flag);
+        run_turn_guarded(
+            &guard_session,
+            |payload| {
+                let _ = guard_tx.send(Ok(json_event(payload)));
+            },
+            async move {
+        // 非 move 闭包：按引用捕获 tx / peer_gone——ChatGate 后面还要 tx.clone()
+        let send = |payload: Value| {
+            if tx.send(Ok(json_event(payload))).is_err() {
+                peer_gone.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        };
+        // 看门狗退出信号：任务体任何出口（含 panic / 提前 return）都置位
+        struct DoneGuard(Option<std::sync::Arc<std::sync::atomic::AtomicBool>>);
+        impl Drop for DoneGuard {
+            fn drop(&mut self) {
+                if let Some(f) = &self.0 {
+                    f.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        let _done_guard = DoneGuard(watchdog_done);
+        // D2：本轮取消标志（会话级）——新会话不再复位别人的标志，停止只停本会话。
+        // N1：标志已在进入 handler 时占位登记（同会话并发在门口就 409）。
+        // 守卫在任务结束（含提前 return / panic）时注销登记，不留「永远在跑」的僵尸会话。
+        // M2：run/cancel 可重绑——收尾时会先注销占位、再取队列续跑一轮。
+        // 初始守卫在 spawn 外层创建（见上），这里直接接管，保证任务体任何位置 panic 都注销。
+        let mut run = initial_run;
+        let mut cancel = run.flag.clone();
+        // 摘要槽：Summary 事件写入，Snapshot 落盘时随会话持久化
+        let summary_slot: Arc<std::sync::Mutex<Option<String>>> =
+            Arc::new(std::sync::Mutex::new(prior_summary.clone()));
+        // 025：本任务最新一次会话快照（消息全量，不含 system）——迟到的追加消息
+        // 要接着再跑一轮时，用它当上下文，而不是重新问客户端要历史。
+        let last_snapshot: Arc<std::sync::Mutex<Vec<Value>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        if history.is_empty() {
+            send(json!({ "error": "消息为空" }));
+            return;
+        }
+        // 先把会话 id 告诉前端（新建时它还不知道）
+        send(json!({ "session": session_id }));
+
+        // 渠道组装提前：普通主循环与「身份快路」共用同一份主渠道（请求级
+        // model/base_url/key 覆盖也在这里生效）。
+        let ch = assemble_turn_channels(&state, &s, &active_cfg, &req_model, &req_base_url, &req_api_key);
+        for n in &ch.notices {
+            send(json!({ "notice": n }));
+        }
+
+        // 纯身份问题快路（2026-10-27 用户彻查令）：带 19 个工具的主循环会被
+        // agent 工具集带偏（真机矩阵：step 随机答 Step/Kimi/Claude/Kiro），而
+        // 同一渠道的裸请求 5/5 答 Step。这里用干净上下文探测直接答，不经过工具；
+        // 结果缓存 1 小时，并把自述写进后续系统提示的【自我认知】。
+        // 只拦短句纯身份问题；带任务/附件/排队消息一律走普通主循环。
+        if identity::is_identity_question(&message)
+            && !req.steer
+            && !req.interrupt
+            && !req.plan_mode
+            && attachments.is_empty()
+            && state.steer.pending(&session_id) == 0
+        {
+            match identity::probe(&state, &ch.primary, &session_id).await {
+                Ok(answer) => {
+                    let mut msgs = session.get(&session_id).map(|f| f.messages).unwrap_or_default();
+                    let same = msgs
+                        .last()
+                        .and_then(|m| {
+                            (m.get("role").and_then(Value::as_str) == Some("user"))
+                                .then(|| m.get("content").and_then(Value::as_str) == Some(message.as_str()))
+                        })
+                        .unwrap_or(false);
+                    if !same {
+                        msgs.push(json!({ "role": "user", "content": message, "ts": now_ms() }));
+                    }
+                    let stats = json!({
+                        "model": ch.primary.model,
+                        "provider_id": ch.primary.params.provider_id,
+                        "config": active_cfg.name.clone(),
+                        "identity_probe": true,
+                    });
+                    msgs.push(json!({ "role": "assistant", "content": answer, "ts": now_ms(), "stats": stats.clone() }));
+                    let prior = session.get(&session_id).and_then(|f| f.summary);
+                    if let Err(e) = session.save(&session_id, &msgs, prior.as_deref()) {
+                        observability::event(EventType::Error, json!({ "message": format!("身份问答落盘失败: {e}") }));
+                    }
+                    observability::event(
+                        EventType::State,
+                        json!({
+                            "kind": "identity.probe_answered",
+                            "session": session_id,
+                            "model": ch.primary.model,
+                            "answer": answer,
+                        }),
+                    );
+                    send(json!({ "turn_stats": stats }));
+                    send(json!({ "content": answer }));
+                    send(json!({ "done": true }));
+                    return;
+                }
+                Err(e) => {
+                    // 探测失败不堵路：提示后继续普通主循环（可能被工具带偏，
+                    // 但用户至少拿到回答或真实错误）。
+                    observability::event(EventType::Error, json!({ "message": format!("身份探测失败: {e}") }));
+                    send(json!({ "notice": format!("快速身份问答没走通（{e}），已改为正常对话回答") }));
+                }
+            }
+        }
+
+        // 系统约定 + 双层 AGENTS.md + 技能索引（与无头会话同一组装路径）。
+        // **不含**「项目现状」brief——它只在新会话第一轮出现，放进系统提示会让
+        // 第 2 轮 system 变短、system+tools 稳定区缓存全失效（e2e 实测第 2 轮
+        // 命中 21%）；改并进首条 user 消息，随 messages 区走（turn.rs 有完整纪律注释）。
+        let system_prompt = turn_system_prompt(&state, &ch.primary).await;
+
+        // 多模态媒体理解流水线：感知媒体附件与视觉/视频/音频解析能力
+        let mut history = history;
+        // 025：续跑一轮时摘要可能被上一轮更新（见收尾处的重新赋值）
+        let mut prior_summary = prior_summary;
+        // 新会话第一轮：项目现状 brief 并进首条 user 消息（不进系统提示，保缓存前缀）
+        let brief = first_turn_brief(&state, &session_id).await;
+        inject_brief_into_first_user(&mut history, &brief);
+        if !attachments.is_empty() {
+            // features.roles=false（「功能桥接」关）= 不走专家渠道，媒体附件统一占位文本
+            let roles = if s.features.roles { s.roles.as_ref() } else { None };
+            let mut native_attachments: Vec<&MediaAttachment> = Vec::new();
+            let mut forward_attachments: Vec<&MediaAttachment> = Vec::new();
+            let mut doc_attachments: Vec<&MediaAttachment> = Vec::new();
+            let mut projections: Vec<String> = Vec::new();
+
+            for att in &attachments {
+                // 文档流水线：Office/PDF 类附件不做多模态内联（视觉模型解析不了
+                // 二进制文档），一律落盘工作区 + 文本通知，交给文档处理技能
+                if att.is_document() {
+                    doc_attachments.push(att);
+                    continue;
+                }
+                let is_vid = att.is_video();
+                let is_aud = att.is_audio();
+                // 未知扩展名的 is_image 兜底只对**转接路径**成立（媒体理解按图片试一
+                // 次）；原生内联必须是真图片 mime——data:application/octet-stream
+                // 塞进 image_url，渠道直接 400、整轮失败（2026-10-08 修）。
+                let is_img = att.is_image() && att.effective_mime().starts_with("image/");
+
+                let supports_natively = (is_img && active_cfg.capabilities.vision)
+                    || (is_vid && active_cfg.capabilities.video)
+                    || (is_aud && active_cfg.capabilities.audio);
+
+                if supports_natively {
+                    native_attachments.push(att);
+                } else {
+                    forward_attachments.push(att);
+                }
+            }
+
+            // 1. 对于主模型原生支持的媒体类型，挂载原生多模态结构
+            if !native_attachments.is_empty()
+                && let Some(last_msg) = history.iter_mut().rev().find(|m| m["role"] == "user") {
+                    let mut parts = Vec::new();
+                    if let Some(txt) = last_msg["content"].as_str() {
+                        parts.push(json!({ "type": "text", "text": txt }));
+                    }
+                    for att in native_attachments {
+                        if att.is_audio() {
+                            parts.push(json!({
+                                "type": "input_audio",
+                                "input_audio": {
+                                    "data": att.raw_base64(),
+                                    "format": att.audio_format()
+                                }
+                            }));
+                        } else if att.is_video() {
+                            // 视频按 OpenAI 的 video_url 形状发（2026-10-08 修：原先
+                            // 也走 image_url，data:video/mp4 塞进 image_url 两种协议
+                            // 路径都必 400——Anthropic 转换器只认 image/* mime）
+                            parts.push(json!({
+                                "type": "video_url",
+                                "video_url": { "url": att.data_url() }
+                            }));
+                        } else {
+                            parts.push(json!({
+                                "type": "image_url",
+                                "image_url": { "url": att.data_url() }
+                            }));
+                        }
+                    }
+                    last_msg["content"] = json!(parts);
+                }
+
+            // 0. 文档类附件：落盘工作区 .attachments/ + 注入文档清单通知（与多模态流水线完全隔离）
+            if !doc_attachments.is_empty() {
+                let ws = crate::tools::workspace_root();
+                let _ = std::fs::create_dir_all(ws.join(".attachments"));
+                ensure_attachments_ignored(&ws);
+                for att in &doc_attachments {
+                    match persist_attachment(att, &ws) {
+                        Some(rel) => projections.push(att.document_intake_notice(&ws, &rel).await),
+                        None => projections.push(format!(
+                            "[📄 文档附件「{}」保存失败：附件内容解码异常，请用户重新发送该文件]",
+                            att.name
+                        )),
+                    }
+                }
+            }
+
+            // 2. 对于主模型不支持的媒体类型，走专职转接与确定性文本投影（对齐 DSH media-understanding 规范）
+            if !forward_attachments.is_empty() {
+
+                for att in forward_attachments {
+                    let is_vid = att.is_video();
+                    let is_aud = att.is_audio();
+                    let kind = if is_vid { "video" } else if is_aud { "audio" } else { "image" };
+                    let kind_cn = if is_vid { "视频" } else if is_aud { "音频" } else { "图片" };
+                    let success_label = if is_vid { "Video understanding" } else if is_aud { "Audio understanding" } else { "Image understanding" };
+
+                    // 持久化附件到工作区 .attachments/ 便于主模型与工具查阅
+                    // A5：附件目录自动进工作区 git 排除（幂等，只追加）
+                    let safe_name = persist_attachment(att, &crate::tools::workspace_root())
+                        .unwrap_or_else(|| "attachment".to_string());
+
+                    // 1) 专属路由解析（对齐 DSH）：严格隔离，仅使用用户在 roles 中针对该模态显式配置的渠道，严禁自动跨渠道降级
+                    let role_target = if is_vid {
+                        roles.and_then(|r| r.video.as_deref())
+                    } else if is_aud {
+                        roles.and_then(|r| r.audio.as_deref())
+                    } else {
+                        roles.and_then(|r| r.vision.as_deref())
+                    };
+
+                    let mut candidates: Vec<gateway::Channel> = Vec::new();
+                    if let Some(n) = role_target.filter(|n| !n.trim().is_empty())
+                        && let Some(ch) = find_channel(&s, n) {
+                            candidates.push(ch);
+                        }
+
+                    // 2) 若该模态未配置路由或无可用候选：对齐 DSH 替换为确定性占位文本（deterministic placeholder），绝不发起注定失败的请求
+                    if candidates.is_empty() {
+                        let placeholder = format!(
+                            "[{kind} omitted because no {kind}-understanding model is configured; 附件「{}」已跳过并保存至工作区 .attachments/{}。当前未在“设置 → 功能桥接”中配置{}理解专家 ({})，请在设置中指定具备{}能力的多模态模型（如 Gemini、Whisper、Qwen-Audio 等），或直接粘贴文字描述]",
+                            att.name,
+                            safe_name,
+                            kind_cn,
+                            if is_aud { "Audio" } else if is_vid { "Video" } else { "Vision" },
+                            kind_cn
+                        );
+                        projections.push(placeholder);
+                        continue;
+                    }
+
+                    // 3) 能力预检：以专家配置里用户勾选的能力标记为准（勾了「图片解析」就放行）；
+                    //    专家配置解析失败（角色名指不到配置）按未勾选处理，不按名猜
+                    let first_ch = &candidates[0];
+                    let first_provider = first_ch.params.provider_id.as_deref().unwrap_or("openai_compat");
+                    let first_model = &first_ch.model;
+
+                    let gate_ok = match role_target
+                        .and_then(|id| s.configs.iter().find(|c| c.id == id || c.name == id))
+                    {
+                        Some(expert) => match kind {
+                            "audio" => expert.capabilities.audio,
+                            "video" => expert.capabilities.video,
+                            "image" => expert.capabilities.vision,
+                            _ => false,
+                        },
+                        None => false,
+                    };
+                    if !gate_ok {
+                        let text = format!(
+                            "[{} not run: 专家配置「{}/{}」未勾选{}解析能力。该{}未展示给主模型。请在「设置 → 模型配置」选中该专家配置并勾选「{}解析」（或在「功能桥接」把{}理解专家换成具备该能力的模型）]",
+                            success_label, first_provider, first_model, kind_cn, kind_cn, kind_cn, kind_cn
+                        );
+                        projections.push(text);
+                        continue;
+                    }
+
+                    let candidate_prompts: Vec<Value> = if is_aud {
+                        vec![
+                            // 格式 1（标准 OpenAI input_audio：媒体块在前，提示词在后）
+                            json!([
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "input_audio",
+                                            "input_audio": {
+                                                "data": att.raw_base64(),
+                                                "format": att.audio_format()
+                                            }
+                                        },
+                                        {
+                                            "type": "text",
+                                            "text": "Transcribe and describe this audio in detail. Cover spoken content and notable non-speech sounds in order. 请仔细倾听并详细转录该音频内容：逐字转录全部语音对话内容（ASR），提取说话人语调与关键要点，并记录环境背景声音。"
+                                        }
+                                    ]
+                                }
+                            ]),
+                            // 格式 2（备选 audio_url）
+                            json!([
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "audio_url",
+                                            "audio_url": { "url": att.data_url() }
+                                        },
+                                        {
+                                            "type": "text",
+                                            "text": "Transcribe and describe this audio in detail. Cover spoken content and notable non-speech sounds in order."
+                                        }
+                                    ]
+                                }
+                            ]),
+                        ]
+                    } else if is_vid {
+                        vec![
+                            json!([
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "video_url",
+                                            "video_url": { "url": att.data_url() }
+                                        },
+                                        {
+                                            "type": "text",
+                                            "text": "Describe this video in detail: what happens across it, including visual content and any speech or captions, in chronological order. 请按时间顺序详细描述该视频：视频中发生了什么，包括画面视觉内容、任何语音旁白或字幕。"
+                                        }
+                                    ]
+                                }
+                            ]),
+                            json!([
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "image_url",
+                                            "image_url": { "url": att.data_url() }
+                                        },
+                                        {
+                                            "type": "text",
+                                            "text": "Describe this video in detail: what happens across it, including visual content and any speech or captions, in chronological order."
+                                        }
+                                    ]
+                                }
+                            ]),
+                        ]
+                    } else {
+                        vec![
+                            json!([
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "image_url",
+                                            "image_url": { "url": att.data_url() }
+                                        },
+                                        {
+                                            "type": "text",
+                                            "text": "Describe this image in detail. Cover every element that would matter to someone who cannot see it, in the order a reader would need. 请详细观察并深度解析该图片内容：涵盖所有对看不见该图片的人至关重要的元素，逐字提取画面中的所有可见文本、代码片段、图表与数值数据。"
+                                        }
+                                    ]
+                                }
+                            ])
+                        ]
+                    };
+
+                    let mut desc_result = None;
+                    let mut last_route = (first_provider.to_string(), first_model.clone());
+                    let mut last_error_msg = String::new();
+                    // 用户停止 → 不再试下一个候选渠道，也不为后面的附件继续转写
+                    let mut cancelled = false;
+
+                    for vch in &candidates {
+                        let provider = vch.params.provider_id.as_deref().unwrap_or("openai_compat");
+                        last_route = (provider.to_string(), vch.model.clone());
+
+                        let mut params = vch.params.clone();
+                        // DSH 规范：上限 1500 tokens，清空思考参数
+                        params.max_tokens = Some(params.max_tokens.unwrap_or(1500).min(1500));
+                        params.thinking = None;
+
+                        let mut call_err = None;
+                        for prompt_variant in &candidate_prompts {
+                            // 媒体旁路调用记台账（purpose=media，归属本会话）
+                            let media_ctx = gateway::UsageCtx::aux(&session_id, "media");
+                            // 旁路走非流式 complete，本身不看取消标志：用户点了停止
+                            // 就别再为转写/识图干等渠道（2026-10-20 修，同 bug 1/2 一类）
+                            let done = tokio::select! {
+                                r = gateway.complete(&media_ctx, &vch.base_url, &vch.model, &vch.api_key, prompt_variant, &params) => r,
+                                () = cancel.cancelled() => { cancelled = true; break; }
+                            };
+                            match done {
+                                Ok(text) if !text.trim().is_empty() => {
+                                    let is_refusal = text.contains("没有能力听音频")
+                                        || text.contains("无法听音频")
+                                        || text.contains("无法识别音频")
+                                        || text.contains("无法处理音频")
+                                        || text.contains("无法解析音频")
+                                        || text.contains("我是纯文本")
+                                        || text.contains("不支持音频")
+                                        || text.contains("未附带音频")
+                                        || text.contains("没看到音频")
+                                        || text.contains("don't have the ability to listen")
+                                        || text.contains("cannot process audio")
+                                        || text.contains("text-based AI assistant")
+                                        || text.contains("no audio file was attached")
+                                        || text.contains("don't see any audio file")
+                                        || text.contains("looks like no audio");
+                                    if is_refusal {
+                                        call_err = Some(format!("上游网关或模型声明未收到/无法解析该音频: {}", text.trim()));
+                                    } else {
+                                        desc_result = Some(text.trim().to_string());
+                                        break;
+                                    }
+                                }
+                                Ok(_) => {
+                                    call_err = Some("模型返回空内容".to_string());
+                                }
+                                Err(e) => {
+                                    observability::event(
+                                        EventType::Error,
+                                        json!({ "kind": "media.error", "modality": kind, "model": vch.model, "url": vch.base_url, "error": format!("{e:#}") }),
+                                    );
+                                    call_err = Some(format!("{e}"));
+                                }
+                            }
+                        }
+
+                        if desc_result.is_some() || cancelled {
+                            break;
+                        }
+                        if let Some(err) = call_err {
+                            last_error_msg = err;
+                        }
+                    }
+                    // 取消已置位：不再为剩余附件做转写/识图，交给下游的取消收尾
+                    if cancelled {
+                        projections.push(format!("[{success_label}: 已取消]"));
+                        break;
+                    }
+
+                    // 4) 投影格式化（DSH 规范）
+                    let substituted_text = if let Some(text) = desc_result {
+                        format!("[{} ({}/{}):\n{}]", success_label, last_route.0, last_route.1, text)
+                    } else {
+                        format!("[{} failed ({}/{}): {}]", success_label, last_route.0, last_route.1, last_error_msg)
+                    };
+                    projections.push(substituted_text);
+                }
+            }
+
+            // 5) 历史投影（projectMessages）：直接替换用户消息内容，媒体字节不传给会话模型。
+            // 文档附件与媒体转接共用同一份投影；注意这段必须在 forward 分支**外**——
+            // 原来嵌在分支里，纯文档消息（无转接附件）的收件通知从来没进过模型上下文
+            // （2026-10-06 真机实锤：模型收不到附件路径，靠 dir 翻目录才找到文件）。
+            apply_projections_to_last_user(&mut history, &projections);
+        }
+        // 渠道已在任务开头组装（身份快路与主循环共用），这里不再重复组装；
+        // 提示也已在开头发给前端。
+        // 钩子（027）：单任务累计 token（预算通知用；[hooks] 未配置时零开销）
+        // 同一个 Arc 标志同时驱动「剩余步骤改走降级渠道」（核心循环每步读它）
+        let task_tokens = std::sync::atomic::AtomicU64::new(0);
+        let budget_fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // 用量快照槽：种子取会话文件里上次落盘的快照（跨请求/跨重启延续累计）；
+        // ContextUsage 事件进槽并在那一刻落盘（每步至少两次、永远是含最新回复的终态），
+        // ApiUsage 只更新槽里的累计与锚点（缓存行/预算用）
+        let usage_slot = std::sync::Mutex::new(
+            session.get(&session_id).and_then(|f| f.usage).unwrap_or_default(),
+        );
+        loop {
+            // 锚点带入本轮的起点：上一轮结束时的 (占用终值 projected, 锚点估价) ——
+            // 新起一轮不会退回估算口径（DSH 的测量是会话级的，样本一直有效）。
+            // 必须用 projected（含最后一次回复），用 pressure（裸 prompt）会把上一轮
+            // 的回复整段漏掉（锚点真实值与 anchor_est 不配对）
+            let prior_anchor = {
+                let u = usage_slot.lock().unwrap_or_else(|e| e.into_inner());
+                u.anchor()
+            };
+            let outcome = agent::run_task(
+                &gateway,
+                // 续跑一轮时这些值复用（Channel 是克隆廉价的连接参数快照）
+                &agent::LoopChannels {
+                    primary: ch.primary.clone(),
+                    summary: ch.summary.clone(),
+                    title: ch.title.clone(),
+                    fallbacks: ch.fallbacks.clone(),
+                    // 预算降级渠道 + 共享超预算标志（见上方 budget_fired）
+                    downgrade: ch.downgrade.clone(),
+                    // 视觉转写渠道（主模型没勾图片解析时，给截图当眼睛）
+                    vision: ch.vision.clone(),
+                    budget_hit: budget_fired.clone(),
+                    // 子代理派发（None 的任务不许派发）
+                    subagents: subagents.clone(),
+                    prior_anchor,
+                },
+                // 提示词保持最小：prompts/system.md（"用中文简洁回答"）+ AGENTS.md 仓库事实 + 技能索引（无技能时不占上下文）。
+                // 不注入模型名/身份/角色——特意为之，模型自造身份属可接受代价（坑 13）
+                &system_prompt,
+                &history,
+                &cancel,
+                &cfg,
+                &sandbox_cfg,
+                crate::sandbox::SANDBOX_CPU_PERCENT, // 固定值（2026-10-06 撤可调项）
+                &ctx_cfg,
+                &rec_cfg,
+                &mem,
+                prior_summary.clone(),
+                req.plan_mode,
+                &ChatGate {
+                    mode: state.approval_mode.clone(),
+                    session_modes: state.session_approval.clone(),
+                    allow_unsandboxed,
+                    unsandboxed_approval: cfg.unsandboxed_approval,
+                    pending: approvals.clone(),
+                    // A3：会话内同类允许的作用域与记忆存储
+                    session_id: session_id.clone(),
+                    meta: state.approval_meta.clone(),
+                    approved: state.approved_scopes.clone(),
+                plan_mode: req.plan_mode,
+                tx: tx.clone(),
+                cancel: cancel.clone(),
+                steer: steer_queue.clone(),
+            },
+                crate::tools::workspace_root(),
+                |ev| match ev {
+                    AgentEvent::Content(c) => send(json!({ "content": c })),
+                    // 思考=关时不上报 reasoning——渠道（如 StepFun 推理模型）无视
+                    // 「不发思考参数」仍自行思考，用户明确关了就不要再显示思考过程
+                    AgentEvent::Reasoning(r) => {
+                        if ch.primary.params.thinking.as_deref() != Some("off") {
+                            send(json!({ "reasoning": r }))
+                        }
+                    }
+                    AgentEvent::ToolCall { name, args } => {
+                        send(json!({ "tool_call": { "name": name, "args": args } }))
+                    }
+                    AgentEvent::ToolCallArgs { name, args } => {
+                        send(json!({ "tool_call_args": { "name": name, "args": args } }))
+                    }
+                    AgentEvent::ToolResult { name, ok, preview } => {
+                        send(json!({ "tool_result": { "name": name, "ok": ok, "preview": preview } }))
+                    }
+                    AgentEvent::StepLimit(n) => send(json!({ "step_limit": n })),
+                    AgentEvent::ContextUsage { pressure, projected, window, breakdown } => {
+                        // 快照进槽并落盘：这是圆环/构成/跨轮锚点的唯一来源
+                        //（每步至多三次事件，最后一次必是含最新回复的终态）
+                        let snap = {
+                            let mut u = usage_slot.lock().unwrap_or_else(|e| e.into_inner());
+                            u.apply_context(pressure, projected, window, &breakdown);
+                            u.clone()
+                        };
+                        if let Err(e) = session.update_usage(&session_id, snap) {
+                            observability::debug(&format!("用量快照落盘失败: {e}"));
+                        }
+                        send(json!({
+                            "context_usage": {
+                                "pressure": pressure,
+                                "projected": projected,
+                                "window": window,
+                                "breakdown": {
+                                    "messages": breakdown.messages,
+                                    "tools": breakdown.tools,
+                                    "system": breakdown.system,
+                                    "other": breakdown.other,
+                                    "tools_schema": breakdown.tools_schema,
+                                },
+                            }
+                        }))
+                    }
+                    AgentEvent::ApiUsage { prompt_tokens, cached_tokens } => {
+                        // 钩子（027）：单任务累计 token 预算——超 [hooks] budget_tokens
+                        // 触发一次 budget_exceeded 通知挂点（降级策略本身留成本台账）
+                        // 子代理的花销并进本任务预算（水印增量，防拆子代理绕过预算）
+                        let sub_total = subagent::subagent_tokens(&session_id);
+                        let sub_fresh =
+                            sub_total.saturating_sub(subagent_seen.swap(sub_total, std::sync::atomic::Ordering::Relaxed));
+                        let total = task_tokens
+                            .fetch_add(prompt_tokens + sub_fresh, std::sync::atomic::Ordering::Relaxed)
+                            + prompt_tokens
+                            + sub_fresh;
+                        let budget = crate::hooks::budget_tokens();
+                        if crate::hooks::budget_exceeded(total, budget)
+                            && !budget_fired.swap(true, std::sync::atomic::Ordering::Relaxed)
+                        {
+                            crate::hooks::notify_budget_exceeded(&session_id, total, budget);
+                        }
+                        // 累计并入槽（缓存命中率行）；圆环不在这里改口径——它只认 ContextUsage
+                        {
+                            let mut u = usage_slot.lock().unwrap_or_else(|e| e.into_inner());
+                            u.apply_api(prompt_tokens, cached_tokens);
+                        }
+                        send(json!({ "api_usage": { "prompt_tokens": prompt_tokens, "cached_tokens": cached_tokens } }))
+                    }
+                    // 消息信息卡（2026-10-26）：核心层给的计时/模型画像，这里补上配置名
+                    // 再转前端（挂到正在流式的那条气泡上）
+                    AgentEvent::TurnStats { stats } => {
+                        let mut v = stats;
+                        v["config"] = json!(active_cfg.name.clone());
+                        send(json!({ "turn_stats": v }));
+                    }
+                    // 会话落盘：核心循环每关键点推全量消息（不含 system），写盘即续命。
+                    // brief 在落盘边界剥掉：模型上下文里留着（保缓存前缀），用户气泡
+                    // 里不能有——会话文件就是界面回显的数据源（turn.rs 有完整纪律注释）
+                    AgentEvent::Snapshot { messages } => {
+                        let mut messages = messages;
+                        strip_brief_from_first_user(&mut messages);
+                        // 信息卡的「来源配置」要随消息落盘：stats 由核心层生成（只有模型/供应商），
+                        // 配置名只有服务端知道——不补的话刷新/切回会话后那一行永远是「—」
+                        // （2026-11-01 真机实测：好多条消息的来源配置都是一条横杆）
+                        stamp_stats_config(&mut messages, &active_cfg.name);
+                        *last_snapshot.lock().unwrap_or_else(|e| e.into_inner()) = messages.clone();
+                        let cur_summary = summary_slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                        match session.save(&session_id, &messages, cur_summary.as_deref()) {
+                            Ok(()) => observability::event(
+                                EventType::State,
+                                json!({ "kind": "session.saved", "session": session_id, "messages": messages.len() }),
+                            ),
+                            Err(e) => observability::event(
+                                EventType::Error,
+                                json!({ "message": format!("会话落盘失败: {e}") }),
+                            ),
+                        }
+                    }
+                    // 滚动摘要：存槽里，下一次 Snapshot 落盘时随会话一起写 summary 字段
+                    AgentEvent::Summary(s) => {
+                        *summary_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
+                        send(json!({ "summary": true }))
+                    }
+                    // 改动统计条：撤销按钮恢复到任务起点基线
+                    AgentEvent::Checkpoint { id, files_changed, additions, deletions } => {
+                        send(json!({ "checkpoint": { "id": id, "files": files_changed, "additions": additions, "deletions": deletions } }))
+                    }
+                    // TITLE 角色：标题已生成 → 改会话文件并转前端
+                    AgentEvent::Title(t) => {
+                        match session.rename(&session_id, &t) {
+                            Ok(()) => send(json!({ "title": t })),
+                            Err(e) => observability::event(
+                                EventType::Error,
+                                json!({ "message": format!("会话改名失败: {e}") }),
+                            ),
+                        }
+                    }
+                    // B3：Plan 档结构化计划 → 前端计划卡（SSE 增字段；JSONL 由 agent 层记 plan.proposed）
+                    AgentEvent::PlanProposal { goal, steps, files } => {
+                        send(json!({ "plan_proposal": { "goal": goal, "steps": steps, "files": files } }))
+                    }
+                    AgentEvent::StepReset { content, reasoning } => {
+                        send(json!({ "reset": { "content": content, "reasoning": reasoning } }))
+                    }
+                    // 025：运行中追加的用户消息已并入本轮 → 前端补用户气泡
+                    AgentEvent::Steer { messages } => {
+                        send(json!({ "steer": { "messages": messages } }))
+                    }
+                    AgentEvent::Notice(n) => send(json!({ "notice": n })),
+                    // 临时通知撤回（如「正在重试…」在重试成功后）：前端删掉最后一条同文系统消息
+                    AgentEvent::NoticeClear(n) => send(json!({ "notice_clear": n })),
+                },
+            )
+            .await;
+        match outcome {
+            Ok(LoopOutcome::Done) => {}
+            Ok(LoopOutcome::Cancelled) => {
+                send(json!({ "cancelled": true }));
+                // 用户点了停止：排队的消息一并作废（「停」= 这一轮和还没轮上的话都别跑了）。
+                // 先注销占位再清队列（M2 同一顺序）：此后到达的消息会走正常路径自己跑，不会悬空。
+                drop(run);
+                steer_queue.drain_all(&session_id);
+                break;
+            }
+            Err(e) => {
+                // 出错也继续走下面的收尾：已排队的追加消息是用户发出去的话，不能因上一轮
+                // 失败被悄悄吞掉（若下一轮同样失败，会再报一次错，语义仍然清楚）
+                observability::event(EventType::Error, json!({ "message": e.to_string() }));
+                send(json!({ "error": e.to_string() }));
+                // 错误随会话落盘（重启/切回会话后报错气泡还在）。display_only 消息，
+                // 发送侧 replay 剥离，不进模型上下文。
+                {
+                    let mut snap = last_snapshot.lock().unwrap_or_else(|e| e.into_inner());
+                    snap.push(json!({ "role": "system", "content": format!("[错误] {e}"), "display_only": true }));
+                    let cur_summary = summary_slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    if let Err(se) = session.save(&session_id, &snap, cur_summary.as_deref()) {
+                        observability::event(
+                            EventType::Error,
+                            json!({ "message": format!("会话落盘失败: {se}") }),
+                        );
+                    }
+                }
+            }
+        }
+        // M2 收尾顺序：**先注销占位、再取队列**。顺序反过来的话，「入队后没人取」的窗口
+        // 就会出现（消息在收尾 drain 之后到达 → 队列里没人消费）。先注销后，这一瞬之后
+        // 到达的消息会走正常路径自己起一轮（而不是排队等人取）。
+        drop(run);
+        // 025/027：一轮跑完后还剩的排队消息（缺省模式，或最后一个决策点之后才到的——
+        // 含错过补取窗口的引导/打断）→ 用最后一轮快照当上下文，紧接着再跑一轮
+        // （同一个 SSE 流）：「进了队列的消息一定被处理」。带 mode：followup 的
+        // 消息也按 引导=steered 静默 / 打断=interrupted 气泡 打标记，与决策点并入同款。
+        let extra = steer_queue.drain_all(&session_id);
+        if extra.is_empty() {
+            send(json!({ "done": true }));
+            break;
+        }
+        // 还有排队的消息 → 抢回占位自己续跑；抢不到说明已有别的请求起来了，
+        // 把它们放回队列（那一轮的收尾会取走——入队与收尾的顺序保证不会悬空）。
+        let Some(f) = cancel_registry.try_begin(&session_id) else {
+            for s in extra {
+                steer_queue.push(&session_id, s.text, s.mode);
+            }
+            send(json!({ "done": true }));
+            break;
+        };
+        run = CancelRun::from_flag(cancel_registry.clone(), &session_id, f);
+        cancel = run.flag.clone();
+        let mut next: Vec<Value> = last_snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if next.is_empty() {
+            // 理论上到不了（每轮至少落一次快照）；兜底退回本轮历史，别把整轮丢掉
+            next = history.clone();
+        }
+        observability::event(
+            EventType::State,
+            json!({ "kind": "steer", "phase": "followup", "session": session_id, "count": extra.len() }),
+        );
+        let turn_msgs: Vec<Value> = extra
+            .iter()
+            .map(|s| match s.mode {
+                SteerMode::Interrupt => json!({ "role": "user", "content": s.content.clone(), "interrupted": true, "ts": now_ms() }),
+                _ => json!({ "role": "user", "content": s.content.clone(), "steered": true, "ts": now_ms() }),
+            })
+            .collect();
+        // 通知前端：这些排队消息现在开始跑了（气泡从「排队中」转成正式消息、开新回答气泡）
+        send(json!({ "turn": { "messages": turn_msgs } }));
+        next.extend(turn_msgs);
+        history = next;
+        // 滚动摘要跟着上一轮走（跑的过程中 Summary 事件更新过槽）
+        prior_summary = summary_slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        }
+        // 钩子（027）：任务结束挂点（Done / Cancelled / 出错都算结束；含续跑轮）
+        crate::hooks::session_end(&session_id).await;
+            },
+        )
+        .await;
+    });
+
+    Sse::new(UnboundedReceiverStream::new(rx)).into_response()
+}
+
+/// 本轮任务的取消标志守卫（D2）：登记即持标志，Drop 即注销。
+/// 任务正常结束、提前 return 或 panic 都会走到 Drop，注册表不留僵尸登记。
+/// 无头会话复用同一把守卫——「会话在跑」的登记随任务生命周期。
+pub(super) struct CancelRun {
+    registry: Arc<CancelRegistry>,
+    session: String,
+    flag: Arc<CancelFlag>,
+}
+
+impl CancelRun {
+    /// 接管一个**已登记**的标志（登记在 handler 入口由 `try_begin` 完成，
+    /// 这样「拒并发」与「占位」是同一个原子动作）。
+    pub(super) fn from_flag(registry: Arc<CancelRegistry>, session_id: &str, flag: Arc<CancelFlag>) -> Self {
+        Self { registry, session: session_id.to_string(), flag }
+    }
+}
+
+impl Drop for CancelRun {
+    fn drop(&mut self) {
+        self.registry.end(&self.session, &self.flag);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 2026-10-30：对话轮 panic 不再静默——必须发 error + done，取消登记随守卫注销
+    /// （否则前端停在「正在运行」，/api/cancel 也一直显示 running）。
+    #[tokio::test]
+    async fn panicking_turn_reports_error_and_leaves_no_zombie() {
+        let reg = Arc::new(CancelRegistry::new());
+        let flag = reg.try_begin("sess-panic").expect("应先占位成功");
+        let run = CancelRun::from_flag(reg.clone(), "sess-panic", flag);
+        let mut events: Vec<Value> = Vec::new();
+        let detail = run_turn_guarded("sess-panic", |v| events.push(v), async move {
+            let _run = run; // 模拟任务体持有的取消守卫（Drop 即注销）
+            panic!("boom-turn");
+        })
+        .await;
+        assert_eq!(detail.as_deref(), Some("boom-turn"), "要拿到 panic 信息");
+        assert_eq!(events.len(), 2, "应发 error + done 两条: {events:?}");
+        assert_eq!(events[0]["session"], json!("sess-panic"));
+        let err = events[0]["error"].as_str().unwrap_or_default();
+        assert!(err.contains("boom-turn"), "错误事件要带原因: {err}");
+        assert_eq!(events[1]["done"], json!(true), "要补 done 让前端收尾");
+        assert!(!reg.is_active("sess-panic"), "panic 后不许留下「永远在跑」的僵尸会话");
+    }
+
+    /// JSONL 记录形状（前端错误气泡之外的排障现场）。
+    #[test]
+    fn panic_event_shape() {
+        let v = panic_event("s1", "boom");
+        assert_eq!(v["kind"], json!("chat.turn_panicked"));
+        assert_eq!(v["session"], json!("s1"));
+        assert_eq!(v["error"], json!("boom"));
+    }
+
+    /// 本轮上下文取会话文件（工具调用/思考都在里面），只接上本条新用户消息。
+    /// 反例（本次修的真机 bug）：拿前端请求的 messages 当历史——它只有 role+content，
+    /// 于是每起一轮就把上一轮的工具卡/思考/用时从会话文件里抹掉，重启后全都展不开。
+    #[test]
+    fn file_history_wins_over_request_messages() {
+        let file = vec![
+            json!({"role":"user","content":"改名"}),
+            json!({"role":"assistant","content":null,"reasoning_content":"想一下",
+                   "tool_calls":[{"id":"c1","type":"function","function":{"name":"settings","arguments":"{}"}}]}),
+            json!({"role":"tool","tool_call_id":"c1","content":"已改"}),
+            json!({"role":"assistant","content":"改好了"}),
+        ];
+        // 前端照旧只带气泡正文（工具记录不在其中）
+        let req = vec![
+            json!({"role":"user","content":"改名"}),
+            json!({"role":"assistant","content":"改好了"}),
+            json!({"role":"user","content":"打开终端面板"}),
+        ];
+        let merged = merge_file_history(file.clone(), &req, "打开终端面板");
+        assert_eq!(merged.len(), 5, "文件历史 4 条 + 新用户消息 1 条: {merged:?}");
+        assert_eq!(merged[3]["content"], "改好了", "上一轮的收尾文本还在");
+        assert!(merged[1].get("tool_calls").is_some(), "工具调用必须留在上下文里");
+        assert!(merged[1].get("reasoning_content").is_some(), "思考必须留在上下文里");
+        assert_eq!(merged[1]["tool_calls"], file[1]["tool_calls"]);
+        assert_eq!(merged[4]["role"], "user");
+        assert_eq!(merged[4]["content"], "打开终端面板");
+    }
+
+    /// 同一条消息重发（上一轮失败后重试）：文件末尾已经是它，不重复接。
+    #[test]
+    fn file_history_does_not_duplicate_the_same_user_message() {
+        let file = vec![
+            json!({"role":"user","content":"改名"}),
+            json!({"role":"user","content":"打开终端面板"}),
+        ];
+        let req = vec![
+            json!({"role":"user","content":"改名"}),
+            json!({"role":"user","content":"打开终端面板"}),
+        ];
+        let merged = merge_file_history(file, &req, "打开终端面板");
+        assert_eq!(merged.len(), 2, "同一条不该接第二遍: {merged:?}");
+    }
+
+    /// 文件没有历史（新会话）：用请求里的 messages，并补上发送时间 ts。
+    #[test]
+    fn empty_file_falls_back_to_request_messages() {
+        let req = vec![json!({"role":"user","content":"第一条"})];
+        let merged = merge_file_history(Vec::new(), &req, "第一条");
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0]["role"], json!("user"));
+        assert_eq!(merged[0]["content"], json!("第一条"));
+        assert!(merged[0]["ts"].as_u64().unwrap_or(0) > 0, "新会话首条也要有发送时间: {merged:?}");
+    }
+
+    /// 请求尾不是用户消息、但 message 有正文：用 message 补一条，别把这轮的话丢了。
+    #[test]
+    fn missing_user_tail_falls_back_to_message_field() {
+        let file = vec![json!({"role":"user","content":"上一轮"}),
+                        json!({"role":"assistant","content":"答完"})];
+        let req = vec![json!({"role":"user","content":"上一轮"}), json!({"role":"assistant","content":"答完"})];
+        let merged = merge_file_history(file, &req, "这轮的话");
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[2]["role"], json!("user"));
+        assert_eq!(merged[2]["content"], json!("这轮的话"));
+        assert!(merged[2]["ts"].as_u64().unwrap_or(0) > 0, "补进来的 user 也要有发送时间: {merged:?}");
+    }
+
+    #[test]
+    fn attachment_save_and_decode() {
+        let att = MediaAttachment {
+            name: "test.mp3".into(),
+            mime: "audio/mp3".into(),
+            data: "data:audio/mp3;base64,//uQxAAAAAAAAAAAAAAAAAAAAAA==".into(),
+        };
+        assert_eq!(att.raw_base64(), "//uQxAAAAAAAAAAAAAAAAAAAAAA==");
+        use base64::Engine;
+        let clean = att.raw_base64().trim().replace(['\r', '\n', ' '], "");
+        let unpadded = clean.trim_end_matches('=');
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&clean)
+            .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(unpadded))
+            .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(unpadded))
+            .unwrap();
+        assert!(!bytes.is_empty());
+    }
+
+    #[test]
+    fn attachments_dir_appended_to_gitignore() {
+        // A5（施工单 012）：附件目录自动进工作区 git 排除（只追加，不重写用户文件）
+        let dir = std::env::temp_dir().join(format!("agent-a5-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        let gi = dir.join(".gitignore");
+        std::fs::write(&gi, "target/\nlogs/").unwrap(); // 故意不带结尾换行
+        ensure_attachments_ignored(&dir);
+        assert_eq!(
+            std::fs::read_to_string(&gi).unwrap(),
+            "target/\nlogs/\n.attachments/\n",
+            "只追加一行并补齐换行"
+        );
+        // 幂等：再跑一次不重复追加
+        ensure_attachments_ignored(&dir);
+        let text = std::fs::read_to_string(&gi).unwrap();
+        assert_eq!(text.matches(".attachments/").count(), 1, "不得重复追加");
+        // 非 git 仓库不动
+        let dir2 = std::env::temp_dir().join(format!("agent-a5-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir2).unwrap();
+        ensure_attachments_ignored(&dir2);
+        assert!(!dir2.join(".gitignore").exists(), "非 git 仓库不落 .gitignore");
+    }
+
+    /// 角色/降级渠道的 key 回落链（B2）——没单独存 key 的配置靠环境变量兜底，
+    /// 否则 budget/summary/title 渠道会一律「API key 未设置」。
+    #[test]
+    fn resolve_key_falls_back_to_env() {
+        use crate::config::settings::{Config, Settings};
+        let s = Settings::default();
+        let mut c = Config {
+            id: "cfg-test".into(),
+            name: "无 key 配置".into(),
+            provider_id: "deepseek".into(),
+            base_url: "http://127.0.0.1:9399".into(),
+            model: "m".into(),
+            models: Vec::new(),
+            key_cipher: None,
+            context_length: None,
+            max_output_tokens: None,
+            temperature: None,
+            top_p: None,
+            thinking: None,
+            thinking_style: None,
+            capabilities: Default::default(),
+            capabilities_user_set: false,
+        };
+        // 无 DPAPI key、无环境变量 → 空
+        unsafe { std::env::remove_var("DEEPSEEK_API_KEY") };
+        assert!(resolve_key(&s, &c).is_empty());
+        // 环境变量兜底
+        unsafe { std::env::set_var("DEEPSEEK_API_KEY", "sk-env-fallback") };
+        assert_eq!(resolve_key(&s, &c), "sk-env-fallback");
+        // DPAPI key 优先（配了 key 时环境变量只是兜底）
+        c.set_key("sk-dpapi").expect("测试配置应能存 key");
+        assert_eq!(resolve_key(&s, &c), "sk-dpapi");
+        unsafe { std::env::remove_var("DEEPSEEK_API_KEY") };
+    }
+}
+
+/// 落盘附件到工作区 `.attachments/`（目录自动进 git 排除），返回最终文件名。
+/// 同名附件不互相覆盖：追加 `_2`/`_3` 后缀（同轮发两份「报表.xlsx」是常见场景）。
+fn persist_attachment(att: &MediaAttachment, ws: &std::path::Path) -> Option<String> {
+    let att_dir = ws.join(".attachments");
+    std::fs::create_dir_all(&att_dir).ok()?;
+    ensure_attachments_ignored(ws);
+    let safe_name = std::path::Path::new(&att.name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("attachment")
+        .to_string();
+    let stem = std::path::Path::new(&safe_name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("attachment")
+        .to_string();
+    let ext = std::path::Path::new(&safe_name)
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|e| e.to_string());
+    let mut target = att_dir.join(&safe_name);
+    if target.exists() {
+        for i in 2..100 {
+            let cand = match &ext {
+                Some(e) => att_dir.join(format!("{stem}_{i}.{e}")),
+                None => att_dir.join(format!("{stem}_{i}")),
+            };
+            if !cand.exists() {
+                target = cand;
+                break;
+            }
+        }
+    }
+    let final_name = target.file_name().and_then(|n| n.to_str())?.to_string();
+    use base64::Engine;
+    let clean = att.raw_base64().trim().replace(['\r', '\n', ' '], "");
+    let unpadded = clean.trim_end_matches('=');
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&clean)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(unpadded))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(unpadded))
+        .ok()?;
+    std::fs::write(&target, decoded).ok()?;
+    Some(final_name)
+}
+
+/// 引导/立即发送带附件（2026-11-03）：把附件转成模型可用的 user content。
+/// - 图片/音频/视频：主渠道原生支持（capabilities）就内联成内容块；
+/// - 文档、主渠道不支持的媒体：落盘工作区 `.attachments/`，以文本带出路径/清单。
+///
+/// 运行中**不**再转接视觉/音频专家——那会把「引导」拖成一次外部请求；
+/// 主渠道没有该模态时如实占位，让用户改用支持该模态的模型。
+async fn steer_content_with_attachments(
+    text: &str,
+    attachments: &[MediaAttachment],
+    caps: &crate::config::settings::ModelCapabilities,
+) -> Value {
+    let ws = crate::tools::workspace_root();
+    let mut native: Vec<Value> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    for att in attachments {
+        if att.is_document() {
+            match persist_attachment(att, &ws) {
+                Some(rel) => notes.push(att.document_intake_notice(&ws, &rel).await),
+                None => notes.push(format!(
+                    "[📄 文档附件「{}」保存失败：附件内容解码异常，请用户重新发送该文件]",
+                    att.name
+                )),
+            }
+            continue;
+        }
+        let is_vid = att.is_video();
+        let is_aud = att.is_audio();
+        let is_img = att.is_image() && att.effective_mime().starts_with("image/");
+        let native_ok = (is_img && caps.vision) || (is_vid && caps.video) || (is_aud && caps.audio);
+        if native_ok {
+            if is_aud {
+                native.push(json!({
+                    "type": "input_audio",
+                    "input_audio": { "data": att.raw_base64(), "format": att.audio_format() }
+                }));
+            } else if is_vid {
+                native.push(json!({ "type": "video_url", "video_url": { "url": att.data_url() } }));
+            } else {
+                native.push(json!({ "type": "image_url", "image_url": { "url": att.data_url() } }));
+            }
+            continue;
+        }
+        let kind_cn = if is_vid { "视频" } else if is_aud { "音频" } else { "图片" };
+        let safe_name = persist_attachment(att, &ws).unwrap_or_else(|| "attachment".to_string());
+        notes.push(format!(
+            "[{kind_cn}附件「{}」已保存到工作区 .attachments/{}；当前主渠道未开启{kind_cn}理解，无法直接查看。需要时用工具读取，或让用户改用支持{kind_cn}的模型。]",
+            att.name, safe_name
+        ));
+    }
+    if native.is_empty() && notes.is_empty() {
+        return json!(text);
+    }
+    let mut parts = vec![json!({ "type": "text", "text": text })];
+    parts.extend(native);
+    for n in notes {
+        parts.push(json!({ "type": "text", "text": n }));
+    }
+    json!(parts)
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+
+    /// 2026-10-08 修：投影块曾无条件把 content 换成字符串，原生多模态 parts
+    /// （图片/音频）被静默丢掉——「截图 + 合同.pdf」同发时模型只收到文档通知。
+    #[test]
+    fn projections_preserve_native_multimodal_parts() {
+        let mut history = vec![json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "看看这张截图和合同"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}},
+            ]
+        })];
+        apply_projections_to_last_user(&mut history, &["[📄 文档附件已收到：contract.pdf]".into()]);
+        let parts = history[0]["content"].as_array().expect("应仍是数组");
+        assert_eq!(parts.len(), 2, "图片 part 必须保留: {parts:?}");
+        assert_eq!(parts[0]["type"], json!("text"));
+        let text = parts[0]["text"].as_str().unwrap();
+        assert!(text.contains("文档附件已收到"), "投影应在正文里: {text}");
+        assert!(text.contains("看看这张截图和合同"), "原正文应保留: {text}");
+        assert!(text.find("文档附件").unwrap() < text.find("看看这张").unwrap(), "投影在前");
+        assert_eq!(parts[1]["type"], json!("image_url"), "图片 part 原样");
+    }
+
+    /// 音频 part 同样保留；多个 text part 合成一条，不留重复正文。
+    #[test]
+    fn projections_merge_text_parts_and_keep_audio() {
+        let mut history = vec![json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "第一段"},
+                {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "mp3"}},
+                {"type": "text", "text": "第二段"},
+            ]
+        })];
+        apply_projections_to_last_user(&mut history, &["[Audio understanding]: 说了啥".into()]);
+        let parts = history[0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 2, "两个 text part 应合成一条: {parts:?}");
+        assert_eq!(parts[0]["type"], json!("text"));
+        let text = parts[0]["text"].as_str().unwrap();
+        assert!(text.contains("第一段") && text.contains("第二段"), "两段正文都在: {text}");
+        assert_eq!(parts[1]["type"], json!("input_audio"), "音频 part 原样");
+    }
+
+    /// 信息卡的来源配置落盘：缺的补上、已有的不覆盖、没 stats 的消息不动。
+    #[test]
+    fn stats_config_stamped_on_save() {
+        let mut msgs = vec![
+            json!({"role": "user", "content": "问题"}),
+            json!({"role": "assistant", "content": "答", "stats": {"model": "m1"}}),
+            json!({"role": "system", "content": "通知"}),
+            json!({"role": "assistant", "content": "旧答", "stats": {"model": "m0", "config": "旧配置"}}),
+        ];
+        stamp_stats_config(&mut msgs, "商汤");
+        assert_eq!(msgs[1]["stats"]["config"], json!("商汤"), "新消息补上配置名");
+        assert_eq!(msgs[3]["stats"]["config"], json!("旧配置"), "已有配置不覆盖");
+        assert!(msgs[0].get("stats").is_none(), "无 stats 的消息不硬塞");
+        // 空配置名（异常态）不写空串
+        let mut m2 = vec![json!({"role": "assistant", "content": "x", "stats": {"model": "m"}})];
+        stamp_stats_config(&mut m2, "");
+        assert!(m2[0]["stats"].get("config").is_none());
+    }
+
+    /// 纯文本消息维持旧行为（整体替换为字符串）；无投影/无 user 消息时不动。
+    #[test]
+    fn projections_on_plain_string_and_noops() {
+        let mut history = vec![json!({"role": "user", "content": "原文"})];
+        apply_projections_to_last_user(&mut history, &["投影".into()]);
+        assert_eq!(history[0]["content"], json!("投影\n\n原文"));
+        // 无投影：不动
+        let mut h2 = vec![json!({"role": "user", "content": "x"})];
+        apply_projections_to_last_user(&mut h2, &[]);
+        assert_eq!(h2[0]["content"], json!("x"));
+        // 没有 user 消息：不动（不 panic）
+        let mut h3: Vec<Value> = vec![json!({"role": "system", "content": "s"})];
+        apply_projections_to_last_user(&mut h3, &["投影".into()]);
+        assert_eq!(h3.len(), 1);
+        assert_eq!(h3[0]["content"], json!("s"));
+    }
+}

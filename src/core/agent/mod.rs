@@ -1,0 +1,2204 @@
+//! 核心循环 v1（施工单 003）
+//!
+//! 任务消息 → 模型（带 tools）→ 若返回 tool_calls 则执行回填继续；纯文本则终止。
+//! 步数上限 cfg.max_steps：0 = 不限；失控由取消标志/花费硬闸
+//! 两道缰绳管。每步开始与每个流式分片前查取消标志。
+//! thought / tool_call / tool_result 全量落 JSONL；on_event 把结构化事件转给前端。
+
+use std::{future::Future, pin::Pin, sync::Arc};
+
+use serde_json::{Value, json};
+
+use crate::config::{AgentConfig, ContextConfig, RecoveryConfig, SandboxConfig};
+use crate::context;
+use crate::core::cancel::CancelFlag;
+use crate::gateway::{Channel, ChatOutcome, ChatParams, Gateway, ToolCall, UsageCtx, extract_delta};
+use crate::observability::{self, EventType};
+use crate::recovery;
+use crate::tools::{self, ExecConfig};
+
+
+mod checkpoint;
+mod exec;
+mod plan;
+mod summary;
+
+pub(crate) use checkpoint::*;
+pub(crate) use exec::*;
+pub use plan::*;
+pub(crate) use summary::*;
+/// 循环向外发的结构化事件（SSE 转发用）。
+pub enum AgentEvent {
+    Content(String),
+    Reasoning(String),
+    ToolCall { name: String, args: String },
+    /// 流式工具调用参数增量（「调用要先显示」）：模型还在吐参数时
+    /// 就发，前端把对应 running 行的参数实时补长——不再等工具真正开跑才出现。
+    /// name 定位行（与 ToolResult 同模式），args 是**全量累积**（前端直接覆盖）。
+    ToolCallArgs { name: String, args: String },
+    ToolResult { name: String, ok: bool, preview: String },
+    StepLimit(u32),
+    /// 上下文占用（每步模型调用前 + 每次回复落地后各发一次；圆环数据源）。
+    /// 口径对齐 DSH token-meter 的 `contextPressure`：三个数语义分开、单一来源——
+    /// `pressure`（最近一次渠道实报的 prompt，锚点，未拿到实报时为 None）、
+    /// `projected`（**下一次请求**的预估占用 = pressure + 自锚点以来的带符号增量，
+    /// 圆环分子，裁剪后会自动回落）、`window`（模型窗口，圆环分母）。
+    /// `breakdown` 是**估算**构成（近似值，不参与任何决策）。
+    ContextUsage { pressure: Option<u64>, projected: u64, window: u64, breakdown: context::Breakdown },
+    /// 渠道返回的真实用量（：缓存命中率累计 + 预算钩子 + 圆环锚点更新）。
+    ApiUsage { prompt_tokens: u64, cached_tokens: Option<u64> },
+    /// 本步模型调用的计时/渠道画像（2026-10-26 消息信息卡）：首包延迟、输出耗时、
+    /// completion tokens、实际用的渠道与模型（降级链取成功那个）。server 层补上
+    /// 配置名后转前端；同时随 assistant 消息落 stats 进会话文件（切回可看）。
+    TurnStats { stats: Value },
+    /// 会话快照：当前全量消息（不含 system），server 收到即落盘
+    Snapshot { messages: Vec<Value> },
+    /// 提示性通知（：自动 HANDOFF 等），前端以系统消息展示
+    Notice(String),
+    /// 撤回一条**临时**通知（2026-11-01 真机实测：流中断后「正在原渠道自动重试…」
+    /// 这条，重试成功后应该消失，不能一直挂在对话里）。带的是同一条通知的原文；
+    /// 前端把最后一条内容匹配的系统消息删掉。只在没落盘过时用（落过盘的通知不撤）。
+    NoticeClear(String),
+    /// 本步作废重来（/022 降级链）：主渠道流到一半失败、换渠道重试时发出。
+    /// 前端应把当前消息尾部各丢掉 `content` / `reasoning` 个 UTF-16 码元
+    /// （与 JS String.length 同口径），否则半截回答会与重试后的完整回答叠在一起。
+    StepReset { content: usize, reasoning: usize },
+    /// TITLE 角色：会话标题已生成（server 收到即改会话文件并转前端）
+    Title(String),
+    /// 任务改动统计条：相对任务起点基线的文件数/增删行；「撤销」恢复到 id
+    Checkpoint { id: String, files_changed: usize, additions: u64, deletions: u64 },
+    /// 滚动摘要更新：server 收到即写进会话文件（跨任务延续）
+    Summary(String),
+    /// B3：Plan 档产出的结构化计划（模型最终回答中的 ```plan 块），前端渲染计划卡
+    PlanProposal { goal: String, steps: Vec<String>, files: Vec<String> },
+    /// N1/025 运行中追加消息（steering）：这些用户消息已并入本轮对话（模型下一步可见），
+    /// server 收到即转前端补气泡 + 落盘。取走点有两个：每步决策前（take_steering）+
+    /// 最终回答落地后（补流式输出期间到达的，见主循环 027 补口）。
+    Steer { messages: Vec<Value> },
+}
+
+/// B3：Plan 档解析出的结构化计划。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Plan {
+    pub goal: String,
+    pub steps: Vec<String>,
+    pub files: Vec<String>,
+}
+
+/// 滚动摘要消息的前缀标记（注入/剥离/快照过滤都认它）。
+pub const SUMMARY_PREFIX: &str = "【历史摘要】";
+
+/// B3：Plan 档 system prompt 增量。
+/// 红线（坑 13/施工单 013 红线 9）：不注入模型身份/人设——这里是纯任务行为约束与计划格式约定。
+pub const PLAN_PROMPT: &str = "\
+[Plan 模式]\n\
+当前处于 Plan（规划）档：只允许只读类操作（查看文件、搜索代码、只读命令）。写文件与改动类命令会被直接拒绝，请勿尝试。\n\
+请先用只读工具完成调研，然后在最终回答里输出一份执行计划，必须使用如下 ```plan 围栏格式：\n\
+```plan\n\
+目标: <一句话目标>\n\
+步骤:\n\
+1. <步骤一>\n\
+2. <步骤二>\n\
+文件: <涉及文件路径，逗号分隔>\n\
+```\n\
+用户批准该计划后才会开始实际执行。";
+
+/// 角色映射 + 降级链的接线件：主渠道 + 可选专用渠道 + 降级配置（按序）。
+pub struct LoopChannels {
+    /// 主对话渠道（base_url/model/key/参数已从 settings+预设组装）
+    pub primary: Channel,
+    /// SUMMARY 专用渠道（未配置=主渠道）
+    pub summary: Option<Channel>,
+    /// TITLE 专用渠道；None=不生成标题
+    pub title: Option<Channel>,
+    /// 降级链：主渠道当轮失败时按序替换重试
+    pub fallbacks: Vec<Channel>,
+    /// 任务超 token 预算后的降级渠道（[roles] budget；None=不降级，维持主渠道）
+    pub downgrade: Option<Channel>,
+    /// 视觉转写渠道（roles.vision；None=没配或没勾「图片解析」）。主模型没勾「图片解析」
+    /// 时，computer 截图先交给它转成文字再喂给主模型——和用户发附件的转接同一条判据
+    /// （2026-11-02 截图投递统一：判模型能力，协议只决定图放哪个字段）。
+    pub vision: Option<Channel>,
+    /// 与 server 共享的「本任务已超预算」标志（budget_exceeded 触发时置位，
+    /// 本任务剩余步骤改走 downgrade）。未配 downgrade 时只影响 Notice，不换渠道。
+    pub budget_hit: Arc<std::sync::atomic::AtomicBool>,
+    /// 子代理派发器（None = 本任务不许派发子代理，如测试或无头简单场景）。
+    /// 工具调用 subagent_spawn 由核心循环拦截交给它——实现见 server/subagent.rs。
+    pub subagents: Option<Arc<dyn crate::core::subagent::SubagentRunner>>,
+    /// 上一轮结束时的占用锚点 `(实报 pressure, 锚点时的本地估价)`，由 server 从会话用量
+    /// 快照带入：跨轮沿用锚点，圆环不会因为新起一轮就退回估算口径（DSH 的测量是会话级
+    /// 的，样本一直有效）。None/首轮 = 纯估算起步。
+    pub prior_anchor: Option<(u64, u64)>,
+}
+
+/// 阻塞式提问（ask 工具）的前向通道：往本轮 SSE 流发 JSON 事件 + 断流探测。
+/// 前台会话由 server 层的 ChatGate 提供；无头/子代理/组件总线/测试 = None，
+/// ask 工具据此禁用（ZCode 同款：没人在场不许挂起等答案）。
+pub struct AskSink {
+    pub session: String,
+    pub send: Box<dyn Fn(serde_json::Value) + Send + Sync>,
+    pub closed: Box<dyn Fn() -> bool + Send + Sync>,
+}
+
+/// 审批判定**单点**：一律走 `ApprovalGate::needs_approval_for`（细粒度，见
+/// `core::rules::evaluate_risk` + `should_ask_approval` 的档位映射）。
+/// 旧的按工具静态 danger_level 判定的 `needs_approval` 已在施工单 013 A2 中删除——
+/// 两套判定并存会造成语义分裂，此后再无第二处审批判定入口。
+/// （工具静态 danger_level 现仅用于「是否拍影子仓库检查点」，不参与审批判定。）
+///
+/// 审批门：由 server 层实现（SSE 发审批请求、挂 oneshot 等决定）。
+pub trait ApprovalGate: Send + Sync {
+    /// 细粒度审批：结合工具名与具体参数进行风险研判
+    fn needs_approval_for(&self, tool: &str, args_json: &str) -> bool;
+    /// 带工作区的审批判定：本任务钉住的工作区（后台任务/运行中切项目不能串目录）。
+    /// 默认退回无参版本——测试与不区分工作区的实现不受影响。
+    fn needs_approval_for_in(
+        &self,
+        _ws: &std::path::Path,
+        tool: &str,
+        args_json: &str,
+    ) -> bool {
+        self.needs_approval_for(tool, args_json)
+    }
+    /// B2（Plan 档）：返回 Some(理由) = 该工具在 Plan 档被**直接驳回**，
+    /// 不进审批弹窗流程（写/执行类操作连「问用户」都不问，直接拦下回喂模型调整计划）。
+    /// 默认不拦截（Plan 档之外恒 None）——判定单点原则与 A2 一致。
+    fn plan_block_reason(&self, _tool: &str, _args: &str) -> Option<String> {
+        None
+    }
+    /// 带工作区的 Plan 档判定（同 needs_approval_for_in 的理由）。
+    fn plan_block_reason_in(
+        &self,
+        _ws: &std::path::Path,
+        tool: &str,
+        args: &str,
+    ) -> Option<String> {
+        self.plan_block_reason(tool, args)
+    }
+    /// 本档位是否还在沙箱里跑（full-access 档 = false，前提是 config 总开关已开）
+    fn sandbox_enabled(&self) -> bool;
+    /// 本档位文件工具是否允许越出工作区（auto / full-access = true；read-only = false）。
+    /// 与 sandbox_enabled 一样按决策步现读——运行中切档，下一步即生效。
+    fn file_tools_unconfined(&self) -> bool {
+        false
+    }
+    /// 当前对话会话 id：检查点归属用（切回该会话时改动条/撤销只认自己的基线）。
+    /// 默认空串 = 不归属，行为与旧版一致。
+    fn session_id(&self) -> &str {
+        ""
+    }
+
+    /// 本会话的**父任务**会话 id（子代理会话专用）——台账按父任务聚合。
+    /// 默认 None = 本会话就是主任务（行为与旧版一致）。
+    fn usage_parent_session(&self) -> Option<&str> {
+        None
+    }
+    /// 等待用户决定；true=允许。实现内部处理超时（视为拒绝）与取消。
+    fn ask(&self, tool: &str, args: &str) -> Pin<Box<dyn Future<Output = bool> + Send + '_>>;
+    /// 「阻塞式提问」（ask 工具）的前向通道：前台会话返回 Some（往本轮 SSE 流发
+    /// ask_request + 断流探测）；无头/子代理/测试默认 None——ask 工具据此禁用。
+    fn ask_sink(&self) -> Option<Arc<AskSink>> {
+        None
+    }
+    /// N1/025「立即发送（引导）」的运行中消息：核心循环每个决策点取一次并入本轮；
+    /// 默认无（测试与其它实现不受影响）。只取「立即」的，排队的等本轮结束再发。
+    fn take_steering(&self) -> Vec<crate::core::steer::SteerMsg> {
+        Vec::new()
+    }
+    /// 打断信号（2026-10-22「立即发送」分家：打断让位，引导不打断）。工具执行与
+    /// 流式输出 select! 它当场让位；决策点取走打断消息时由队列侧复位。
+    /// 默认返回一个永不置位的信号（测试与 headless 等实现不受影响——它们没有
+    /// 「立即发送」入口，天然无人置位）。
+    fn interrupt_flag(&self) -> Arc<CancelFlag> {
+        static NEVER: std::sync::OnceLock<Arc<CancelFlag>> = std::sync::OnceLock::new();
+        NEVER.get_or_init(|| Arc::new(CancelFlag::new())).clone()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopOutcome {
+    Done,
+    Cancelled,
+}
+
+/// 消息时间戳（毫秒）：落盘进会话文件、前端「边缘时间」显示用。
+/// 出网关前由适配器的消息白名单剥掉，模型永远看不到。
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 取消时给还没执行的 tool_call 回填结果。
+///
+/// 协议要求 assistant(tool_calls) 之后必须逐条跟 tool 消息；取消点在结果回填之前时
+/// 直接落盘会留下悬空 tool_calls，下一轮请求被严格端点 400（2026-11-02 审计实锤）。
+fn backfill_cancelled_tools(msgs: &mut Vec<Value>, calls: &[ToolCall], executed: &[bool]) {
+    for (i, call) in calls.iter().enumerate() {
+        if executed.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        msgs.push(json!({
+            "role": "tool",
+            "tool_call_id": call.id,
+            "content": "已取消：用户终止了本轮任务，该工具未执行。",
+        }));
+    }
+}
+
+/// 写类/执行类工具动手前拍影子仓库检查点。失败只记日志，绝不阻断。
+/// 工作区用任务钉住的那个（不是全局单例）——后台任务/中途切项目不能串目录。
+async fn checkpoint_before(
+    ws: &std::path::Path,
+    name: &str,
+    args: &str,
+    sid: &str,
+    mem: &crate::memory::Memory,
+) {
+    let reason = format!("{} {}", name, short_args(args, 100));
+    let ws = ws.to_path_buf();
+    let sid = sid.to_string();
+    match tokio::task::spawn_blocking(move || recovery::checkpoint(&ws, &reason, &sid)).await {
+        Ok(Ok(Some(cp))) => {
+            observability::event(
+                EventType::State,
+                json!({ "kind": "checkpoint.created", "id": cp.id, "ts": cp.ts, "reason": cp.reason, "session": cp.session }),
+            );
+            mem.record("checkpoint.created", json!({ "reason": cp.reason }));
+        }
+        Ok(Ok(None)) => {}
+        Ok(Err(e)) => observability::event(
+            EventType::State,
+            json!({ "kind": "checkpoint.skipped", "reason": e.to_string() }),
+        ),
+        Err(e) => observability::event(
+            EventType::State,
+            json!({ "kind": "checkpoint.skipped", "reason": format!("任务失败: {e}") }),
+        ),
+    }
+}
+
+/// 渠道链调用（从 run_task 抽出，续写复用同一套）：主渠道当轮失败按序换 fallback
+/// 重试同一步；取消置位立即停（不降级）。流式增量原样转发 on_event；换渠道时先发
+/// StepReset（前端丢半截内容）+ 人话提示。返回 (结果, 提示文本, 实际用的渠道)——
+/// 提示已实时转发过，调用方负责 persist_notice 补进上下文落盘（重启后气泡还在）。
+#[allow(clippy::too_many_arguments)]
+async fn run_chain(
+    gateway: &Arc<Gateway>,
+    chain: &[&Channel],
+    ctx: &[Value],
+    tools_def: Option<&Value>,
+    cancel: &CancelFlag,
+    interrupt: &CancelFlag,
+    usage_ctx: &UsageCtx,
+    step: u32,
+    on_event: &(impl Fn(AgentEvent) + Send + Sync),
+) -> (anyhow::Result<ChatOutcome>, Vec<String>, Option<Channel>) {
+    let mut notices = Vec::new();
+    // 本步「正在原渠道自动重试…」那条临时提示的原文（重试成功要撤回，失败才落盘）
+    let mut retry_note: Option<String> = None;
+    let mut outcome = Err(anyhow::anyhow!("渠道链为空"));
+    // 本步实际用的渠道：每次尝试前登记，成功即它（信息卡「来源渠道」的口径——
+    // 主渠道失败走降级链时，报的必须是真的用过的那个，不能报链头充数）
+    let mut used: Option<Channel> = None;
+    // 本步当前这次尝试已经推给前端的字符数（UTF-16 码元，与 JS String.length 同口径）。
+    // 换渠道重试时前端要按这个数把半截内容丢掉——否则界面会出现「半截 + 完整」叠着显示。
+    let streamed_content = std::sync::atomic::AtomicUsize::new(0);
+    let streamed_reasoning = std::sync::atomic::AtomicUsize::new(0);
+    // 每个渠道在本步内已原地重试的次数（流中断自动重试一次；换渠道即清零语义由索引绑定）
+    let attempts_in_channel: Vec<std::sync::atomic::AtomicU32> =
+        (0..chain.len()).map(|_| std::sync::atomic::AtomicU32::new(0)).collect();
+    'channels: for (i, ch) in chain.iter().enumerate() {
+        if i > 0 {
+            observability::event(
+                EventType::State,
+                json!({ "kind": "gateway.fallback", "step": step, "from": chain[0].model, "to": ch.model, "base_url": ch.base_url }),
+            );
+            let last_err = outcome.err().map(|e| e.to_string()).unwrap_or_default();
+            on_event(AgentEvent::StepReset {
+                content: streamed_content.swap(0, std::sync::atomic::Ordering::Relaxed),
+                reasoning: streamed_reasoning.swap(0, std::sync::atomic::Ordering::Relaxed),
+            });
+            let note = format!("主渠道调用失败（{last_err}），已切换到降级渠道「{}」", ch.model);
+            on_event(AgentEvent::Notice(note.clone()));
+            notices.push(note);
+        }
+        used = Some((*ch).clone());
+        // 同渠道重试必须是「真的再发一次」：2026-11-01 实锤原先这里没有循环，
+        // 重试分支的 continue 直接跳到下一个渠道（单渠道=完全不重试），用户只看到
+        // 一句「正在原渠道自动重试…」然后失败。现在每次尝试独立进这个循环。
+        loop {
+            // 流式工具调用跟踪（2026-10-31「调用要先显示」）：模型吐 tool_calls 增量时
+            // 就发 ToolCall/ToolCallArgs，前端立即建 running 行并实时补长参数。
+            // index → (name, args 累积, 已发长度, 上次发送 ms)；节流：新增 ≥32 字节或
+            // 距上次 ≥250ms 才发一次，避免逐 token 事件打爆 SSE。
+            let tc_stream: std::sync::Mutex<std::collections::HashMap<usize, (String, String, usize, u64)>> =
+                std::sync::Mutex::new(std::collections::HashMap::new());
+            outcome = gateway
+                .stream_chat(usage_ctx, ch, &Value::Array(ctx.to_vec()), tools_def, cancel, Some(interrupt), |chunk| {
+                    let delta = extract_delta(chunk);
+                    if !delta.content.is_empty() {
+                        streamed_content.fetch_add(
+                            delta.content.encode_utf16().count(),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        on_event(AgentEvent::Content(delta.content));
+                    }
+                    if let Some(r) = delta.reasoning
+                        && !r.is_empty() {
+                            streamed_reasoning.fetch_add(
+                                r.encode_utf16().count(),
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            on_event(AgentEvent::Reasoning(r));
+                        }
+                    if let Some(tcs) = chunk.pointer("/choices/0/delta/tool_calls").and_then(Value::as_array) {
+                        let now = now_ms();
+                        let mut emit: Vec<(String, String, bool)> = Vec::new();
+                        {
+                            let mut st = tc_stream.lock().unwrap_or_else(|e| e.into_inner());
+                            for tc in tcs {
+                                let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                                let fname = tc.pointer("/function/name").and_then(Value::as_str).unwrap_or("");
+                                let fargs = tc.pointer("/function/arguments").and_then(Value::as_str).unwrap_or("");
+                                let e = st.entry(idx).or_insert_with(|| (String::new(), String::new(), 0, 0));
+                                let is_new = !fname.is_empty() && e.0.is_empty();
+                                if is_new {
+                                    e.0 = fname.to_string();
+                                }
+                                if !fargs.is_empty() {
+                                    e.1.push_str(fargs);
+                                }
+                                if e.0.is_empty() {
+                                    continue; // 函数名还没到（极少数渠道先吐参数）
+                                }
+                                let grown = e.1.len().saturating_sub(e.2);
+                                if is_new || grown >= 32 || now.saturating_sub(e.3) >= 250 {
+                                    e.2 = e.1.len();
+                                    e.3 = now;
+                                    emit.push((e.0.clone(), e.1.clone(), is_new));
+                                }
+                            }
+                        }
+                        for (name, args, is_new) in emit {
+                            if is_new {
+                                // 首现即建行（前端幂等：执行循环再发 ToolCall 时只更新不重复）
+                                on_event(AgentEvent::ToolCall { name, args });
+                            } else {
+                                on_event(AgentEvent::ToolCallArgs { name, args });
+                            }
+                        }
+                    }
+                })
+                .await;
+            match &outcome {
+                Ok(ChatOutcome::Done(_)) | Ok(ChatOutcome::Interrupted(_)) => {
+                    // 重试成功：把刚才那句「正在原渠道自动重试…」撤回（它本来就是临时态），
+                    // 也不能进 notices（那样会被当历史通知落盘，真机实测「一直停在那里」）
+                    if let Some(n) = retry_note.take() {
+                        on_event(AgentEvent::NoticeClear(n));
+                    }
+                    break 'channels; // Interrupted 不是错误，不降级——半截落地后本轮继续
+                }
+                Ok(ChatOutcome::Cancelled) => return (outcome, notices, used),
+                Err(e) => {
+                    // 流中断原地重试（2026-10-31 用户渠道实锤：连写大文件的长流中途被上游
+                    // 掐断，降级链只有单渠道时直接失败）。读流失败/流超时是「上下文没变、
+                    // 从头重发同一请求」的瞬态故障——同渠道自动重试一次：前端半截内容由
+                    // StepReset 回滚（换渠道重试的现成机制），用户无感续跑。
+                    let msg = e.to_string();
+                    let transient = msg.contains("读流失败")
+                        || msg.contains("模型流超时")
+                        || msg.contains("error sending request")
+                        || msg.contains("connection")
+                        // 网关对「发请求阶段网络失败」的人话包装（2026-11-02：原分类
+                        // 只认英文子串，而网关把底层 cause 丢了 → 永远不重试）
+                        || msg.contains("网络层不通");
+                    if transient
+                        && attempts_in_channel[i].load(std::sync::atomic::Ordering::Relaxed) == 0
+                    {
+                        attempts_in_channel[i].store(1, std::sync::atomic::Ordering::Relaxed);
+                        on_event(AgentEvent::StepReset {
+                            content: streamed_content.swap(0, std::sync::atomic::Ordering::Relaxed),
+                            reasoning: streamed_reasoning.swap(0, std::sync::atomic::Ordering::Relaxed),
+                        });
+                        let note = format!("输出流中断（{}），正在原渠道自动重试…", msg.chars().take(120).collect::<String>());
+                        on_event(AgentEvent::Notice(note.clone()));
+                        // 先只当临时提示（不 push 进 notices = 不落盘）：重试成功会 NoticeClear
+                        // 撤掉；重试也失败才在下面补进 notices 当历史（信息有用，留着）
+                        retry_note = Some(note);
+                        observability::event(
+                            EventType::State,
+                            json!({ "kind": "gateway.stream_retry", "step": step, "channel": ch.model }),
+                        );
+                        // 给上游半秒缓冲再重发（连发容易撞同一个故障窗口）
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        continue; // 同渠道重发（attempts_in_channel 挡住第二次）
+                    }
+                    // 重试也失败：这条提示留着当历史（这时才进 notices → 落盘）
+                    if let Some(n) = retry_note.take() {
+                        notices.push(n);
+                    }
+                    break; // 换下一个渠道
+                }
+            }
+        }
+    }
+    (outcome, notices, used)
+}
+
+/// 通知持久化：通知以 display_only 消息进上下文——随 Snapshot 落盘，重启/切回
+/// 会话后气泡还在；发送侧由 gateway replay 净化剥离（模型永远看不到）。
+/// 提示已实时转发过 Notice 事件的调用方用这个（如渠道链降级提示）。
+fn persist_notice(msgs: &mut Vec<Value>, on_event: &(impl Fn(AgentEvent) + Send + Sync), text: &str) {
+    msgs.push(json!({ "role": "system", "content": format!("[通知] {text}"), "display_only": true }));
+    on_event(AgentEvent::Snapshot { messages: snapshot_msgs(msgs) });
+}
+
+/// 实时转发 + 持久化（绝大多数通知走这个）。
+fn emit_notice(msgs: &mut Vec<Value>, on_event: &(impl Fn(AgentEvent) + Send + Sync), text: String) {
+    on_event(AgentEvent::Notice(text.clone()));
+    persist_notice(msgs, on_event, &text);
+}
+
+/// 测一次上下文占用并推给前端（唯一出口：圆环/构成/落盘全部读它）。
+/// `anchor = (实报 prompt, 那次请求发出时的本地估价)`；增量带符号，所以回复落地、
+/// 工具回填、追发消息会自动补上，裁剪/折叠会自动回落（见 `context::projected_tokens`）。
+/// 返回本次估价（构成 + 工具定义），调用方按需用于交接阈值等。
+fn emit_context_usage(
+    msgs: &[Value],
+    anchor: Option<(u64, u64)>,
+    tools_schema_tokens: u64,
+    count_reasoning: bool,
+    window: u64,
+    on_event: &(impl Fn(AgentEvent) + Send + Sync),
+) -> context::Breakdown {
+    let mut breakdown = context::estimate_breakdown(msgs, count_reasoning);
+    breakdown.tools_schema = tools_schema_tokens;
+    let projected = context::projected_tokens(anchor, breakdown.total());
+    on_event(AgentEvent::ContextUsage {
+        pressure: anchor.map(|(real, _)| real),
+        projected,
+        window,
+        breakdown,
+    });
+    breakdown
+}
+
+/// 渠道实报落地：锚点跟随最新一次实报 + 发 ApiUsage（缓存行累计 / 预算钩子 / 落盘靠它）。
+/// 放在 assistant 消息 push **之后**调用——那时上下文已含这条回复，服务端一次落盘即终态。
+/// 渠道实报落地：锚点跟随本次响应 + 发 ApiUsage（缓存行累计 / 预算钩子 / 落盘靠它）。
+/// 放在 assistant 消息 push **之后**调用——那时上下文已含这条回复。
+/// 锚点真实值 = 实报 prompt + 渠道实报 completion（同一把尺子）：**输入+输出 =
+/// 上下文**，用户拿用量面板能直接对上账；completion 缺失时才回落本地估算增量。
+/// 配对估价 = 回复落地后的本地估价（之后的工具结果/裁剪增量都以它为零点）。
+fn report_api_usage(
+    msgs: &[Value],
+    turn: &crate::gateway::AssistantTurn,
+    est_at_request: u64,
+    tools_schema_tokens: u64,
+    count_reasoning: bool,
+    anchor: &mut Option<(u64, u64)>,
+    on_event: &(impl Fn(AgentEvent) + Send + Sync),
+) {
+    if let Some(p) = turn.prompt_tokens {
+        let est_now = context::estimate_breakdown(msgs, count_reasoning).total() + tools_schema_tokens;
+        let real = match turn.completion_tokens {
+            Some(c) => p + c,
+            None => {
+                // 渠道不回 completion：本地估算回复增量兜底（est_now − 请求时估价）
+                let delta = est_now.saturating_sub(est_at_request);
+                p + delta
+            }
+        };
+        *anchor = Some((real, est_now));
+        on_event(AgentEvent::ApiUsage { prompt_tokens: p, cached_tokens: turn.cached_tokens });
+    }
+}
+
+/// 执行一个任务：messages 为前端带来的对话历史（不含 system）。
+#[allow(clippy::too_many_arguments)]
+pub async fn run_task(
+    gateway: &Arc<Gateway>,
+    channels: &LoopChannels,
+    system_prompt: &str,
+    messages: &[Value],
+    cancel: &Arc<CancelFlag>,
+    cfg: &AgentConfig,
+    sandbox_cfg: &SandboxConfig,
+    // 沙箱整树 CPU 硬上限百分比（0=不限；2026-10-06 起为固定值 SANDBOX_CPU_PERCENT）
+    cpu_percent: u32,
+    ctx_cfg: &ContextConfig,
+    rec_cfg: &RecoveryConfig,
+    mem: &crate::memory::Memory,
+    prior_summary: Option<String>,
+    // B1：Plan 档（true=只读+先出计划；由请求级 plan_mode 带入，前端随会话持久化）
+    plan_mode: bool,
+    gate: &dyn ApprovalGate,
+    // 审计 05：本任务固定使用的工作区（无头/定时任务按触发时钉住；前台每轮传当前全局）
+    ws: std::path::PathBuf,
+    on_event: impl Fn(AgentEvent) + Send + Sync,
+) -> anyhow::Result<LoopOutcome> {
+    let primary = &channels.primary;
+    let max_output_tokens = primary.params.max_tokens;
+    // B1/B3：Plan 档注入行为约束与 ```plan 计划格式（增量不含身份/人设，坑 13）
+    let system_prompt_owned;
+    let system_prompt = if plan_mode {
+        system_prompt_owned = format!("{system_prompt}\n\n{PLAN_PROMPT}");
+        system_prompt_owned.as_str()
+    } else {
+        system_prompt
+    };
+    let mut msgs: Vec<Value> = Vec::with_capacity(messages.len() + 1);
+    msgs.push(json!({ "role": "system", "content": system_prompt }));
+    // 用量台账归属：本任务的会话 id（辅助调用与主流程同一归属）
+    // 子代理会话填父任务 id——台账按父任务聚合（草案第 4 节，无数据迁移）
+    let sid = gate.session_id().to_string();
+    let mut usage_ctx = UsageCtx::main(&sid);
+    if let Some(parent) = gate.usage_parent_session() {
+        usage_ctx.parent_session = Some(parent.to_string());
+    }
+    // 任务超 token 预算后剩余步骤改走降级渠道（与 server 共享标志；未配渠道只通知不换道）
+    let mut downgrade_noticed = false;
+    // 任务起点边界事件（trace 时间线切分用；State kind 扩展属合法「只增」）
+    // session 一并记上：时间线按工作区过滤要把任务归属回聊天会话——日志顶层 session_id
+    // 是进程级日志会话（进程重启即换），跟工作区无关，归属只能靠这个字段（真机实锤过）
+    observability::event(EventType::State, json!({ "kind": "task.start", "session": gate.session_id() }));
+    // 「工作用时」的起点：从任务开始到回复落地的总时长（前端「工作中 N 分 N 秒」的数据源）
+    let task_started = std::time::Instant::now();
+    if plan_mode {
+        observability::event(
+            EventType::State,
+            json!({ "kind": "plan.mode", "mode": "plan", "step": 0 }),
+        );
+    }
+    msgs.extend(messages.iter().cloned());
+    // 会话落盘：任务一开始就把用户消息存住（崩溃也丢不了这轮请求）
+    on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
+    // 事件流水：任务开始
+    mem.record(
+        "task.start",
+        json!({ "text": messages.iter().rev().find(|m| m.get("role").and_then(Value::as_str) == Some("user")).and_then(|m| m.get("content")).and_then(Value::as_str).map(|s| s.chars().take(200).collect::<String>()).unwrap_or_default() }),
+    );
+    // 滚动摘要：跨任务延续的当前摘要
+    let mut running_summary = prior_summary.filter(|s| !s.trim().is_empty());
+    // 摘要连续失败熔断（ZCode MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES 同款=3）：
+    // 摘要渠道挂了就别每步都白打一次辅助调用；成功即清零
+    let mut summary_fail_streak = 0u32;
+    // 改动统计条基线：任务起点当场拍一个快照（提交当前工作树状态），
+    // 结束时的 diff 就只包含本任务的改动，不会把历史漂移算进来
+    let baseline: Option<String> = if rec_cfg.checkpoint_enabled {
+        // 用任务钉住的工作区，不是全局单例：后台任务运行期间用户切项目，
+        // 基线/结束 diff/撤销都必须跟着本任务走（2026-11-02 审计实锤）。
+        let ws = ws.clone();
+        let sid = gate.session_id().to_string();
+        tokio::task::spawn_blocking(move || -> Option<String> {
+            let _ = recovery::checkpoint(&ws, "任务起点", &sid);
+            recovery::head_id(&ws).ok().flatten()
+        })
+        .await
+        .ok()
+        .flatten()
+    } else {
+        None
+    };
+    // 回滚锚点（「回滚=文件+对话一起」）：任务起点基线记到触发的
+    // 那条 user 消息上——之后「回滚到这条消息」就能把工作区恢复到它发出前的状态。
+    // cp 随 Snapshot 落进会话文件；适配器出网关前的消息白名单会剥掉它，模型看不见。
+    if let Some(cp_id) = &baseline
+        && let Some(last_user) = msgs
+            .iter_mut()
+            .rev()
+            .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+    {
+        last_user["cp"] = json!(cp_id);
+    }
+    // 会话标题素材：本任务第一次最终回答（引导续跑后不从「好的已结束」生成标题）
+    let mut title_source: Option<String> = None;
+
+    // A3 能力标记「工具调用」闭环（施工单 012）：capabilities.tools=false 时不携带 tools
+    // 参数，模型无法发起新工具调用；历史消息里的 tool_calls 回放不受影响（replay 只动消息字段）。
+    let tools_def = tools_def_for(&primary.params);
+    // 工具定义随每次请求发给模型（渠道计入 prompt tokens），圆环必须算上——
+    // 否则比真实用量少一大截（实测：估算 1866 vs 实际 4750，差额≈工具 Schema）
+    let tools_schema_tokens =
+        tools_def.as_ref().map(|d| context::estimate_tokens(&d.to_string())).unwrap_or(0);
+    // 估算/裁剪是否计入思考，跟随回放判定：DeepSeek/zai 契约与白名单模型每轮把思考
+    // 重发进 prompt，本地预算必须看见；剥离渠道思考不进上下文、不计入（
+    // 2026-10-01：切勿对所有模型一律计入，否则剥离渠道会被过度裁剪）。
+    // 注：降级/备用渠道若契约不同会有偏差，以主渠道为准（裁剪本就是启发式）
+    let count_reasoning = {
+        let compat = crate::gateway::compat::resolve(
+            primary.params.provider_id.as_deref(),
+            Some(primary.base_url.trim()),
+            &primary.model,
+            primary.params.thinking_format,
+        );
+        crate::gateway::replay::should_preserve_replay(&primary.model, &compat)
+    };
+    // 占用锚点（对齐 DSH token-meter）：`(渠道实报 prompt_tokens, 那次请求发出时的本地估价)`。
+    // 圆环 = 实报 + 自锚点以来的带符号增量，所以「回复落地即进上下文」「工具结果回填」
+    // 「裁剪后回落」全都是自动的，不再需要手工维护 last_real/last_added 两个数。
+    // 起点可由 server 从上一轮的用量快照带入（跨轮沿用样本，见 LoopChannels::prior_anchor）。
+    let mut anchor: Option<(u64, u64)> = channels.prior_anchor.filter(|(p, e)| *p > 0 && *e > 0);
+
+    // 打断信号（2026-10-22「立即发送」分家）：流式输出与工具执行两个等待点
+    // select! 它当场让位（半截落地/工具按已中断回喂），决策点取走打断消息时复位；
+    // 整轮生命周期内同一实例（clear 不 remove，见 SteerQueue）。
+    let interrupt = gate.interrupt_flag();
+    // 步数上限：0 = 不限（大项目 100+ 次工具调用是常态，步数
+    // 上限本只该防死循环，而防死循环有取消标志/花费硬闸两道缰绳，不该由它
+    // 把长任务拦腰砍断）。非 0 时是硬上限：撞顶即止并抛 StepLimit（前端提示可回「继续」）。
+    for step in 0usize.. {
+        if cfg.max_steps > 0 && step >= cfg.max_steps as usize {
+            break; // 撞上限：收尾事件在循环外发（能走到这只可能是撞顶——自然完成早已 return）
+        }
+        // 每轮模型决策前查取消标志（核心循环刚性检查点）
+        if cancel.is_set() {
+            observability::event(EventType::State, json!({ "kind": "cancel", "phase": "loop", "step": step }));
+            on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
+            emit_checkpoint_bar(baseline, gate.session_id(), &ws, &on_event).await;
+            return Ok(LoopOutcome::Cancelled);
+        }
+        // N1/025 运行中追加消息：下一步决策前并入（模型这一步就能看到），原轮不打断。
+        // 落 Snapshot 让追加消息立刻进会话文件；前端按 Steer 事件补用户气泡。
+        let steer = gate.take_steering();
+        if !steer.is_empty() {
+            // 引导/打断消息进上下文与落盘都带标记（模型照常看到内容——它就是给
+            // 模型的指令；标记只是给前端的渲染提示，发送侧 replay 剥掉）：
+            // 引导 steered=true（静默「已引导」行）；
+            // 打断 interrupted=true（正常用户气泡——立即发送的消息要在对话里）。
+            let added: Vec<Value> = steer
+                .iter()
+                .map(|s| match s.mode {
+                    crate::core::steer::SteerMode::Interrupt => {
+                        json!({ "role": "user", "content": s.content.clone(), "interrupted": true, "ts": now_ms() })
+                    }
+                    _ => json!({ "role": "user", "content": s.content.clone(), "steered": true, "ts": now_ms() }),
+                })
+                .collect();
+            observability::event(
+                EventType::State,
+                json!({ "kind": "steer", "count": added.len(), "step": step }),
+            );
+            msgs.extend(added.iter().cloned());
+            on_event(AgentEvent::Steer { messages: added });
+            on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
+        }
+        // 上下文预算：超预算则归档旧工具结果/折叠旧轮次；占用推给前端圆环
+        {
+            // 摘要消息每步重新注入，先剥掉上一轮的（不参与裁剪统计）
+            msgs.retain(|m| !is_summary_msg(m));
+            let (mut compacted, stats) =
+                context::compact_messages(&msgs, ctx_cfg, tools_schema_tokens, count_reasoning);
+            if stats.compacted {
+                // 裁剪后不再清空实报值（旧做法：清零回落估算，等于把真实锚点丢了）：
+                // 锚点 + 带符号增量天然处理缩水——当前估价变小，增量就是负的，圆环当场回落。
+                observability::event(
+                    EventType::State,
+                    json!({
+                        "kind": "context.compacted",
+                        "step": step,
+                        "archived_tools": stats.archived_tools,
+                        "folded_messages": stats.folded_messages,
+                        "deduped_results": stats.deduped_results,
+                        "truncated_results": stats.truncated_results,
+                        "tokens_before": stats.tokens_before,
+                        "tokens_after": stats.tokens_after,
+                    }),
+                );
+                // 滚动摘要：有折叠 → 调模型把折叠内容压进摘要（失败保留占位符降级）。
+                // 连续失败 ≥3 次熔断：摘要渠道挂了别每步都白打一次辅助调用（占位符
+                // 照常降级，有新摘要需求时下轮也不再试——重启任务或换渠道后重置）。
+                // 用户点了停止就别再为了摘要干等渠道（辅助调用走非流式 complete，
+                // 本身不看取消标志）——取消即按「摘要失败」降级，下面立刻收尾。
+                if !stats.folded.is_empty() && mem.enabled && summary_fail_streak < 3 {
+                    let summarized = tokio::select! {
+                        s = summarize_folded(gateway, primary, channels.summary.as_ref(), &running_summary, &stats.folded, &sid) => s,
+                        () = cancel.cancelled() => None,
+                    };
+                    match summarized {
+                        Some(s) => {
+                            summary_fail_streak = 0;
+                            running_summary = Some(s.clone());
+                            observability::event(
+                                EventType::State,
+                                json!({ "kind": "memory.summarized", "step": step, "chars": s.chars().count() }),
+                            );
+                            on_event(AgentEvent::Summary(s));
+                        }
+                        None => {
+                            summary_fail_streak += 1;
+                            observability::event(
+                                EventType::State,
+                                json!({ "kind": "memory.summary_skipped", "step": step, "streak": summary_fail_streak, "note": "摘要调用失败，保留占位符" }),
+                            );
+                        }
+                    }
+                }
+            }
+            // 把当前摘要作为 system 消息紧跟主 system 注入（不进快照、不参与折叠）
+            if let Some(s) = &running_summary {
+                compacted.insert(1, json!({ "role": "system", "content": format!("{SUMMARY_PREFIX}{s}") }));
+            }
+            msgs = compacted;
+        }
+        // 圆环数据源（唯一出口）：锚点 + 带符号增量 → 占用；构成走估算，只当近似值。
+        // 交接阈值仍用估算口径（est_total）。
+        let breakdown = emit_context_usage(
+            &msgs,
+            anchor,
+            tools_schema_tokens,
+            count_reasoning,
+            ctx_cfg.budget_tokens,
+            &on_event,
+        );
+        let est_total = breakdown.total();
+        // 交接文档已移除（2026-10-01）：上下文满时的自动 HANDOFF 生成
+        // 与 composer 手动按钮都不做了——会话落盘+摘要已保障续命，不再另生文档
+        observability::debug(&format!("[loop] step {step} 调用模型 {}", primary.model));
+
+        // 降级链：主渠道当轮失败 → 按序换 fallback 重试同一步；取消置位立即停（不降级）
+        // 任务已超 token 预算且有降级渠道时，本步起改走降级渠道（便宜模型跑剩余步骤）
+        let mut chain: Vec<&Channel> = Vec::with_capacity(1 + channels.fallbacks.len());
+        if let (true, Some(cheap)) = (
+            channels.budget_hit.load(std::sync::atomic::Ordering::Relaxed),
+            channels.downgrade.as_ref(),
+        ) {
+            if !downgrade_noticed {
+                downgrade_noticed = true;
+                observability::event(
+                    EventType::State,
+                    json!({ "kind": "cost.downgraded", "step": step, "from": primary.model, "to": cheap.model }),
+                );
+                emit_notice(
+                    &mut msgs,
+                    &on_event,
+                    format!(
+                        "本任务累计 token 已超预算（[hooks] budget_tokens），后续步骤改走降级渠道「{}」以节省花费",
+                        cheap.model
+                    ),
+                );
+            }
+            chain.push(cheap);
+        } else {
+            chain.push(primary);
+        }
+        chain.extend(channels.fallbacks.iter());
+        // 锚点配对用的估价快照：就是上面那次测量的估价（send 前 msgs 不再变——
+        // 降级提示是 display_only，计价 0，不会让估价失真）。拿到实报时与它配对成新锚点
+        let est_at_request = est_total;
+        let call_started = std::time::Instant::now();
+        let (outcome, chain_notices, used_channel) = run_chain(
+            gateway,
+            &chain,
+            &msgs,
+            tools_def.as_ref(),
+            cancel,
+            &interrupt,
+            &usage_ctx,
+            step as u32,
+            &on_event,
+        )
+        .await;
+        // 本步模型调用耗时（中间步骤消息的 step_ms）
+        let call_ms = call_started.elapsed().as_millis() as u64;
+        if matches!(&outcome, Ok(ChatOutcome::Cancelled)) {
+            // 流式阶段取消同样要收尾：落盘当前消息（此前其它取消出口都有）、
+            // 发改动统计条、补 task.finish——否则这轮新建文件不进影子仓库，
+            // 之后撤销会静默留在磁盘上（2026-11-02 审计）。
+            on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
+            emit_checkpoint_bar(baseline, gate.session_id(), &ws, &on_event).await;
+            mem.record("task.finish", json!({ "reason": "cancelled", "phase": "streaming", "step": step }));
+            return Ok(LoopOutcome::Cancelled);
+        }
+        // 换渠道的提示实时已推给前端，这里补进上下文随快照落盘（重启后气泡还在）
+        for n in chain_notices {
+            persist_notice(&mut msgs, &on_event, &n);
+        }
+        let outcome = outcome?;
+
+        let turn = match outcome {
+            ChatOutcome::Cancelled => return Ok(LoopOutcome::Cancelled),
+            ChatOutcome::Interrupted(t) => {
+                // 「立即发送」打断（2026-10-22）：流式被用户插话让位——半截回答
+                // 落地（有内容才落），**本轮继续**：下一个决策点（循环顶部
+                // take_steering）取走打断指令，模型带着「自己的半截回答 + 新指令」继续。
+                if !t.content.trim().is_empty() {
+                    msgs.push(json!({ "role": "assistant", "content": t.content, "ts": now_ms() }));
+                    on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
+                }
+                continue;
+            }
+            ChatOutcome::Done(t) => t,
+        };
+
+        // 消息信息卡数据（2026-10-26）：本步实际用的渠道（降级链取成功那个）+ 流式计时。
+        // 随 assistant 消息落 stats 进会话文件（刷新/切回还能看），TurnStats 事件转前端
+        // 给正在流式的那条气泡实时挂上（server 层再补配置名）。
+        let used_model = used_channel
+            .as_ref()
+            .map(|c| c.model.clone())
+            .unwrap_or_else(|| primary.model.clone());
+        let used_provider = used_channel
+            .as_ref()
+            .and_then(|c| c.params.provider_id.clone())
+            .or_else(|| primary.params.provider_id.clone());
+        let turn_stats = json!({
+            "ttft_ms": turn.ttft_ms(call_started),
+            "gen_ms": turn.gen_ms(),
+            "completion_tokens": turn.completion_tokens,
+            "prompt_tokens": turn.prompt_tokens,
+            "cached_tokens": turn.cached_tokens,
+            "model": used_model,
+            "provider_id": used_provider,
+        });
+        on_event(AgentEvent::TurnStats { stats: turn_stats.clone() });
+
+        // 渠道真实用量：锚点更新 + 缓存行累计在回复落地后报（见下面两处 report_api_usage），
+        // 这样服务端那一次 usage 落盘就是含本条回复的终态。
+
+        // 输出截断检测：finish_reason=length → 提示调大最大输出/拆分写入。
+        // 思考预算已在网关侧扩容（effective_max_tokens：思考开启时发送
+        // 配置值+思考余量），思考不再吃掉「最大输出长度」额度——此处截断即正文
+        // 本身超限，提示口径回归真实。此前的自动续写方案已撤（治标不治本且拖慢
+        // 响应：续写要重传全量上下文，真机实测「还会卡」）。
+        if turn.finish_reason.as_deref() == Some("length") {
+            observability::event(
+                EventType::State,
+                json!({ "kind": "model.truncated", "step": step, "max_output_tokens": max_output_tokens }),
+            );
+            emit_notice(
+                &mut msgs,
+                &on_event,
+                "模型输出被截断（达到最大输出长度）。建议在设置里调大该模型的「最大输出长度」，或让它分多次写入。"
+                    .to_string(),
+            );
+        }
+
+        // 思考完整段落落 thought（分片级已记 model_chunk）
+        if !turn.reasoning.is_empty() {
+            observability::event(EventType::Thought, json!({ "step": step, "text": turn.reasoning }));
+        }
+
+        // 没有工具调用 → 纯文本即最终回答（已流式转发），终止
+        if turn.tool_calls.is_empty() {
+            // 兜底：弱模型/免费模型常只给 reasoning 不给 content，避免前端空回答
+            let final_text = if turn.content.trim().is_empty() && !turn.reasoning.trim().is_empty() {
+                observability::event(
+                    EventType::Error,
+                    json!({ "message": "模型未输出正文，回退展示思考内容" }),
+                );
+                on_event(AgentEvent::Content(turn.reasoning.clone()));
+                turn.reasoning.clone()
+            } else {
+                turn.content.clone()
+            };
+            // B3：Plan 档最终回答解析 ```plan 结构化计划 → 前端计划卡
+            if plan_mode {
+                match parse_plan(&final_text) {
+                    Some(plan) => {
+                        observability::event(
+                            EventType::State,
+                            json!({
+                                "kind": "plan.proposed", "step": step,
+                                "steps": plan.steps.len(), "files": plan.files.len(),
+                            }),
+                        );
+                        on_event(AgentEvent::PlanProposal {
+                            goal: plan.goal,
+                            steps: plan.steps,
+                            files: plan.files,
+                        });
+                    }
+                    None => emit_notice(
+                        &mut msgs,
+                        &on_event,
+                        "Plan 档：模型未按 ```plan 围栏格式输出计划，可直接对话要求它补一份格式化计划。".to_string(),
+                    ),
+                }
+            }
+            // 最终回答写入会话并落盘（与前端看到的一致）；带 reasoning_content（思考内容
+            // 随消息持久化，前端切回会话时恢复；回放侧由 replay.rs 按渠道契约决定去留）
+            // 顺带落时长：「工作用时」（整轮）与「思考 · 持续了」
+            // （本步 reasoning 分片首尾差）——刷新/切回会话后这两个数字还在
+            let mut final_msg = json!({ "role": "assistant", "content": final_text, "ts": now_ms() });
+            if !turn.reasoning.is_empty() {
+                final_msg["reasoning_content"] = json!(turn.reasoning);
+            }
+            final_msg["work_ms"] = json!(task_started.elapsed().as_millis() as u64);
+            final_msg["stats"] = turn_stats.clone();
+            if let Some(ms) = turn.reasoning_ms() {
+                final_msg["reasoning_ms"] = json!(ms);
+            }
+            msgs.push(final_msg);
+            on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
+            // 回复已落地 → 先报实报（更新锚点），再按新锚点重算占用推给前端：
+            // 圆环含这条回答，服务端那次落盘就是终态（重启后不丢这截增量）
+            report_api_usage(
+                &msgs,
+                &turn,
+                est_at_request,
+                tools_schema_tokens,
+                count_reasoning,
+                &mut anchor,
+                &on_event,
+            );
+            emit_context_usage(
+                &msgs,
+                anchor,
+                tools_schema_tokens,
+                count_reasoning,
+                ctx_cfg.budget_tokens,
+                &on_event,
+            );
+            // 标题素材取本任务**第一次**最终回答：引导续跑后的「好的，已结束」不该当会话标题
+            if title_source.is_none() {
+                title_source = Some(final_text.clone());
+            }
+            // 027 补口（2026-09-27 真机实测）：决策点只在每步模型调用**之前**，「立即发送」
+            // 若在最终回答流式输出期间到达，会错过全部决策点——按旧逻辑直接收尾，这条引导
+            // 被服务层收尾 drain_all 捡去当 followup 另起一轮（用户看到自己没再说话却多出
+            // 一轮「好的，已结束」）。最终回答落地后再取一次：有引导就并进本轮继续（不丢
+            // 已流出的回答，模型下一步就看到），没有才是真的结束。
+            let steer = gate.take_steering();
+            if !steer.is_empty() {
+                // 同决策点：按模式打标记（引导=steered 静默行 / 打断=interrupted 气泡）
+                let added: Vec<Value> = steer
+                    .iter()
+                    .map(|s| match s.mode {
+                        crate::core::steer::SteerMode::Interrupt => {
+                            json!({ "role": "user", "content": s.content.clone(), "interrupted": true, "ts": now_ms() })
+                        }
+                        _ => json!({ "role": "user", "content": s.content.clone(), "steered": true, "ts": now_ms() }),
+                    })
+                    .collect();
+                observability::event(
+                    EventType::State,
+                    json!({ "kind": "steer", "phase": "post_answer", "count": added.len(), "step": step }),
+                );
+                msgs.extend(added.iter().cloned());
+                on_event(AgentEvent::Steer { messages: added });
+                on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
+                continue;
+            }
+            emit_checkpoint_bar(baseline, gate.session_id(), &ws, &on_event).await;
+            observability::event(
+                EventType::State,
+                json!({ "kind": "loop.finish", "step": step, "content_chars": turn.content.chars().count(), "session": gate.session_id() }),
+            );
+            // 事件流水：任务完成
+            mem.record("task.finish", json!({ "steps": step + 1, "chars": final_text.chars().count() }));
+            // TITLE 角色：任务结束用专用渠道生成会话标题（失败静默保留机械标题）。
+            // 同样接取消：回答已落地，用户点了停止就不该再为标题多等一次渠道往返。
+            if let Some(tch) = &channels.title {
+                let titled = tokio::select! {
+                    t = generate_title(gateway, tch, title_source.as_deref().unwrap_or(&final_text), &sid) => t,
+                    () = cancel.cancelled() => None,
+                };
+                if let Some(title) = titled {
+                    observability::event(
+                        EventType::State,
+                        json!({ "kind": "session.titled", "title": title }),
+                    );
+                    on_event(AgentEvent::Title(title));
+                }
+            }
+            return Ok(LoopOutcome::Done);
+        }
+
+        // 回填 assistant 消息（含 tool_calls）；思考内容随消息落盘（前端切回会话可恢复）
+        let calls_json: Vec<Value> = turn
+            .tool_calls
+            .iter()
+            .map(|c| {
+                json!({
+                    "id": c.id,
+                    "type": "function",
+                    "function": { "name": c.name, "arguments": c.arguments },
+                })
+            })
+            .collect();
+        let mut asst_msg = json!({
+            "role": "assistant",
+            "content": if turn.content.is_empty() { Value::Null } else { json!(turn.content) },
+            "tool_calls": calls_json,
+            "ts": now_ms(),
+            "stats": turn_stats.clone(),
+        });
+        if !turn.reasoning.is_empty()
+            && primary.params.thinking.as_deref() != Some("off")
+        {
+            // 思考=关时不落 reasoning_content——否则刷新/切回会话又从历史里显示出来
+            asst_msg["reasoning_content"] = json!(turn.reasoning);
+        }
+        // 中间步骤也带上时长（思考持续 + 本步耗时）：刷新后每一步的气泡也能显示
+        asst_msg["step_ms"] = json!(call_ms);
+        if let Some(ms) = turn.reasoning_ms() {
+            asst_msg["reasoning_ms"] = json!(ms);
+        }
+        msgs.push(asst_msg);
+        // 本步工具结果槽位：`executed` 单独记「是否真的跑过」——不能拿空结果判断
+        // （工具可能合法返回空串）。取消时要靠它给没执行的 tool_call 回填结果，
+        // 否则落盘的 assistant(tool_calls) 没有对应 tool 消息，下一轮协议校验直接 400。
+        let mut results: Vec<(String, bool)> = vec![(String::new(), true); turn.tool_calls.len()];
+        let mut executed: Vec<bool> = vec![false; turn.tool_calls.len()];
+        // 带工具调用的回复同样先落地再报：锚点更新 + 圆环重算（工具结果回填后，
+        // 下一步开头那次测量会把它们按增量补上）
+        report_api_usage(
+            &msgs,
+            &turn,
+            est_at_request,
+            tools_schema_tokens,
+            count_reasoning,
+            &mut anchor,
+            &on_event,
+        );
+        emit_context_usage(
+            &msgs,
+            anchor,
+            tools_schema_tokens,
+            count_reasoning,
+            ctx_cfg.budget_tokens,
+            &on_event,
+        );
+
+        // —— 018：工具执行两阶段（判定串行 → 只读组并行 / 写类串行独占）——
+        // fs_unconfined / unsandboxed 每步现读 gate：运行中切档，从下一步起按新档位执行
+        let exec_cfg = ExecConfig {
+            sandbox: sandbox_cfg.clone(),
+            max_chars: cfg.tool_result_max_chars,
+            unsandboxed: !gate.sandbox_enabled(),
+            fs_unconfined: gate.file_tools_unconfined(),
+            cpu_percent,
+            workspace: ws.clone(),
+            // 沙箱子进程的停止信号：点停止时 wait 轮询到它立即整树击杀，
+            // 不再出现「点了停止、旧命令还在后台写文件」
+            cancel: Some(cancel.clone()),
+            // 阻塞式提问通道：前台 ChatGate 给（ask 工具用）；无头实现默认 None=工具禁用
+            ask: gate.ask_sink(),
+        };
+        use futures_util::StreamExt;
+
+        // 阶段一「判定」（串行）：Plan 拦截 / 审批弹窗 / 取消——全部现有语义不变
+        struct Decision {
+            approved: bool,
+            plan_reason: Option<String>,
+            hook_reason: Option<String>,
+            skip_conflict: bool,
+            /// 同路径多写：并行会互相覆盖，必须串行（2026-11-02 并行放开的配套）
+            force_serial: bool,
+        }
+        let mut decisions: Vec<Decision> = Vec::with_capacity(turn.tool_calls.len());
+        for call in &turn.tool_calls {
+            if cancel.is_set() {
+                observability::event(EventType::State, json!({ "kind": "cancel", "phase": "tool", "step": step }));
+                // 协议完整性：已经落盘的 assistant(tool_calls) 必须逐条有 tool 结果，
+                // 否则这条会话下一轮会被严格校验的端点 400 掉（2026-11-02 审计实锤）。
+                backfill_cancelled_tools(&mut msgs, &turn.tool_calls, &executed);
+                on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
+                emit_checkpoint_bar(baseline, gate.session_id(), &ws, &on_event).await;
+                mem.record("task.finish", json!({ "reason": "cancelled", "step": step }));
+                return Ok(LoopOutcome::Cancelled);
+            }
+            observability::event(
+                EventType::ToolCall,
+                json!({ "step": step, "id": call.id, "name": call.name, "arguments": call.arguments }),
+            );
+            on_event(AgentEvent::ToolCall { name: call.name.clone(), args: call.arguments.clone() });
+            observability::debug(&format!("[loop] 工具 {} 参数 {}", call.name, call.arguments));
+
+            // B2：Plan 档拦截优先于审批流；细粒度审批单点不变
+            let plan_reason = gate.plan_block_reason_in(&ws, &call.name, &call.arguments);
+            // 钩子（027）：before_tool 只有否决权——deny 则不执行且不进审批流；
+            // 钩子放行 ≠ 免审批，审批门照走（定案 7）。
+            let hook_reason = if plan_reason.is_none() {
+                crate::hooks::before_tool(gate.session_id(), &call.name, &call.arguments)
+                    .await
+                    .err()
+            } else {
+                None
+            };
+            let approved = match (&plan_reason, &hook_reason) {
+                (Some(_), _) | (_, Some(_)) => false,
+                (None, None) if gate.needs_approval_for_in(&ws, &call.name, &call.arguments) => {
+                    gate.ask(&call.name, &call.arguments).await
+                }
+                (None, None) => true,
+            };
+            // 分级不再缓存：审批走 gate.needs_approval_for，并行组只看批准与否
+            // （2026-11-02 照 ZCode 全量并发，不再按 risk 分读写组）
+            decisions.push(Decision {
+                approved,
+                plan_reason,
+                hook_reason,
+                skip_conflict: false,
+                force_serial: false,
+            });
+        }
+
+        // 写冲突检测（018）：同轮 write_file 同路径 → 仅首个执行，其余跳过回喂
+        {
+            let calls: Vec<(String, String)> = turn
+                .tool_calls
+                .iter()
+                .map(|c| (c.name.clone(), c.arguments.clone()))
+                .collect();
+            for i in write_conflict_skips(&calls) {
+                let d = &mut decisions[i];
+                if d.approved && d.plan_reason.is_none() && !d.skip_conflict {
+                    d.skip_conflict = true;
+                    observability::event(
+                        EventType::State,
+                        json!({ "kind": "write.conflict", "step": step, "tool": turn.tool_calls[i].name, "arguments": turn.tool_calls[i].arguments }),
+                    );
+                }
+            }
+            // 2026-11-02 并行放开的配套：同一路径的多写（含 edit_file）踢回串行组，
+            // 否则并发 read→replace→write 会互相覆盖，静默丢改动
+            for i in same_path_write_indices(&calls) {
+                decisions[i].force_serial = true;
+            }
+        }
+
+        // 阶段二「执行」：**已批准的一律并行**（「改的和 ZCode 一样」）。
+        // 原来只让 risk==0 的只读调用进并行组、写/执行串行独占；ZCode 的 executeTools
+        // 是 `Promise.all(toolCalls.map(...))`——不按读/写分组，model 一条消息里发几个
+        // 就同时跑几个。用户在那边用久了，认为这个节奏刚好。照搬。
+        // 仍不进并行组的只有三种：没批的、被计划拦截的、同轮写同一路径被跳过的。
+        // tool_images：本步工具结果里剥出的截图（computer 工具）——按 tool_calls
+        // 下标存，回填时升级成多模态 tool 消息；只活在本次任务的请求上下文里。
+        let mut tool_images: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+        let flags: Vec<(bool, bool, bool, bool)> = decisions
+            .iter()
+            .map(|d| (d.approved, d.plan_reason.is_some(), d.skip_conflict, d.force_serial))
+            .collect();
+        let parallel: Vec<usize> = parallel_flags(&flags);
+        if parallel.len() > 1 {
+            observability::event(
+                EventType::State,
+                json!({ "kind": "tools.parallel", "step": step, "count": parallel.len() }),
+            );
+        }
+        let subagent_runner = channels.subagents.clone();
+        let parent_sid = gate.session_id().to_string();
+        // 并行组也要拍检查点（2026-11-02 审计实锤：并行放开后写类全走这里，原实现
+        // 只在串行分支拍 → 写前影子检查点形同虚设）。串行把每个写/执行类工具的
+        // 检查点拍完再并发跑，避免多个 git 检查点同时写同一影子仓库。
+        if rec_cfg.checkpoint_enabled {
+            for &i in &parallel {
+                let call = &turn.tool_calls[i];
+                let danger = tools::find(&call.name).map(|s| s.danger_level).unwrap_or(2);
+                if danger >= 1 && call.name != "subagent_spawn" {
+                    checkpoint_before(&ws, &call.name, &call.arguments, gate.session_id(), mem).await;
+                }
+            }
+        }
+        let mut futs = futures_util::stream::FuturesUnordered::new();
+        for &i in &parallel {
+            let call = &turn.tool_calls[i];
+            let cfg = exec_cfg.clone();
+            let name = call.name.clone();
+            let args = call.arguments.clone();
+            let runner = subagent_runner.clone();
+            let parent = parent_sid.clone();
+            let interrupt = interrupt.clone();
+            futs.push(Box::pin(async move {
+                let exec = exec_tool_call(&cfg, &name, &args, runner.as_ref(), &parent);
+                (i, exec_with_cancel(cancel, &interrupt, exec).await)
+            }));
+        }
+        // 并行完成即发 result 事件（时间线可见并发；进度与完成顺序一致）
+        while let Some((i, r)) = futs.next().await {
+            let call = &turn.tool_calls[i];
+            let (mut content, ok) = match r {
+                Ok(s) => (s, true),
+                Err(e) => (format!("工具执行失败: {e}"), false),
+            };
+            // 截图标记：剥出 base64 单放（文本留干净的一句话），消息回填时升级成
+            // 多模态 tool 消息——没有这一步 computer 工具的截图模型看不见
+            if let Some(img) = crate::computer::take_image(&mut content) {
+                tool_images.insert(i, img);
+            }
+            let preview: String = content.chars().take(300).collect();
+            observability::event(
+                EventType::ToolResult,
+                json!({ "step": step, "id": call.id, "name": call.name, "ok": ok, "chars": content.chars().count(), "truncated": content.contains(context::OMITTED_MARK), "preview": preview }),
+            );
+            on_event(AgentEvent::ToolResult { name: call.name.clone(), ok, preview });
+            crate::hooks::notify_after_tool(gate.session_id(), &call.name, ok);
+            results[i] = (content, ok);
+            executed[i] = true;
+        }
+
+        // 串行组：只剩没批准 / 被计划拦截 / 同路径写冲突被跳过的（2026-11-02 起
+        // 写类也进并行组，见上）。逐个发回执，不打乱顺序。
+        for i in 0..turn.tool_calls.len() {
+            if parallel.contains(&i) {
+                continue;
+            }
+            if cancel.is_set() {
+                observability::event(EventType::State, json!({ "kind": "cancel", "phase": "tool", "step": step }));
+                backfill_cancelled_tools(&mut msgs, &turn.tool_calls, &executed);
+                on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
+                emit_checkpoint_bar(baseline, gate.session_id(), &ws, &on_event).await;
+                mem.record("task.finish", json!({ "reason": "cancelled", "step": step }));
+                return Ok(LoopOutcome::Cancelled);
+            }
+            let call = &turn.tool_calls[i];
+            let d = &decisions[i];
+            let danger = tools::find(&call.name).map(|s| s.danger_level).unwrap_or(2);
+            let (content, ok) = if let Some(reason) = &d.plan_reason {
+                observability::event(
+                    EventType::State,
+                    json!({ "kind": "plan.blocked", "step": step, "tool": call.name, "reason": reason }),
+                );
+                emit_notice(&mut msgs, &on_event, format!("Plan 档已拦截 {}：{}", call.name, reason));
+                (
+                    format!(
+                        "Plan 模式拦截（未执行）：{reason}。请勿执行写/改类操作——继续只读调研，并在最终回答中用 ```plan 围栏输出执行计划，等待用户批准。"
+                    ),
+                    true,
+                )
+            } else if let Some(reason) = &d.hook_reason {
+                // 钩子 deny（027）：未执行，把理由回喂给模型调整做法
+                observability::event(
+                    EventType::State,
+                    json!({ "kind": "hook.blocked", "step": step, "tool": call.name, "reason": reason }),
+                );
+                emit_notice(&mut msgs, &on_event, format!("钩子已拦截 {}：{}", call.name, reason));
+                (
+                    format!("自定义钩子拦截（未执行）：{reason}。请换别的做法或直接回答用户。"),
+                    true,
+                )
+            } else if d.skip_conflict {
+                emit_notice(
+                    &mut msgs,
+                    &on_event,
+                    format!("写冲突已跳过 {}：本轮已有对同一文件的写操作", call.name),
+                );
+                (
+                    "写冲突：本轮已有对同一文件的写操作，本次已跳过。请把对同一文件的多次写入拆分到不同轮次。".to_string(),
+                    true,
+                )
+            } else if !d.approved {
+                ("用户拒绝了该操作，工具未执行。请换别的做法或直接回答用户。".to_string(), true)
+            } else {
+                // 写类/执行类工具动手前先拍影子仓库检查点；失败只记日志，绝不阻断。
+                // subagent_spawn 不拍——子代理会话对自己的改动拍自己的检查点
+                // （父任务这边拍只会把子代理的改动混进父任务的基线口径）。
+                if rec_cfg.checkpoint_enabled && danger >= 1 && call.name != "subagent_spawn" {
+                    checkpoint_before(&ws, &call.name, &call.arguments, gate.session_id(), mem).await;
+                }
+                let exec = exec_tool_call(
+                    &exec_cfg,
+                    &call.name,
+                    &call.arguments,
+                    channels.subagents.as_ref(),
+                    gate.session_id(),
+                );
+                match exec_with_cancel(cancel, &interrupt, exec).await {
+                    Ok(mut s) => {
+                        // 截图标记同并行路径：剥出单放，回填时升级多模态
+                        if let Some(img) = crate::computer::take_image(&mut s) {
+                            tool_images.insert(i, img);
+                        }
+                        (s, true)
+                    }
+                    Err(e) => (format!("工具执行失败: {e}"), false),
+                }
+            };
+            // 串行组 result 事件即时发（与原行为一致）
+            let preview: String = content.chars().take(300).collect();
+            observability::event(
+                EventType::ToolResult,
+                json!({ "step": step, "id": call.id, "name": call.name, "ok": ok, "chars": content.chars().count(), "truncated": content.contains(context::OMITTED_MARK), "preview": preview }),
+            );
+            on_event(AgentEvent::ToolResult { name: call.name.clone(), ok, preview });
+            crate::hooks::notify_after_tool(gate.session_id(), &call.name, ok);
+            results[i] = (content, ok);
+            executed[i] = true;
+        }
+
+        // —— 统一回填（按 tool_calls 原顺序，协议友好）——
+        for (i, call) in turn.tool_calls.iter().enumerate() {
+            let (content, ok) = &results[i];
+            mem.record("tool.call", json!({ "name": call.name, "ok": ok }));
+            // 本步有截图时按**模型能力**决定怎么投递（2026-11-02 统一，与附件同一条判据）：
+            // - 主模型勾了「图片解析」→ 升级成多模态 tool 消息（Anthropic 原生带图；
+            //   OpenAI 适配层把图挪进下一条 user 消息，和用户发附件同形）；
+            // - 没勾 → 先让视觉角色把图转成文字，纯文本模型也有眼睛；转写失败/没配
+            //   视觉角色才退回原样（OpenAI 侧压平成落盘截图的指路话）。
+            // 图片只活在 msgs（请求上下文）；落盘快照由 snapshot_msgs 剥掉，不撑爆会话文件。
+            let mut text = content.clone();
+            let mut image = tool_images.get(&i);
+            if let Some(img) = image
+                && !channels.primary.params.vision
+                && let Some(vch) = channels.vision.as_ref()
+            {
+                match describe_screenshot(gateway, vch, img, cancel, gate.session_id()).await {
+                    Some(desc) => {
+                        let route = vch.params.provider_id.as_deref().unwrap_or("openai_compat");
+                        text.push_str(&format!(
+                            "\n[截图转写 ({}/{model}):\n{desc}]",
+                            route,
+                            model = vch.model
+                        ));
+                        image = None;
+                    }
+                    None => text.push_str(
+                        "\n[截图转写失败：视觉角色没有返回可用描述，截图按落盘路径指路]",
+                    ),
+                }
+            }
+            let content_value = match image {
+                Some(img) => json!([
+                    { "type": "text", "text": text },
+                    { "type": "image_url", "image_url": { "url": format!("data:image/png;base64,{img}") } }
+                ]),
+                None => json!(text),
+            };
+            msgs.push(json!({ "role": "tool", "tool_call_id": call.id, "content": content_value }));
+        }
+        // 会话落盘：本步工具回填完毕，状态常驻磁盘
+        on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
+    }
+
+    // 撞步数上限也是任务结束：补「结束快照」提交 + 改动统计条（2026-10-08 修——
+    // 其余四个出口都拍了只这条漏：前端拿不到 Checkpoint 事件 = 没有改动统计/撤销入口；
+    // 影子仓库没提交末段新建文件 = 撤销后这些文件静默留在磁盘上）。事件流水补 task.finish。
+    emit_checkpoint_bar(baseline, gate.session_id(), &ws, &on_event).await;
+    mem.record("task.finish", json!({ "steps": cfg.max_steps, "reason": "step_limit", "max_steps": cfg.max_steps }));
+    observability::event(EventType::Error, json!({ "message": format!("已达步数上限 {}，强制终止", cfg.max_steps) }));
+    on_event(AgentEvent::StepLimit(cfg.max_steps));
+    Ok(LoopOutcome::Done)
+}
+
+/// 截图转文字（主模型没勾「图片解析」时的转接路径，2026-11-02 统一）。
+///
+/// 和用户发附件的转接走同一条判据与同一种调用：非流式 complete、只读、台账记
+/// purpose=media 归当前会话；失败/取消返回 None，由调用方兜底（保留截图 + 落盘指路）。
+/// 提示词只要事实描述 + 大致坐标，明确禁止它执行操作——它只是主模型的「眼睛」。
+async fn describe_screenshot(
+    gateway: &Arc<Gateway>,
+    ch: &Channel,
+    b64: &str,
+    cancel: &CancelFlag,
+    session: &str,
+) -> Option<String> {
+    let prompt = json!([{
+        "role": "user",
+        "content": [
+            { "type": "image_url", "image_url": { "url": format!("data:image/png;base64,{b64}") } },
+            { "type": "text", "text": "这是电脑当前屏幕的截图。请详细描述可见内容：窗口标题、界面文字、按钮/开关/输入框及其状态，并给出各元素大致的屏幕坐标，供一个看不见屏幕的助手据此操作。只描述事实，不要执行任何操作。" }
+        ]
+    }]);
+    // 与附件转接同一口径：上限 1500 tokens、清空思考参数（转写要快，不要推理档）
+    let mut params = ch.params.clone();
+    params.max_tokens = Some(params.max_tokens.unwrap_or(1500).min(1500));
+    params.thinking = None;
+    let ctx = UsageCtx::aux(session, "media");
+    tokio::select! {
+        r = gateway.complete(&ctx, &ch.base_url, &ch.model, &ch.api_key, &prompt, &params) => match r {
+            Ok(t) if !t.trim().is_empty() => Some(t.trim().to_string()),
+            Ok(_) => {
+                observability::event(EventType::Error, json!({ "kind": "computer.caption_empty", "model": ch.model }));
+                None
+            }
+            Err(e) => {
+                observability::event(
+                    EventType::Error,
+                    json!({ "kind": "computer.caption_failed", "model": ch.model, "error": format!("{e:#}") }),
+                );
+                None
+            }
+        },
+        () = cancel.cancelled() => None,
+    }
+}
+
+/// 本步哪些调用进并行组。「和 ZCode 一样」：ZCode 的
+/// executeTools 是 `Promise.all(toolCalls.map(...))`——已批准的全量并发，不按读/写
+/// 分组。四种情况仍不进：没批准、被计划拦截、同轮写同一路径被跳过、同路径多写要串行。
+fn parallel_flags(flags: &[(bool, bool, bool, bool)]) -> Vec<usize> {
+    flags
+        .iter()
+        .enumerate()
+        .filter(|(_, (approved, plan_blocked, conflict, force_serial))| {
+            *approved && !*plan_blocked && !*conflict && !*force_serial
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 并行组判定：已批准的一律并行（含写类），只有没批/计划拦截/写冲突/同路径多写被排除。
+    #[test]
+    fn parallel_group_takes_every_approved_call() {
+        // (approved, plan_blocked, conflict, force_serial)
+        assert_eq!(parallel_flags(&[]), Vec::<usize>::new());
+        assert_eq!(parallel_flags(&[(true, false, false, false)]), vec![0], "单条也进并行组（形态与旧逻辑一致）");
+        // 两条写类：2026-11-02 起一起并行，不再按读/写分组
+        assert_eq!(
+            parallel_flags(&[(true, false, false, false), (true, false, false, false)]),
+            vec![0, 1]
+        );
+        // 没批 / 计划拦截 / 写冲突 / 同路径多写：都不进
+        assert_eq!(
+            parallel_flags(&[
+                (false, false, false, false),
+                (true, true, false, false),
+                (true, false, true, false),
+                (true, false, false, true),
+                (true, false, false, false),
+            ]),
+            vec![4]
+        );
+    }
+
+    /// 同一路径两次写（含 edit_file）必须串行：并行会互相覆盖、静默丢改动。
+    #[test]
+    fn same_path_writes_are_forced_serial() {
+        use crate::core::agent::plan::same_path_write_indices;
+        let calls = vec![
+            ("write_file".to_string(), r#"{"path":"a.txt","content":"1"}"#.to_string()),
+            ("edit_file".to_string(), r#"{"path":"a.txt","old_string":"1","new_string":"2"}"#.to_string()),
+            ("edit_file".to_string(), r#"{"path":"B.TXT","old_string":"x","new_string":"y"}"#.to_string()),
+            ("write_file".to_string(), r#"{"path":"b.txt","content":"z"}"#.to_string()),
+            ("read_file".to_string(), r#"{"path":"a.txt"}"#.to_string()),
+        ];
+        let idx = same_path_write_indices(&calls);
+        assert!(idx.contains(&0) && idx.contains(&1), "a.txt 两次写：两个都要串行");
+        assert!(idx.contains(&2) && idx.contains(&3), "b.txt 大小写不同也算同一路径");
+        assert!(!idx.contains(&4), "读不进这个集合");
+    }
+
+    /// 2026-10-30 真机实锤：模型一次吐 50KB 的 write_file，输出打满 max_tokens 被切断，
+    /// 参数是没闭合的 JSON。体检必须认出「截断」并给分块指引，而不是 serde 天书。
+    #[test]
+    fn tool_args_guard_detects_truncation_and_guides_chunking() {
+        // 合法 JSON / 空参数 → 放行
+        assert!(tool_args_guard("write_file", r#"{"path":"a.txt","content":"hi"}"#).is_none());
+        assert!(tool_args_guard("list_skills", "").is_none(), "空参数放行，让工具自己按原行为报");
+        // 截断：字符串没闭合（serde: EOF while parsing a string）
+        let mut truncated = String::from(r#"{"path":"a.html","content":"<!DOCTYPE html>"#);
+        truncated.push_str(&"x".repeat(500));
+        let msg = tool_args_guard("write_file", &truncated).expect("截断必须拦下来");
+        assert!(msg.contains("被截断"), "要说是截断: {msg}");
+        assert!(msg.contains("分块"), "要给分块指引: {msg}");
+        assert!(msg.contains("edit_file"), "要指路续写工具: {msg}");
+        // 其他非法 JSON → 也给人话，但不冒充截断
+        let bad = tool_args_guard("write_file", "not json at all").expect("非法 JSON 也要拦");
+        assert!(bad.contains("不是合法 JSON"), "{bad}");
+        assert!(!bad.contains("被截断"), "语法错误不该说成截断: {bad}");
+    }
+
+    #[test]
+    fn tools_def_follows_capability_mark() {
+        // A3（施工单 012）：capabilities.tools=false → 请求不携带 tools 参数
+        let mut p = ChatParams::default();
+        assert!(tools_def_for(&p).is_some(), "默认（tools=true）携带 tools");
+        p.tools_enabled = false;
+        assert!(tools_def_for(&p).is_none(), "勾掉「工具调用」后不再携带 tools；历史 tool_calls 回放不受影响");
+    }
+
+    // —— 坑 31 ① 收口 + 2026-10-22「立即发送」分家：工具执行期两道闸（exec_with_cancel）——
+    // 卡住的工具（永不完成的 future）+ 点停止 → 当场返回「已取消」；
+    // + 点「立即发送」→ 当场返回「已中断」（本轮继续，下一个决策点取走新指令）。
+    #[tokio::test]
+    async fn tool_exec_cancel_gate_interrupts_pending_tool() {
+        let flag = Arc::new(CancelFlag::new());
+        let setter = flag.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            setter.set();
+        });
+        // 唯一出路是取消臂：2s 上限远小于「干等工具自己超时」的旧行为
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            exec_with_cancel(&flag, &CancelFlag::new(), std::future::pending::<Result<String, String>>()),
+        )
+        .await
+        .expect("点停止必须在 2s 内打断卡住的工具（旧行为：干等工具超时 ~30s）");
+        assert_eq!(r, Err("已取消：用户点了结束回答".to_string()));
+    }
+
+    /// 「立即发送」打断臂：打断信号置位 → 工具按「已中断」回喂（文案区分于停止；
+    /// 循环不终止是 run_task 层的职责，这里锁的是闸本身的即时性）。
+    #[tokio::test]
+    async fn tool_exec_interrupt_gate_yields_immediately() {
+        let interrupt = Arc::new(CancelFlag::new());
+        let setter = interrupt.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            setter.set();
+        });
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            exec_with_cancel(&CancelFlag::new(), &interrupt, std::future::pending::<Result<String, String>>()),
+        )
+        .await
+        .expect("「立即发送」必须在 2s 内让卡住的工具让位");
+        assert!(matches!(r, Err(ref e) if e.contains("已中断")), "打断文案要说人话: {r:?}");
+    }
+
+    #[tokio::test]
+    async fn tool_exec_cancel_gate_passes_through_completion() {
+        let flag = CancelFlag::new();
+        let r = exec_with_cancel(&flag, &CancelFlag::new(), async { Ok("完成".to_string()) }).await;
+        assert_eq!(r, Ok("完成".to_string()), "未点停止时工具结果原样通过");
+    }
+
+    // —— B3：plan 块解析 ——
+    // —— 018：写冲突检测 ——
+    #[test]
+    fn write_conflict_detection() {        let mk = |n: &str, a: &str| (n.to_string(), a.to_string());
+        let calls = vec![
+            mk("write_file", r#"{"path": "src/a.rs"}"#),
+            mk("read_file", r#"{"path": "src/a.rs"}"#),
+            mk("write_file", r#"{"path": "SRC\\a.rs"}"#), // 大小写+反斜杠归一后同路径
+            mk("write_file", r#"{"path": "src/b.rs"}"#),
+            mk("shell", r#"{"command": "del x"}"#),
+        ];
+        let skip = write_conflict_skips(&calls);
+        assert!(!skip.contains(&0), "首个写不跳过");
+        assert!(!skip.contains(&1), "read_file 不参与检测");
+        assert!(skip.contains(&2), "同路径（归一后）第二个写跳过");
+        assert!(!skip.contains(&3), "不同路径不跳过");
+        assert_eq!(skip, [2usize].into_iter().collect());
+    }
+
+    #[test]
+    fn parse_plan_standard_block() {
+        let text = "好的，我先调研一下。\n```plan\n目标: 重构审批模块\n步骤:\n1. 梳理 gate 调用点\n2. 抽出纯函数\n3. 补单测\n文件: src/core/agent.rs, src/server.rs\n```\n等待批准。";
+        let p = parse_plan(text).expect("标准格式应解析成功");
+        assert_eq!(p.goal, "重构审批模块");
+        assert_eq!(p.steps, vec!["梳理 gate 调用点", "抽出纯函数", "补单测"]);
+        assert_eq!(p.files, vec!["src/core/agent.rs", "src/server.rs"]);
+    }
+
+    // —— 占用口径对齐 DSH（实报锚点 + 带符号增量）的端到端回归 ——
+    // 旧实现圆环 = 上次实报 + (正文+工具调用参数)，**整块工具结果不进圆环**：用户盯着
+    // 圆环等模型读工具结果的那段时间，显示的数偏小，要等下一次响应才跳一下。
+    // 这里两轮 mock 把它钉死：工具结果回填后那一次测量必须比响应刚落地的值更大。
+    #[tokio::test]
+    async fn context_usage_tracks_anchor_and_tool_results() {
+        fn init_logger() {
+            static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            ONCE.get_or_init(|| {
+                let dir = std::env::temp_dir().join("agent-test-logs");
+                let _ = crate::observability::init(&dir, "agent.jsonl", format!("ag-{}", uuid::Uuid::new_v4()));
+            });
+        }
+        init_logger();
+        use crate::config::MemoryConfig;
+        use crate::memory::Memory;
+        use std::sync::atomic::AtomicUsize;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_c = hits.clone();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_c = stop.clone();
+        let mock = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            while !stop_c.load(std::sync::atomic::Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut s, _)) => {
+                        let _ = s.set_nonblocking(false);
+                        let mut buf = [0u8; 65536];
+                        let _ = Read::read(&mut s, &mut buf);
+                        let n = hits_c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // 第 1 轮：要一个工具（结果会回填进上下文）；第 2 轮：最终回答
+                        let body = if n == 0 {
+                            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"config.toml\\\"}\"}}]}}]}\n\n\
+                             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+                             data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":20}}\n\n\
+                             data: [DONE]\n\n"
+                        } else {
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"读完了\"}}]}\n\n\
+                             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                             data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2500,\"completion_tokens\":30}}\n\n\
+                             data: [DONE]\n\n"
+                        };
+                        let r = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = s.write_all(r.as_bytes());
+                        let _ = s.flush();
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(15)),
+                }
+            }
+        });
+
+        let gateway = Arc::new(Gateway::new());
+        let ch = Channel::new(
+            &format!("http://127.0.0.1:{port}/v1"),
+            "mock-model",
+            "sk-dummy",
+            ChatParams::default(),
+        );
+        let channels = LoopChannels {
+            primary: ch,
+            summary: None,
+            title: None,
+            fallbacks: Vec::new(),
+            downgrade: None,
+            vision: None,
+            budget_hit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            subagents: None,
+            prior_anchor: None,
+        };
+        let ws = std::env::temp_dir().join(format!("agent-ctxmeter-{}-{}", std::process::id(), port));
+        std::fs::create_dir_all(&ws).unwrap();
+        let mem = Memory::open_at(
+            &ws,
+            &MemoryConfig { enabled: false, persist_sensitive: false, profile_max_chars: 2500 },
+            crate::memory::GlobalDirs {
+                install: ws.join("global"),
+                user: ws.join("user"),
+                install_legacy: ws.join("global-legacy"),
+                user_legacy: ws.join("user-legacy"),
+            },
+        );
+        // 收集每次 ContextUsage（pressure, projected）与 ApiUsage 次数
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<(Option<u64>, u64)>::new()));
+        let api = Arc::new(AtomicUsize::new(0));
+        let seen_c = seen.clone();
+        let api_c = api.clone();
+        struct G;
+        impl ApprovalGate for G {
+            fn needs_approval_for(&self, _tool: &str, _args_json: &str) -> bool {
+                false
+            }
+            fn sandbox_enabled(&self) -> bool {
+                true
+            }
+            fn ask(&self, _tool: &str, _args: &str) -> std::pin::Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+                Box::pin(async { true })
+            }
+        }
+        let cancel = Arc::new(CancelFlag::new());
+        let outcome = run_task(
+            &gateway,
+            &channels,
+            "sys prompt",
+            &[json!({ "role": "user", "content": "看看配置" })],
+            &cancel,
+            &AgentConfig::default(),
+            &SandboxConfig::default(),
+            0,
+            &ContextConfig::default(),
+            &RecoveryConfig { checkpoint_enabled: false },
+            &mem,
+            None,
+            false,
+            &G,
+            crate::tools::workspace_root(),
+            move |ev: AgentEvent| match ev {
+                AgentEvent::ContextUsage { pressure, projected, .. } => {
+                    seen_c.lock().unwrap().push((pressure, projected))
+                }
+                AgentEvent::ApiUsage { .. } => {
+                    api_c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                _ => {}
+            },
+        )
+        .await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        mock.join().unwrap();
+        let _ = std::fs::remove_dir_all(&ws);
+
+        assert_eq!(outcome.unwrap(), LoopOutcome::Done);
+        let seq = seen.lock().unwrap().clone();
+        assert_eq!(api.load(std::sync::atomic::Ordering::Relaxed), 2, "两次请求各报一次实报");
+        // 期望序列：① 首请求前（纯估算，无锚点）② 第 1 轮回复落地（锚点 = 实报 1000+输出20）
+        //           ③ 工具结果回填后（锚点不变，增量必须补上工具结果）④ 末轮回复落地（锚点 2500+输出30）
+        assert!(seq.len() >= 4, "至少要四次占用事件，实际 {seq:?}");
+        assert_eq!(seq[0].0, None, "首请求前没有实报锚点 → 纯估算");
+        assert_eq!(seq[1].0, Some(1020), "第 1 轮回复落地后锚点 = 实报 prompt + completion");
+        assert_eq!(seq[2].0, Some(1020), "工具结果回填不会换锚点");
+        assert!(
+            seq[2].1 > seq[1].1,
+            "工具结果必须计入圆环：回填后 {} 应大于回复刚落地时的 {}",
+            seq[2].1,
+            seq[1].1
+        );
+        let last = seq.last().unwrap();
+        assert_eq!(last.0, Some(2530), "末次锚点 = 第二次实报 prompt + completion");
+        assert!(last.1 >= 2530, "圆环不低于实报本身，实际 {}", last.1);
+    }
+
+    #[test]
+    fn parse_plan_tolerant_marks() {
+        // 中文冒号 + markdown 加粗 + 「-」列表符 + 反引号包裹路径
+        let text = "```plan\n**目标**：完成 目标\n步骤:\n- 第一步\n- 第二步\n**文件**：`a.rs`、`b.rs`\n```";
+        let p = parse_plan(text).expect("容错格式应解析成功");
+        assert_eq!(p.goal, "完成 目标");
+        assert_eq!(p.steps, vec!["第一步", "第二步"]);
+        assert_eq!(p.files, vec!["a.rs", "b.rs"]);
+    }
+
+    #[test]
+    fn parse_plan_rejects_missing_or_empty() {
+        assert!(parse_plan("没有围栏的普通回答").is_none(), "无 plan 围栏返回 None");
+        assert!(parse_plan("```plan\n```").is_none(), "空围栏返回 None");
+        assert!(
+            parse_plan("```plan\n随便写两句不带头部标记的话\n```").is_none(),
+            "围栏内无任何目标/步骤/文件标记返回 None"
+        );
+    }
+
+    #[test]
+    fn parse_plan_steps_only_is_ok() {
+        // 只有步骤也算有效计划（弱模型可能漏掉目标/文件行）
+        let text = "```plan\n步骤:\n1. 先做 A\n2. 再做 B\n```";
+        let p = parse_plan(text).expect("仅步骤应解析成功");
+        assert!(p.goal.is_empty());
+        assert_eq!(p.steps, vec!["先做 A", "再做 B"]);
+        assert!(p.files.is_empty());
+    }
+
+    // —— 思考预算扩容 + 截断提示（2026-09-29 真机实测「思考内容算进输出长度
+    // 把正文截断」；此前的自动续写方案已撤——治标不治本且拖慢响应）——
+    // mock SSE：一次请求即 finish_reason=length 半截正文。
+    // 期望：① 请求体 max_tokens = 配置值+思考余量（4096 → 12288，思考不再吃正文额度）；
+    //       ② 不自动续写（只有一次请求，正文就是半截）；③ 截断提示落盘成 display_only 气泡。
+    #[tokio::test]
+    async fn thinking_max_tokens_inflated_and_no_auto_continue() {
+        // 日志落临时目录（与 gateway/memory 测试同款，不写仓库 logs/）
+        fn init_logger() {
+            static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            ONCE.get_or_init(|| {
+                let dir = std::env::temp_dir().join("agent-test-logs");
+                let _ = crate::observability::init(&dir, "agent.jsonl", format!("ag-{}", uuid::Uuid::new_v4()));
+            });
+        }
+        init_logger();
+        use crate::config::MemoryConfig;
+        use crate::memory::Memory;
+        use std::sync::atomic::AtomicUsize;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let hits_c = hits.clone();
+        let bodies_c = bodies.clone();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_c = stop.clone();
+        let mock = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            while !stop_c.load(std::sync::atomic::Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut s, _)) => {
+                        let _ = s.set_nonblocking(false);
+                        let mut buf = [0u8; 65536];
+                        let n = Read::read(&mut s, &mut buf).unwrap_or(0);
+                        bodies_c.lock().unwrap().push(String::from_utf8_lossy(&buf[..n]).to_string());
+                        hits_c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"半截正文\"}}]}\n\n\
+                             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n\
+                             data: [DONE]\n\n";
+                        let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n{body}");
+                        let _ = s.write_all(resp.as_bytes());
+                        let _ = s.flush();
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(15)),
+                }
+            }
+        });
+
+        let gateway = Arc::new(Gateway::new());
+        // 复刻真机实测配置：step-5-preview + thinking=high + 最大输出长度 4096
+        let params = ChatParams { max_tokens: Some(4096), thinking: Some("high".to_string()), ..Default::default() };
+        let ch = Channel::new(&format!("http://127.0.0.1:{port}/v1"), "mock-model", "sk-dummy", params);
+        let channels = LoopChannels {
+            primary: ch,
+            summary: None,
+            title: None,
+            fallbacks: Vec::new(),
+            downgrade: None,
+            vision: None,
+            budget_hit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            subagents: None,
+            prior_anchor: None,
+        };
+        let ws = std::env::temp_dir().join(format!("agent-trunc-{}-{}", std::process::id(), port));
+        std::fs::create_dir_all(&ws).unwrap();
+        let mem = Memory::open_at(
+            &ws,
+            &MemoryConfig { enabled: false, persist_sensitive: false, profile_max_chars: 2500 },
+            crate::memory::GlobalDirs {
+                install: ws.join("global"),
+                user: ws.join("user"),
+                install_legacy: ws.join("global-legacy"),
+                user_legacy: ws.join("user-legacy"),
+            },
+        );
+        let notices = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let snaps = Arc::new(std::sync::Mutex::new(Vec::<Vec<Value>>::new()));
+        let notices_c = notices.clone();
+        let snaps_c = snaps.clone();
+        struct G;
+        impl ApprovalGate for G {
+            fn needs_approval_for(&self, _tool: &str, _args_json: &str) -> bool {
+                false
+            }
+            fn sandbox_enabled(&self) -> bool {
+                true
+            }
+            fn ask(&self, _tool: &str, _args: &str) -> std::pin::Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+                Box::pin(async { true })
+            }
+        }
+        let cancel = Arc::new(CancelFlag::new());
+        let outcome = run_task(
+            &gateway,
+            &channels,
+            "sys prompt",
+            &[json!({ "role": "user", "content": "写点东西" })],
+            &cancel,
+            &AgentConfig::default(),
+            &SandboxConfig::default(),
+            0,
+            &ContextConfig::default(),
+            &RecoveryConfig { checkpoint_enabled: false },
+            &mem,
+            None,
+            false,
+            &G,
+            crate::tools::workspace_root(),
+            move |ev: AgentEvent| match ev {
+                AgentEvent::Notice(t) => notices_c.lock().unwrap().push(t),
+                AgentEvent::Snapshot { messages } => snaps_c.lock().unwrap().push(messages),
+                _ => {}
+            },
+        )
+        .await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        mock.join().unwrap();
+        let _ = std::fs::remove_dir_all(&ws);
+
+        assert_eq!(outcome.unwrap(), LoopOutcome::Done);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::Relaxed), 1, "不再自动续写：只有一次请求");
+        let reqs = bodies.lock().unwrap();
+        let body_json = reqs[0]
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b)
+            .unwrap_or_default();
+        let sent: Value = serde_json::from_str(body_json).expect("请求体应为 JSON");
+        assert_eq!(sent.get("max_tokens").and_then(Value::as_u64), Some(12288), "思考开启时 max_tokens 应扩容到 4096+8192");
+        let notes = notices.lock().unwrap();
+        assert!(
+            notes.iter().any(|n| n.contains("模型输出被截断")),
+            "应推送截断提示，实际 {:?}",
+            *notes
+        );
+        let snaps = snaps.lock().unwrap();
+        let last = snaps.last().expect("至少落一次快照");
+        let final_msg = last
+            .iter()
+            .rev()
+            .find(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+            .expect("快照应有最终回答");
+        assert_eq!(final_msg.get("content").and_then(Value::as_str), Some("半截正文"), "不续写：正文就是半截");
+        assert!(
+            last.iter().any(|m| m.get("display_only").and_then(Value::as_bool) == Some(true)),
+            "截断提示应以 display_only 消息落盘（重启后气泡还在）"
+        );
+    }
+
+    // —— 删掉「连续两步相同工具调用 → 终止」护栏（与步数上限一样
+    // 属变相限制，一律不要）。真机实测：建个定时任务翻几步配置就被判「模型重复请求相同
+    // 工具调用」当场击杀。mock SSE：第 1、2 轮返回**完全相同**的 tool_calls，第 3 轮才收尾；
+    // 旧护栏会在第 2 轮抛错终止，现在必须放行到自然收尾（三轮都发出去）。——
+    #[tokio::test]
+    async fn repeated_identical_tool_call_is_not_terminated() {
+        fn init_logger() {
+            static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            ONCE.get_or_init(|| {
+                let dir = std::env::temp_dir().join("agent-test-logs");
+                let _ = crate::observability::init(&dir, "agent.jsonl", format!("ag-{}", uuid::Uuid::new_v4()));
+            });
+        }
+        init_logger();
+        use crate::config::MemoryConfig;
+        use crate::memory::Memory;
+        use std::sync::atomic::AtomicUsize;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_c = hits.clone();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_c = stop.clone();
+        let mock = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            while !stop_c.load(std::sync::atomic::Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut s, _)) => {
+                        let _ = s.set_nonblocking(false);
+                        let mut buf = [0u8; 65536];
+                        let _ = Read::read(&mut s, &mut buf);
+                        let n = hits_c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let body = if n < 2 {
+                            // 两步 name+arguments 完全一致——旧护栏的击杀条件
+                            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"config.toml\\\"}\"}}]}}]}\n\n\
+                             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+                             data: {\"choices\":[],\"usage\":{\"prompt_tokens\":800,\"completion_tokens\":10}}\n\n\
+                             data: [DONE]\n\n"
+                        } else {
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"好了\"}}]}\n\n\
+                             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                             data: [DONE]\n\n"
+                        };
+                        let r = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(), body
+                        );
+                        let _ = s.write_all(r.as_bytes());
+                        let _ = s.flush();
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(15)),
+                }
+            }
+        });
+
+        let gateway = Arc::new(Gateway::new());
+        let ch = Channel::new(
+            &format!("http://127.0.0.1:{port}/v1"),
+            "mock-model",
+            "sk-dummy",
+            ChatParams::default(),
+        );
+        let channels = LoopChannels {
+            primary: ch,
+            summary: None,
+            title: None,
+            fallbacks: Vec::new(),
+            downgrade: None,
+            vision: None,
+            budget_hit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            subagents: None,
+            prior_anchor: None,
+        };
+        let ws = std::env::temp_dir().join(format!("agent-repeat-{}-{}", std::process::id(), port));
+        std::fs::create_dir_all(&ws).unwrap();
+        let mem = Memory::open_at(
+            &ws,
+            &MemoryConfig { enabled: false, persist_sensitive: false, profile_max_chars: 2500 },
+            crate::memory::GlobalDirs {
+                install: ws.join("global"),
+                user: ws.join("user"),
+                install_legacy: ws.join("global-legacy"),
+                user_legacy: ws.join("user-legacy"),
+            },
+        );
+        struct G;
+        impl ApprovalGate for G {
+            fn needs_approval_for(&self, _tool: &str, _args_json: &str) -> bool {
+                false
+            }
+            fn sandbox_enabled(&self) -> bool {
+                true
+            }
+            fn ask(&self, _tool: &str, _args: &str) -> std::pin::Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+                Box::pin(async { true })
+            }
+        }
+        let cancel = Arc::new(CancelFlag::new());
+        let outcome = run_task(
+            &gateway,
+            &channels,
+            "sys prompt",
+            &[json!({ "role": "user", "content": "读一下配置" })],
+            &cancel,
+            &AgentConfig::default(),
+            &SandboxConfig::default(),
+            0,
+            &ContextConfig::default(),
+            &RecoveryConfig { checkpoint_enabled: false },
+            &mem,
+            None,
+            false,
+            &G,
+            crate::tools::workspace_root(),
+            |_ev: AgentEvent| {},
+        )
+        .await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        mock.join().unwrap();
+        let _ = std::fs::remove_dir_all(&ws);
+
+        assert_eq!(
+            outcome.unwrap(),
+            LoopOutcome::Done,
+            "重复相同工具调用不再终止循环（护栏已删）"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "三轮都被请求到：重复步没有触发终止"
+        );
+    }
+
+
+    /// 快照剥离截图：多模态 tool 消息落盘时只留文本（base64 不上会话文件）。
+    /// 请求上下文里是数组（模型看得见），落盘是字符串（文件不爆炸）——两套形状。
+    #[test]
+    fn snapshot_strips_tool_images() {
+        let msgs = vec![
+            json!({ "role": "system", "content": "系统" }),
+            json!({ "role": "user", "content": "操作电脑" }),
+            json!({ "role": "assistant", "content": null, "tool_calls": [
+                { "id": "t1", "type": "function", "function": { "name": "computer", "arguments": "{}" } }
+            ] }),
+            json!({ "role": "tool", "tool_call_id": "t1", "content": [
+                { "type": "text", "text": "已截图 1920×1080" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,iVBORw0KGgoAAAAN" } }
+            ] }),
+        ];
+        let snap = snapshot_msgs(&msgs);
+        assert_eq!(snap.len(), 3, "system 头被 skip，其余三条在");
+        let tool = snap.iter().find(|m| m["role"] == json!("tool")).unwrap();
+        assert_eq!(tool["content"], json!("已截图 1920×1080"), "落盘只剩文本");
+        assert!(!serde_json::to_string(&snap).unwrap().contains("iVBORw0KGgo"), "base64 绝不落盘");
+        // 纯字符串 tool 消息原样过（不受影响）
+        let plain = vec![
+            json!({ "role": "system", "content": "s" }),
+            json!({ "role": "tool", "tool_call_id": "t0", "content": "文本" }),
+        ];
+        assert_eq!(snapshot_msgs(&plain)[0]["content"], json!("文本"));
+    }
+
+    /// 2026-11-01 回归（真机实锤）：流中断后的「同渠道自动重试」必须真的再发一次。
+    /// 旧实现在渠道 for 循环里 `continue`——等于直接跳到下一个渠道，单渠道时什么都
+    /// 不重试，用户只看到一句「正在原渠道自动重试…」然后失败。
+    #[tokio::test]
+    async fn stream_break_retries_same_channel_once() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        ONCE.get_or_init(|| {
+            let dir = std::env::temp_dir().join("agent-test-logs");
+            let _ = crate::observability::init(&dir, "agent.jsonl", format!("ag-{}", uuid::Uuid::new_v4()));
+        });
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_srv = hits.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_srv = stop.clone();
+        let handle = std::thread::spawn(move || {
+            while !stop_srv.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut s, _)) => {
+                        // 监听器非阻塞，accept 出来的 socket 会继承该标志
+                        let _ = s.set_nonblocking(false);
+                        let n = hits_srv.fetch_add(1, Ordering::Relaxed) + 1;
+                        let mut buf = [0u8; 8192];
+                        let _ = s.read(&mut buf);
+                        let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+                        let _ = s.write_all(head.as_bytes());
+                        if n == 1 {
+                            // 第一次：写一个完整分片就掐连接（不写结尾 0 块）——
+                            // 等价真机上游断流，hyper 报 body 错误
+                            let line = "data: {\"choices\":[{\"delta\":{\"content\":\"半截\"},\"index\":0,\"finish_reason\":null}]}\n\n";
+                            let _ = s.write_all(format!("{:X}\r\n{line}\r\n", line.len()).as_bytes());
+                            let _ = s.flush();
+                        } else {
+                            // 第二次：完整流，重试应当成功
+                            let payload = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"index\":0,\"finish_reason\":null}]}\n\ndata: [DONE]\n\n";
+                            let _ = s.write_all(format!("{:X}\r\n{payload}\r\n", payload.len()).as_bytes());
+                            let _ = s.write_all(b"0\r\n\r\n");
+                            let _ = s.flush();
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                }
+            }
+        });
+
+        let base = format!("http://127.0.0.1:{port}/v1");
+        let gw = Arc::new(Gateway::new());
+        let ch = Channel::new(&base, "m", "sk-test", ChatParams::default());
+        let cancel = Arc::new(CancelFlag::new());
+        let events: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ev = events.clone();
+        let on_event = move |e: AgentEvent| {
+            let tag = match &e {
+                AgentEvent::StepReset { .. } => "step_reset".to_string(),
+                AgentEvent::Notice(n) => format!("notice:{n}"),
+                AgentEvent::NoticeClear(n) => format!("notice_clear:{n}"),
+                _ => String::new(),
+            };
+            ev.lock().unwrap().push(tag);
+        };
+        let ctx = vec![json!({ "role": "user", "content": "hi" })];
+        let (outcome, notices, _used) = run_chain(
+            &gw,
+            &[&ch],
+            &ctx,
+            None,
+            &cancel,
+            &CancelFlag::new(),
+            &UsageCtx::main("sess-retry"),
+            0,
+            &on_event,
+        )
+        .await;
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        match outcome {
+            Ok(ChatOutcome::Done(turn)) => assert_eq!(turn.content, "ok", "重试后应拿到完整回答"),
+            Ok(_) => panic!("重试后应返回 Done，实际是取消/打断"),
+            Err(e) => panic!("重试后应成功，实际报错: {e:#}"),
+        }
+        assert_eq!(hits.load(Ordering::Relaxed), 2, "必须真的再发一次（旧实现只有 1 次）");
+        // 2026-11-01：重试成功时那条「正在重试…」要撤回，也不许落盘（不能一直挂在对话里）
+        assert!(
+            !notices.iter().any(|n| n.contains("原渠道自动重试")),
+            "重试成功的提示不该进落盘通知: {notices:?}"
+        );
+        let v = events.lock().unwrap();
+        assert!(v.iter().any(|t| t == "step_reset"), "半截内容要先回滚: {v:?}");
+        assert!(v.iter().any(|t| t.starts_with("notice:")), "重试期间要有临时提示: {v:?}");
+        assert!(v.iter().any(|t| t.starts_with("notice_clear:")), "成功后要撤回提示: {v:?}");
+    }
+}
+
+#[cfg(test)]
+mod cancel_backfill_tests {
+    use super::*;
+
+    /// 2026-11-02 审计：取消时给所有没执行的 tool_call 补「已取消」结果，
+    /// 否则落盘的 assistant(tool_calls) 悬空，下一轮严格端点 400。
+    #[test]
+    fn cancelled_tools_get_results_for_every_call() {
+        let calls = vec![
+            ToolCall { id: "a".into(), name: "read_file".into(), arguments: String::new() },
+            ToolCall { id: "b".into(), name: "write_file".into(), arguments: String::new() },
+        ];
+        let mut msgs = vec![json!({ "role": "assistant", "content": "", "tool_calls": [] })];
+        // 第一条执行过（有结果），第二条没有
+        backfill_cancelled_tools(&mut msgs, &calls, &[true, false]);
+        assert_eq!(msgs.len(), 2, "只给没执行的补结果");
+        assert_eq!(msgs[1]["role"], "tool");
+        assert_eq!(msgs[1]["tool_call_id"], "b");
+    }
+}

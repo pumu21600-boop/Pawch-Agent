@@ -1,0 +1,1 @@
+{"apiVersion":1,"source":"built_in","title":"记忆库","description":"星云视图：光点浏览与搜索全部会话","version":"0.2.0","entry":"index.html","ui":[{"slot":"dock","id":"nebula","title":"记忆库"}],"feature":"galaxy"}

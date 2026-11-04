@@ -1,0 +1,9 @@
+{
+  "apiVersion": 1,
+  "source": "built_in",
+  "title": "中枢",
+  "description": "agent 自操作总闸：改设置/装插件/定时任务",
+  "version": "0.2.0",
+  "feature": "self_mod",
+  "permissions": []
+}

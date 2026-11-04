@@ -1,0 +1,12 @@
+[package]
+name = "pawch-setup"
+version = "0.1.0"
+edition = "2021"
+description = "Pawch Agent 安装器：选择安装目录与数据目录、解压安装、建快捷方式"
+
+[dependencies]
+# 原生目录选择/消息框（与服务的工作区选择同一套）
+rfd = "0.15"
+
+[profile.release]
+strip = true

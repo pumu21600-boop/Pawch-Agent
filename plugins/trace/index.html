@@ -1,0 +1,635 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>时间线 · 最近任务</title>
+    <style>
+:root {
+        /* 2026-10-02：iframe 独立文档，不吃主界面 scrollbar-color——深色下默认白滑杆 */
+        scrollbar-color: var(--line2, #454039) transparent;
+        /* iframe 文档画布兜底色：不声明时浏览器按浅色把画布兜成白色——
+           body 被微调成透明后整块面板会变全白（2026-11-03 真机实测） */
+        color-scheme: dark;
+        --bg: #151412;
+        --fg: #b8b3a9;
+        --strong: #f3f1ec;
+        --dim: #8a8478;
+        --hover: #1c1a18;
+        --sel: #262320;
+        --line: #262320;
+        --line2: var(--t-gray-bg);
+        --btn: var(--t-gray-fg);
+        --btn-hover: #f3f1ec;
+        --btn-line-h: #454039;
+        --input-bg: #1c1a18;
+        --arrow: #6e695f;
+        --arrow-h: var(--t-gray-fg);
+        --fico: #6e695f;
+        --sep: #454039;
+        --ok: var(--t-green-fg);
+        --err: var(--t-red-fg);
+        --t-blue-bg: var(--t-blue-bg);
+        --t-blue-fg: var(--t-blue-fg);
+        --t-green-bg: var(--t-green-bg);
+        --t-green-fg: var(--t-green-fg);
+        --t-red-bg: var(--t-red-bg);
+        --t-red-fg: var(--t-red-fg);
+        --t-yellow-bg: var(--t-yellow-bg);
+        --t-yellow-fg: var(--t-yellow-fg);
+        --t-gray-bg: var(--t-gray-bg);
+        --t-gray-fg: var(--t-gray-fg);
+      }
+            /* 跟随主界面：滑杆颜色随主题切（真机实测深色白滑杆） */
+      body.light {
+        scrollbar-color: var(--line2, #b3bac4) transparent;
+        color-scheme: light;
+        --bg: #f6f7f9;
+        --fg: #1f2328;
+        --strong: #0d1117;
+        --dim: #626b78;
+        --hover: #e9eaee;
+        --sel: #dfe2e8;
+        --line: #e2e4e8;
+        --line2: #d3d6dc;
+        --btn: #4a5260;
+        --btn-hover: #0d1117;
+        --btn-line-h: #b3bac4;
+        --input-bg: #ffffff;
+        --arrow: #8b93a1;
+        --arrow-h: #4a5260;
+        --fico: #9aa1ac;
+        --sep: #9aa1ac;
+        --ok: #1a7f37;
+        --err: #cf222e;
+        --t-blue-bg: #dde9ff;
+        --t-blue-fg: #0b62d0;
+        --t-green-bg: #dcf3e5;
+        --t-green-fg: #1a7f37;
+        --t-red-bg: #ffe1e1;
+        --t-red-fg: #cf222e;
+        --t-yellow-bg: #fff3c4;
+        --t-yellow-fg: #9a6700;
+        --t-gray-bg: #e8eaee;
+        --t-gray-fg: #4a5260;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        height: 100%;
+      }
+      body {
+        margin: 0;
+        padding: 12px 14px;
+        font: 13px/1.6 "Segoe UI", "Microsoft YaHei", sans-serif;
+        background: var(--bg);
+        color: var(--fg);
+        /* 2026-10-30 真机实测「时间线下面那片空间也要用上」：插件文档原先只有内容高，
+           iframe 比内容高出的部分全是面板底色（一片黑）。改成撑满 iframe 的 flex 列，
+           列表区吃剩余高度并自己滚。 */
+        box-sizing: border-box;
+        display: flex;
+        flex-direction: column;
+      }
+      .head {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 10px;
+      }
+      h2 {
+        margin: 0;
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--strong);
+        flex: 1;
+      }
+      button {
+        padding: 5px 12px;
+        border-radius: 7px;
+        border: 1px solid var(--line2);
+        background: transparent;
+        color: var(--btn);
+        font-size: 12px;
+        cursor: pointer;
+      }
+      button:hover {
+        color: var(--btn-hover);
+        border-color: var(--btn-line-h);
+      }
+      .empty {
+        color: var(--dim);
+        font-size: 13px;
+        text-align: center;
+        padding: 24px 0;
+      }
+      /* 列表容器 = 撑满面板剩余高度的那一块；没有任务时（.empty）顺便居中 */
+      #body {
+        flex: 1;
+        min-height: 0;
+        overflow-y: auto;
+      }
+      #body.empty {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .note {
+        font-size: 12px;
+        color: var(--t-yellow-fg);
+        background: var(--t-yellow-bg);
+        border-radius: 6px;
+        padding: 6px 10px;
+        margin-bottom: 10px;
+      }
+      .task {
+        border: 1px solid var(--line2);
+        border-radius: 8px;
+        overflow: hidden;
+        margin-bottom: 8px;
+      }
+      .task-head {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        width: 100%;
+        background: var(--hover);
+        border: none;
+        color: var(--strong);
+        padding: 8px 12px;
+        cursor: pointer;
+        font-size: 13px;
+        text-align: left;
+      }
+      .task-head:hover {
+        background: var(--sel);
+      }
+      .idx {
+        color: var(--t-blue-fg);
+        font-weight: 600;
+      }
+      .time {
+        font-variant-numeric: tabular-nums;
+      }
+      /* 起点缺失提示：小而不抢眼，但要能被看见（用户得知道这个时间不是真的） */
+      .time .stale {
+        margin-left: 6px;
+        padding: 1px 5px;
+        border-radius: 4px;
+        background: var(--warn-bg, rgba(250, 204, 21, 0.14));
+        color: var(--warn-fg, #facc15);
+        font-size: 10.5px;
+        font-weight: 600;
+      }
+      /* 范围行：面板数据口径。时间线**只显示当前对话**，
+         这里把对话标题摊开写，切会话后面板跟着换 */
+      .scope {
+        color: var(--dim);
+        font-size: 12px;
+        margin: -2px 0 8px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .meta {
+        color: var(--dim);
+        font-size: 12px;
+        flex: 1;
+      }
+      .caret {
+        transition: transform 0.15s;
+      }
+      .caret.open {
+        transform: rotate(90deg);
+      }
+      .events {
+        display: flex;
+        flex-direction: column;
+        padding: 6px 10px 10px;
+        /* 原 max-height: 52vh：面板比视口高时展开的任务事件列表只到半截，下面一片黑。
+           改成不设上限——由外层 #body 统一撑满+滚动（2026-10-30 真机实测）。 */
+      }
+      .ev {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+        padding: 3px 0;
+        border-bottom: 1px dashed var(--sel);
+        font-size: 12px;
+        color: var(--btn);
+      }
+      .ev:last-child {
+        border-bottom: none;
+      }
+      .offset {
+        color: var(--dim);
+        font-variant-numeric: tabular-nums;
+        min-width: 52px;
+        text-align: right;
+      }
+      .badge {
+        min-width: 78px;
+        text-align: center;
+        border-radius: 4px;
+        padding: 0 4px;
+        font-size: 11px;
+      }
+      .b-st {
+        background: var(--t-blue-bg);
+        color: var(--t-blue-fg);
+      }
+      .b-call {
+        background: var(--t-green-bg);
+        color: var(--ok);
+      }
+      .b-res {
+        background: var(--hover);
+        color: var(--ok);
+      }
+      .b-fail {
+        background: var(--t-red-bg);
+        color: var(--err);
+      }
+      .b-chunk {
+        background: var(--line2);
+        color: var(--btn);
+      }
+      .b-th {
+        background: var(--t-blue-bg);
+        color: var(--t-blue-fg);
+      }
+      .b-err {
+        background: var(--t-red-bg);
+        color: var(--err);
+      }
+      .sum {
+        flex: 1;
+        word-break: break-all;
+      }
+      .pair {
+        color: var(--t-yellow-fg);
+        font-variant-numeric: tabular-nums;
+      }
+      .folded {
+        margin-top: 6px;
+        font-size: 12px;
+        color: var(--dim);
+        border-top: 1px solid var(--line);
+        padding-top: 6px;
+      }
+    </style>
+  </head>
+  <body>
+    <!--
+      时间线面板（插件契约试点）：原内置 trace 弹窗顺势插件化。数据经宿主只读桥
+      trace.recent 拉取（iframe 是不透明源，fetch 不到 /api）。
+    -->
+    <div class="head">
+      <h2>时间线 · 最近任务</h2>
+      <button id="refresh" title="刷新">↻ 刷新</button>
+    </div>
+    <div id="scope" class="scope"></div>
+    <div id="body" class="empty">加载中…</div>
+
+    <script>
+      const pending = new Map();
+      let seq = 0;
+      let booted = false; // 主题切换会重发 init：换肤照做，boot 只跑一次（别把浏览状态冲掉）
+      // 展开态按 start_ts 认，不按数组下标：刷新后新任务会把索引整体挤位，按下标会把
+      // 「展开着的那个任务」悄悄换成另一个；时间戳是任务的稳定身份。
+      let expandedTs = null;
+      let last = null; // 最近一次数据（展开切换时不重拉）
+      let loadSeq = 0; // 加载序号：连续切换会话时丢掉过期的响应，别让旧对话的数据覆盖新的
+
+      function call(method, params) {
+        return new Promise((resolve, reject) => {
+          const id = ++seq;
+          pending.set(id, { resolve, reject });
+          parent.postMessage({ type: 'pawch:request', id, method, params }, '*');
+          setTimeout(() => {
+            if (pending.has(id)) {
+              pending.delete(id);
+              reject(new Error('桥调用超时'));
+            }
+          }, 10000);
+        });
+      }
+      window.addEventListener('message', (ev) => {
+        const d = ev.data || {};
+        // pawch:init = 宿主已登记本 frame（load 事件后），此刻起桥调用才会被受理——
+        // 初始拉数据必须挂在这里，脚本一跑就调用会因未登记被宿主丢弃（真机踩过）。
+        if (d.type === 'pawch:init') {
+          // 主题跟随宿主（init 里带已解析的 theme；宿主切主题会重发 init）
+          document.body.classList.toggle('light', ((d.payload || {}).theme) === 'light');
+          if (!booted) { booted = true; load(); }
+          return;
+        }
+        // 宿主广播「当前会话变了」（切会话/新对话/切工作区/一轮跑完）：时间线只显示
+        // 当前对话，换个对话就得重拉，否则还停在旧对话的数据上
+        if (d.type === 'pawch:event' && d.event === 'session') {
+          if (booted) load();
+          return;
+        }
+        if (d.type === 'pawch:response' && pending.has(d.id)) {
+          const { resolve, reject } = pending.get(d.id);
+          pending.delete(d.id);
+          d.ok ? resolve(d.result) : reject(new Error(String(d.result || '桥调用失败')));
+        }
+      });
+      parent.postMessage({ type: 'pawch:hello' }, '*');
+
+      // —— 内部 plumbing 事件：会话存储 / 网关握手 / 沙箱 spawn / 检查点跳过这类对
+      // 「任务发生了什么」没有信息量（一次「你好」就能刷出 14 条），折叠成一行计数——
+      // 但数量照实报，不许静默吞。未列入的 state kind 一律仍然展示。
+      const PLUMBING_KINDS = new Set([
+        'storage.write',
+        'session.saved',
+        'gateway.request',
+        'gateway.response',
+        'gateway.stream_end',
+        'gateway.max_tokens_inflated',
+        'sandbox.spawn',
+        'sandbox.exit',
+        'sandbox.tier.resolved',
+        'tools.parallel',
+        'checkpoint.skipped',
+      ]);
+      function isPlumbing(ev) {
+        return ev.etype === 'state' && PLUMBING_KINDS.has((ev.payload || {}).kind);
+      }
+
+      // 事件摘要（一行）：按类型提取可读文本
+      function summary(ev) {
+        const p = ev.payload || {};
+        switch (ev.etype) {
+          case 'state': return p.kind || JSON.stringify(p).slice(0, 90);
+          case 'tool_call': return `${p.name}  ${String(p.arguments || '').slice(0, 90)}`;
+          case 'tool_result': return `${p.ok ? '[成功] ' : '[失败] '}${String(p.preview || '').slice(0, 90)}`;
+          case 'model_chunk': return p.aggregated ? `${p.count} 个模型流式分片（聚合展示）` : '模型分片';
+          case 'thought': return String(p.text || '').slice(0, 90);
+          case 'error': return String(p.message || p.error || JSON.stringify(p)).slice(0, 90);
+          default: return JSON.stringify(p).slice(0, 90);
+        }
+      }
+      // tool_call → tool_result 配对耗时（毫秒）。
+      // **先按 id 配**：并行工具调用（tools.parallel）一次发出多个调用，各带不同 id，
+      // 旧实现「遇下一个 tool_call 就放弃」会把第一个调用的耗时整个丢掉（真机日志实锤：
+      // read_skill 与 shell 并行发出，read_skill 的耗时配不上）。id 缺失的老日志回落按
+      // name 排 FIFO。返回 Map：tool_call 的事件下标 → 耗时。
+      function pairDurations(events) {
+        const out = new Map();
+        const byId = new Map(); // call id → { i, offset }
+        const byName = new Map(); // name → [{ i, offset }]（FIFO）
+        events.forEach((ev, i) => {
+          const p = ev.payload || {};
+          if (ev.etype === 'tool_call') {
+            if (p.id) byId.set(p.id, { i, offset: ev.offset_ms });
+            const q = byName.get(p.name) || [];
+            q.push({ i, offset: ev.offset_ms });
+            byName.set(p.name, q);
+          } else if (ev.etype === 'tool_result') {
+            let hit = null;
+            if (p.id && byId.has(p.id)) {
+              hit = byId.get(p.id);
+              byId.delete(p.id);
+              // 同名 FIFO 队列里同步剔掉这条，避免回落匹配时串到别的调用
+              byName.set(p.name, (byName.get(p.name) || []).filter((c) => c.i !== hit.i));
+            } else {
+              const q = byName.get(p.name) || [];
+              hit = q.length ? q.shift() : null;
+            }
+            if (hit) out.set(hit.i, ev.offset_ms - hit.offset);
+          }
+        });
+        return out;
+      }
+      function badge(ev) {
+        return { state: 'st', tool_call: 'call', tool_result: (ev.payload?.ok === false ? 'fail' : 'res'), model_chunk: 'chunk', thought: 'th', error: 'err' }[ev.etype] || 'st';
+      }
+      function fmtClock(ts) {
+        const d = new Date(ts);
+        if (isNaN(d)) return ts;
+        const hm = d.toLocaleTimeString('zh-CN', { hour12: false });
+        // 跨天任务只显示时分秒会和今天的任务混在一起（最近任务常跨天），补日期
+        return d.toDateString() === new Date().toDateString() ? hm : `${d.getMonth() + 1}-${d.getDate()} ${hm}`;
+      }
+      function fmtDur(ms) {
+        return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
+      }
+      function esc(s) {
+        return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+      }
+      // payload 原样进 title 属性会整个进 DOM：gateway.request 一条 payload 就 10KB+
+      // （整段请求体，长会话里更大），全量展开一个任务往页面里灌几十 KB。截断到 1KB，
+      // 尾部标省略——展开只为快速看一眼，完整数据在 logs/agent.jsonl。
+      function tip(ev) {
+        const s = JSON.stringify(ev.payload);
+        return s.length > 1000 ? s.slice(0, 1000) + ' …（已截断，完整见 logs/agent.jsonl）' : s;
+      }
+
+      function render(data) {
+        const body = document.getElementById('body');
+        const scope = document.getElementById('scope');
+        const tasks = data.tasks || [];
+        const note = data.note || '';
+        // 范围行：时间线只显示当前对话（宿主按当前会话过滤），把对话标题摊开写。
+        // 标题取不到（新对话还没落盘）就只写「当前对话」。
+        if (tasks.length) {
+          const t0 = tasks[0].session_title ? ` · ${tasks[0].session_title}` : '';
+          scope.textContent = `当前对话${t0}`;
+        } else {
+          scope.textContent = '';
+        }
+        if (!tasks.length) {
+          body.className = 'empty';
+          body.textContent = note || '当前对话还没有任务记录（跑一次对话后这里会出现事件流）';
+          return;
+        }
+        let html = note ? `<div class="note">${esc(note)}</div>` : '';
+        tasks.forEach((task, ti) => {
+          // 后端倒序返回（最新在前）：最新任务 = #1
+          const open = expandedTs === task.start_ts;
+          const vis = task.events.map((ev, ei) => ({ ev, ei })).filter((x) => !isPlumbing(x.ev));
+          const hidden = task.events.length - vis.length;
+          const pairs = open ? pairDurations(task.events) : null;
+          html += `<div class="task"><button class="task-head" data-ts="${esc(task.start_ts)}">
+            <span class="idx">#${ti + 1}</span>
+            <span class="time">${esc(fmtClock(task.start_ts))}${task.lost_start ? '<span class="stale" title="任务起点事件被日志轮转冲掉了：这个时间是兜底边界的时刻，不是任务真正的开始">起点缺失</span>' : ''}</span>
+            <span class="meta">${esc(fmtDur(task.duration_ms))} · ${vis.length} 事件${hidden ? ` · 折叠 ${hidden}` : ''}</span>
+            <svg class="caret${open ? ' open' : ''}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><path d="m9 6 6 6-6 6"/></svg>
+          </button>`;
+          if (open) {
+            html += '<div class="events">';
+            vis.forEach(({ ev, ei }) => {
+              const ms = pairs.get(ei);
+              html += `<div class="ev">
+                <span class="offset">${(ev.offset_ms / 1000).toFixed(1)}s</span>
+                <span class="badge b-${badge(ev)}">${esc(ev.etype)}</span>
+                <span class="sum" title="${esc(tip(ev))}">${esc(summary(ev))}</span>
+                ${ms !== undefined ? `<span class="pair">${esc(fmtDur(ms))}</span>` : ''}
+              </div>`;
+            });
+            if (hidden) {
+              html += `<div class="folded">另有 ${hidden} 条内部事件已折叠（会话存储 / 网关握手 / 沙箱 spawn / 检查点跳过等，logs/agent.jsonl 里有全量）</div>`;
+            }
+            html += '</div>';
+          }
+          html += '</div>';
+        });
+        body.className = '';
+        body.innerHTML = html;
+        body.querySelectorAll('.task-head').forEach((el) => {
+          el.onclick = () => {
+            const ts = el.dataset.ts;
+            expandedTs = expandedTs === ts ? null : ts;
+            render(last);
+          };
+        });
+      }
+
+      async function load() {
+        const body = document.getElementById('body');
+        body.className = 'empty';
+        body.textContent = '加载中…';
+        const my = ++loadSeq;
+        try {
+          last = await call('trace.recent', { limit: 10 });
+          if (my !== loadSeq) return; // 期间又触发过一次加载（切会话）：这份响应过期了
+          render(last);
+        } catch (e) {
+          if (my !== loadSeq) return;
+          body.className = 'empty';
+          body.textContent = `读取失败: ${e.message || e}`;
+        }
+      }
+      document.getElementById('refresh').onclick = load;
+    </script>
+  <script>
+/* 微调桥（2026-11-03 协议扩展）：宿主微调模式下本面板支持右击选元素、接收下发 CSS。
+   宿主→插件 {type:'pawch:micro', op:'enter'(listen)/'exit'/'apply'(css)}；
+   插件→宿主 {type:'pawch:micro-ack'} 与 {type:'pawch:micro-pick', pick:{sel,label,styles,x,y}}。
+   旧宿主不认识这些消息也不受影响；本段独立成块，不影响插件自身脚本。 */
+(function () {
+  var listening = false;
+  function ensureStyle(id) {
+    var el = document.getElementById(id);
+    if (!el) {
+      el = document.createElement('style');
+      el.id = id;
+      (document.head || document.documentElement).appendChild(el);
+    }
+    return el;
+  }
+  function onContext(e) {
+    if (!listening) return;
+    e.preventDefault();
+    e.stopPropagation();
+    var t = e.target;
+    if (t && t.nodeType !== 1 && t.parentElement) t = t.parentElement;
+    if (!t || !t.closest) return;
+    var btn = t.closest('button');
+    if (btn && t.closest('svg')) t = btn;
+    var SKIP = /^(active|on|sel|open|hover|running|ok|fail|err|hidden|light|dark|empty|more|dim|warn|danger|primary|ghost|flat|row)$/;
+    function esc(s) { return window.CSS && CSS.escape ? CSS.escape(s) : s; }
+    function classesOf(el) {
+      return (typeof el.className === 'string' ? el.className : (el.getAttribute && el.getAttribute('class')) || '')
+        .split(/\s+/).filter(function (c) { return c && !SKIP.test(c) && !/^s-[A-Za-z0-9_-]+$/.test(c) && !/^svelte-[A-Za-z0-9_-]+$/.test(c); });
+    }
+    // 选择器必须命中「被点的这个元素」：自身 id > 自身类名 > 最近有 id/类名的祖先 + 到目标的子路径。
+    // 旧实现拿最近的「有类名的祖先」当选择器（点 #filter 得到 .toolbar），规则永远改不到目标。
+    function selectorFor(el) {
+      if (el.id) return '#' + esc(el.id);
+      var own = classesOf(el);
+      if (own.length) return '.' + own.map(esc).join('.');
+      var tail = [], cur = el;
+      while (cur && cur !== document.body) {
+        var parent = cur.parentElement;
+        if (!parent) break;
+        var sibs = Array.prototype.filter.call(parent.children, function (x) { return x.tagName === cur.tagName; });
+        var seg = cur.tagName.toLowerCase();
+        if (sibs.length > 1) seg += ':nth-of-type(' + (sibs.indexOf(cur) + 1) + ')';
+        tail.unshift(seg);
+        if (parent.id) return '#' + esc(parent.id) + ' > ' + tail.join(' > ');
+        var pcls = classesOf(parent);
+        if (pcls.length) return '.' + pcls.map(esc).join('.') + ' > ' + tail.join(' > ');
+        cur = parent;
+      }
+      return tail.join(' > ') || el.tagName.toLowerCase();
+    }
+    var sel = selectorFor(t);
+    var labelCls = classesOf(t);
+    var label = labelCls.filter(function (c) { return c.indexOf('-') >= 0; })[0] || labelCls[0] || (t.id ? '#' + t.id : t.tagName.toLowerCase());
+    var cs = getComputedStyle(t);
+    function alphaOf(c) {
+      var m = String(c || '').match(/rgba?\(([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:[,\s/]+([\d.]+))?\)/);
+      if (!m) return /^transparent$/i.test(String(c || '').trim()) ? 0 : 1;
+      return m[4] === undefined ? 1 : parseFloat(m[4]);
+    }
+    function stylesOf(el) {
+      var s = getComputedStyle(el);
+      var b = String(s.backdropFilter || '').match(/blur\(([\d.]+)px\)/);
+      return {
+        color: s.color, bg: s.backgroundColor,
+        radius: parseFloat(s.borderTopLeftRadius) || 0,
+        border: parseFloat(s.borderTopWidth) || 0,
+        borderColor: s.borderTopColor,
+        blur: b ? parseFloat(b[1]) : 0,
+        fontSize: parseFloat(s.fontSize) || 14
+      };
+    }
+    // 背景替身：本身透明时找真正画底色的祖先（深色面板的底常是 body/根容器画的），
+    // 一并上报让宿主面板给「改上级」入口——否则改内层元素背景等于改一块透明玻璃
+    var bgHost = null;
+    if (alphaOf(cs.backgroundColor) <= 0.05) {
+      var host = t.parentElement;
+      while (host) {
+        var hs = getComputedStyle(host);
+        if (alphaOf(hs.backgroundColor) > 0.05) {
+          var hcls = classesOf(host);
+          bgHost = {
+            sel: selectorFor(host),
+            label: hcls.filter(function (c) { return c.indexOf('-') >= 0; })[0] || hcls[0] || (host.id ? '#' + host.id : host.tagName.toLowerCase()),
+            styles: stylesOf(host)
+          };
+          break;
+        }
+        host = host.parentElement;
+      }
+    }
+    parent.postMessage({ type: 'pawch:micro-pick', pick: {
+      sel: sel, label: label || sel,
+      styles: stylesOf(t),
+      bgHost: bgHost,
+      root: { sel: 'body', label: '面板底色（body）', styles: stylesOf(document.body) },
+      x: e.clientX, y: e.clientY
+    } }, '*');
+  }
+  window.addEventListener('message', function (ev) {
+    var d = ev.data || {};
+    if (d.type !== 'pawch:micro' && d.type !== 'agent:micro') return;
+    if (d.op === 'enter') {
+      listening = !!d.listen;
+      document.removeEventListener('contextmenu', onContext, true);
+      if (listening) {
+        document.addEventListener('contextmenu', onContext, true);
+        ensureStyle('pawch-micro-hover').textContent = '*:hover { outline: 1px dashed rgba(186,138,120,.55); outline-offset: -1px; }';
+      } else {
+        var hs = document.getElementById('pawch-micro-hover');
+        if (hs) hs.remove();
+      }
+      parent.postMessage({ type: 'pawch:micro-ack' }, '*');
+    } else if (d.op === 'exit') {
+      listening = false;
+      document.removeEventListener('contextmenu', onContext, true);
+      var h2 = document.getElementById('pawch-micro-hover');
+      if (h2) h2.remove();
+    } else if (d.op === 'apply') {
+      ensureStyle('pawch-micro').textContent = String(d.css || '');
+    }
+  });
+})();
+</script>
+</body>
+</html>

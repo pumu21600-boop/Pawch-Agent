@@ -1,0 +1,473 @@
+/* 设计系统基元（P19 App.svelte 拆分）：主题变量 + 全局共享的最小控件集。
+   只放「跨组件共用且无场景特化」的规则；场景覆盖留在各组件作用域样式里。 */
+
+:root,
+[data-theme='dark'] {
+  color-scheme: dark;
+  scrollbar-color: var(--g4) transparent;
+  /* P10.5 主题系统：变量由聚类脚本生成；dark=原视觉，light=翻转 */
+  /* P13 主题系统：中性色阶。2026-10-31 UI 改版（「柔和 AI 风+浅暖橙」）：
+     灰阶换暖黑，层级仍靠明度微差区分 */
+  --g0: #151412;
+  --g1: #1c1a18;
+  --g2: #262320;
+  --g3: #332f2a;
+  --g4: #454039;
+  --g5: #8a8478;
+  --g6: #b8b3a9;
+  --g7: #f3f1ec;
+  --overlay: rgba(0, 0, 0, 0.55);
+  --veil: rgba(255, 255, 255, 0.07);
+  --tint-blue-bg: #1f2c44;
+  --tint-blue-fg: #cdd2dd;
+  --tint-cyan-bg: #12303a;
+  --tint-cyan-fg: #22d3ee;
+  --tint-green-bg: #1d3a28;
+  --tint-green-fg: #8fe3ae;
+  --tint-red-bg: #541d1d;
+  --tint-red-fg: #ff9b9b;
+  --tint-yellow-bg: #241f14;
+  --tint-yellow-fg: #facc15;
+  /* 2026-10-08 补：orange/purple/pink/gray 四组原先只在 light 定义，深色（默认态）
+     下 var() 无值 → 声明 invalid at computed-value time：color 退化继承值、
+     background 退化 transparent、border-color 退化 currentColor——所有「警告」橙色态
+     （cron 提示等）在深色下掉成灰色透明底，切到浅色才正常。 */
+  --tint-orange-bg: #3d2a12;
+  --tint-orange-fg: #f0a35e;
+  --tint-purple-bg: #2c2244;
+  --tint-purple-fg: #c4a7f0;
+  --tint-pink-bg: #3d1c2c;
+  --tint-pink-fg: #f0a0c0;
+  --tint-gray-bg: #2a2723;
+  --tint-gray-fg: #b8b3a9;
+  /* 成熟化品牌强调色。2026-10-31 改版：浅暖橙（用户从效果图定的色）。
+     --brand=填充面（按钮渐变亮端/激活底/呼吸点），--brand-text=文字场景（深底上更清晰），
+     --brand-deep=渐变按钮暗端，--brand-ink=品牌底上的文字 */
+  --brand: #ba8a78;
+  --brand-hover: #c49c8d;
+  /* 深端只比亮端深半档（用户 2026-10-31 复验：按钮橙「不要那么艳」——之前深端太重把整颗按钮拖深） */
+  --brand-deep: #b3836b;
+  --brand-text: #c49c8d;
+  --brand-ink: #3a1c0e;
+}
+
+[data-theme='light'] {
+  color-scheme: light;
+  scrollbar-color: var(--g4) transparent;
+  /* 2026-10-31 改版：中性色轻暖化，与深色暖黑同一气质 */
+  --g0: #f7f5f2;
+  --g1: #fffefc;
+  /* g2 在深色里是「凸起面/次级描边」，浅色必须给淡灰而不是纯白，否则气泡描边、
+     header 底边、模型 chip、按钮底色会全部隐形 */
+  --g2: #f3f0eb;
+  --g3: #e7e2da;
+  --g4: #d9d3c9;
+  --g5: #87827a;
+  --g6: #56524b;
+  --g7: #1f1d1a;
+  --overlay: rgba(15, 23, 42, 0.32);
+  --veil: rgba(13, 18, 28, 0.05);
+  --tint-red-bg: #fdeaea;
+  --tint-red-fg: #b3261e;
+  --tint-yellow-bg: #f7f1dd;
+  --tint-yellow-fg: #8a6d1a;
+  --tint-green-bg: #e2f4e8;
+  --tint-green-fg: #1e7a3f;
+  --tint-cyan-bg: #e0f4f7;
+  --tint-cyan-fg: #0e7490;
+  --tint-blue-bg: #e7edfb;
+  --tint-blue-fg: #2f5fd0;
+  --tint-purple-bg: #efe8fb;
+  --tint-purple-fg: #6d3fc0;
+  --tint-orange-bg: #fbf0e1;
+  --tint-orange-fg: #a05a1a;
+  --tint-pink-bg: #fbe9f1;
+  --tint-pink-fg: #b0326c;
+  --tint-gray-bg: #f0ede8;
+  --tint-gray-fg: #56524b;
+  /* 成熟化品牌强调色：浅色下文字场景用深一档保对比，按钮字用深棕（浅橙上白字对比不足） */
+  --brand: #ba8a78;
+  --brand-hover: #c49c8d;
+  --brand-deep: #bd947f;
+  --brand-text: #a46851;
+  --brand-ink: #47220e;
+}
+
+/* 画布兜底（2026-11-04 浅色走查实锤）：壁纸模式下 body 会被置透明，html 没有底色时
+   浏览器画布直接透出来——深色画布配浅色主题=聊天区整块黑。html 永远垫主题底色。 */
+html {
+  background: var(--g1);
+}
+
+body {
+  margin: 0;
+  background: var(--g1);
+  color: var(--g7);
+  font-family: -apple-system, 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', sans-serif;
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+/* 2026-10-31 UI 改版：聊天区背后的品牌色极淡光晕（两层径向渐变，静态不动）。
+   侧栏/顶栏/右面板是实色面会自然盖住它，只在透明的聊天流上下缘透出；
+   壁纸模式下让位给壁纸；浅色主题减淡。 */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(680px 440px at 50% -12%, color-mix(in srgb, var(--brand) 9%, transparent), transparent 62%),
+    radial-gradient(760px 520px at 50% 112%, color-mix(in srgb, var(--brand) 6%, transparent), transparent 64%);
+}
+body.has-wallpaper::before {
+  content: none;
+}
+[data-theme='light'] body::before {
+  opacity: 0.55;
+}
+
+#app {
+  height: 100vh;
+}
+
+/* —— 基元：按钮 —— */
+.btn {
+  padding: 9px 17px;
+  border-radius: 8px;
+  border: 1px solid var(--g3);
+  background: var(--g2);
+  color: var(--g7);
+  font-size: 13px;
+  font-weight: 550;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, filter 0.15s ease;
+}
+.btn:hover {
+  background: var(--g3);
+}
+.btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+/* 主按钮：哑光浅陶土底（2026-11-04 减淡：去高亮渐变对比与光晕感，按钮不再抢视线） */
+.btn.primary {
+  background: linear-gradient(180deg,
+    color-mix(in srgb, var(--brand) 72%, #fff),
+    color-mix(in srgb, var(--brand-deep) 64%, #fff));
+  border-color: transparent;
+  color: var(--brand-ink);
+  font-weight: 620;
+}
+.btn.primary:hover {
+  filter: brightness(1.04);
+}
+.btn.danger {
+  background: var(--g2);
+  border-color: var(--g4);
+  color: var(--g7);
+}
+.btn.danger:hover {
+  background: var(--g3);
+  border-color: var(--g5);
+}
+.btn.ghost {
+  background: transparent;
+}
+/* 选中态（分段开关：用量报表的分组/范围选择等） */
+.btn.active {
+  background: var(--g3);
+  border-color: var(--g5);
+  color: var(--g7);
+  font-weight: 650;
+}
+
+/* —— 基元：弹窗骨架 —— */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: var(--overlay);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 20;
+}
+.modal {
+  background: var(--g2);
+  border: 1px solid var(--g3);
+  border-radius: 10px;
+  width: 560px;
+  max-height: 85vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  padding: 16px;
+  gap: 12px;
+}
+.modal-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
+.modal-head .hint {
+  flex: 1;
+  text-align: right;
+  font-size: 12px;
+  color: var(--g5);
+}
+.modal-actions {
+  display: flex;
+  gap: 6px;
+}
+/* 弹窗型插件（manifest popup:true）：居中小窗口，高度跟着插件页上报的内容走
+   （agent:resize 协议）——下边缘贴内容，不在确定按钮下方留空白 */
+.ext-popup {
+  box-sizing: border-box;
+  background: var(--g2);
+  border: 1px solid var(--g3);
+  border-radius: 10px;
+  width: min(560px, calc(100vw - 48px));
+  height: auto;
+  max-height: calc(100vh - 48px);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  padding: 12px 12px 8px;
+  gap: 10px;
+  box-shadow: 0 12px 48px rgb(0 0 0 / 45%);
+}
+/* 注意 flex:none——flex:1 的 basis 是 0，auto 高度容器会把 iframe 塌到 min-height，
+   行内高度（插件页上报的内容高度）就不起作用了，内容会被裁。
+   min-height 也不能留大的：它压过行内 height，小内容插件会被撑高。 */
+.ext-popup-frame {
+  flex: none;
+  width: 100%;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+}
+
+/* —— 基元：表单字段 —— */
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+.field label {
+  font-size: 12px;
+  color: var(--g6);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.field input,
+.field select {
+  padding: 8px 11px;
+  border-radius: 9px;
+  border: 1px solid var(--g3);
+  background: var(--g1);
+  color: var(--g7);
+  font-size: 13px;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.field input:hover,
+.field select:hover {
+  border-color: var(--g4);
+}
+.field input:focus,
+.field select:focus {
+  outline: none;
+  border-color: color-mix(in srgb, var(--brand) 45%, var(--g3));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand) 12%, transparent);
+}
+/* 原生下拉的弹出层由浏览器绘制：根元素的 color-scheme 不一定传导到弹出层，
+   必须在 select 元素自身声明，并给 option 显式配色，否则深色主题下是白底浅字 */
+[data-theme='dark'] select {
+  color-scheme: dark;
+}
+[data-theme='light'] select {
+  color-scheme: light;
+}
+/* 时间/日期输入的原生弹层（时钟/日历选择器）同理：不在元素自身声明就会白底浅字 */
+[data-theme='dark'] input[type='time'],
+[data-theme='dark'] input[type='date'] {
+  color-scheme: dark;
+}
+[data-theme='light'] input[type='time'],
+[data-theme='light'] input[type='date'] {
+  color-scheme: light;
+}
+select {
+  accent-color: var(--g5);
+}
+select option {
+  background: var(--g1);
+  color: var(--g7);
+}
+select option:checked {
+  background: var(--g2);
+  color: var(--g7);
+}
+.sub-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+/* —— 基元：文案与占位 —— */
+.param-hint {
+  margin-top: 2px;
+  color: var(--g5);
+  font-size: 11.5px;
+  line-height: 1.65;
+}
+.empty {
+  color: var(--g5);
+  padding: 12px;
+  text-align: center;
+}
+.flex-sp {
+  flex: 1;
+}
+
+/* —— 插件页紧凑行 + 开关：从 App.svelte 作用域下沉为全局，
+   技能页 / MCP 页（与插件页同形式）跨组件共用 —— */
+.group-label {
+  margin: 16px 2px 8px;
+  font-size: 12px;
+  color: var(--g5);
+}
+.plug-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border: 1px solid var(--g3);
+  border-radius: 10px;
+  margin-bottom: 6px;
+  background: var(--g2);
+}
+.plug-ico {
+  flex: none;
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  background: var(--veil);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 15px;
+  color: var(--g6);
+}
+.plug-ico svg {
+  width: 18px;
+  height: 18px;
+}
+.plug-meta {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.plug-title {
+  font-weight: 650;
+  font-size: 13.5px;
+}
+.plug-desc {
+  font-size: 12px;
+  color: var(--g5);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.plug-chip {
+  flex: none;
+  font-size: 11px;
+  line-height: 1;
+  padding: 4px 9px;
+  border-radius: 999px;
+  border: 1px dashed var(--g4);
+  color: var(--g5);
+  white-space: nowrap;
+}
+.plug-chip.warn {
+  color: var(--tint-orange-fg);
+  border-color: currentColor;
+  border-style: solid;
+}
+.plug-chip.ok {
+  color: var(--tint-green-fg);
+  border-color: currentColor;
+  border-style: solid;
+}
+.plug-sub {
+  font-size: 12px;
+  color: var(--tint-orange-fg);
+  margin: -2px 4px 8px 46px;
+  word-break: break-all;
+}
+.plug-sub.block {
+  color: var(--tint-red-fg);
+  font-weight: 600;
+}
+.plug-row .btn {
+  flex: none;
+  padding: 4px 10px;
+  font-size: 12px;
+}
+.switch {
+  flex: none;
+  position: relative;
+  width: 36px;
+  height: 20px;
+  border-radius: 999px;
+  border: none;
+  background: var(--g4);
+  cursor: pointer;
+  padding: 0;
+  transition: background 0.15s;
+}
+.switch .knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  transition: left 0.15s;
+}
+.switch.on {
+  background: var(--brand);
+}
+.switch.on .knob {
+  left: 18px;
+}
+
+/* —— 代码块语法高亮 token（md.js highlightCode 生成；2026-10-31 UI 改版）—— */
+.tk-kw { color: #c792ea; }
+.tk-fn { color: #82aaff; }
+.tk-str { color: inherit; }        /* 字符串不上绿色，跟正文同色 */
+.tk-num { color: #f78c6c; }
+.tk-cm { color: #7a756c; font-style: italic; }
+.tk-type { color: #ffcb6b; }
+[data-theme='light'] .tk-kw { color: #9333ea; }
+[data-theme='light'] .tk-fn { color: #1d4ed8; }
+[data-theme='light'] .tk-str { color: inherit; }
+[data-theme='light'] .tk-num { color: #c2410c; }
+[data-theme='light'] .tk-cm { color: #8a8478; }
+[data-theme='light'] .tk-type { color: #b45309; }
+
+/* 工具详情块专用 token（2026-10-31 用户复验：只有一色不够，键值/标点/路径/报错要分色） */
+.tk-key { color: #82aaff; }        /* JSON 键名、key= 形式的 key */
+.tk-punc { color: #6e695f; }       /* 括号/逗号/冒号，压暗让结构退后 */
+.tk-path { color: #89ddff; }       /* 路径与文件名 */
+.tk-val { color: inherit; }        /* key=value 的 value：同样不上绿，跟正文同色 */
+.tk-warn { color: #ffcb6b; }       /* ?? 未跟踪、warning */
+.tk-err-hl { color: #ff9b9b; }     /* fatal:/error: 整行 */
+[data-theme='light'] .tk-key { color: #1d4ed8; }
+[data-theme='light'] .tk-punc { color: #9a958c; }
+[data-theme='light'] .tk-path { color: #0e7490; }
+[data-theme='light'] .tk-val { color: inherit; }
+[data-theme='light'] .tk-warn { color: #b45309; }
+[data-theme='light'] .tk-err-hl { color: #b3261e; }

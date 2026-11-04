@@ -1,0 +1,434 @@
+//! JSONL 日志地基 —— 施工单 001 / 任务 A
+//!
+//! 约定：后续所有代码统一走本模块落日志，业务数据禁止直接 println。
+//! 每条记录固定 4 个字段：ts / session_id / event_type / payload。
+//! 写盘方式：追加写、单行一条 JSON + '\n'、写完立即 flush（落盘即完整，不许半行）。
+//! 轮转（2026-09-14 补，多份归档）：单文件超过上限就归档成 `<file>.1`（最新），
+//! 旧归档依次倒位为 `.2`…`.N`、超出 N 份的最旧归档丢弃——启动时检查一次，
+//! 运行中每 500 条复查一次；上限与保留份数走 config.toml [logging].max_mb / keep_archives。
+//! schema 见 docs/jsonl-schema.md。
+
+use std::{
+    fs::{self, File, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+    },
+};
+
+use chrono::{SecondsFormat, Utc};
+use serde_json::{json, Value};
+
+/// 运行中体积复查间隔（条）：写满这么多条检查一次，避免每条都 stat。
+const ROTATE_CHECK_EVERY: u64 = 500;
+
+/// 事件类型 6 类（schema 见 docs/jsonl-schema.md）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventType {
+    /// 模型思考 / 推理内容（核心循环接入后使用，本单预留）
+    Thought,
+    /// 工具调用（本单未实现，预留）
+    ToolCall,
+    /// 工具结果（本单未实现，预留）
+    ToolResult,
+    /// 模型流式分片
+    ModelChunk,
+    /// 状态快照（启动、网关请求/响应、取消等）
+    State,
+    /// 错误
+    Error,
+}
+
+impl EventType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EventType::Thought => "thought",
+            EventType::ToolCall => "tool_call",
+            EventType::ToolResult => "tool_result",
+            EventType::ModelChunk => "model_chunk",
+            EventType::State => "state",
+            EventType::Error => "error",
+        }
+    }
+}
+
+pub struct Logger {
+    file: Mutex<File>,
+    session_id: String,
+    /// 当前日志文件完整路径（trace 查询接口用）
+    path: PathBuf,
+    /// 轮转上限（字节），0 = 不轮转
+    max_bytes: u64,
+    /// 归档保留份数（`<file>.1` 最新 … `<file>.N` 最旧；0 = 归档即删）
+    keep: usize,
+    /// 已写入条数（周期性体积复查用）
+    writes: AtomicU64,
+}
+
+impl Logger {
+    /// 打开（追加）JSONL 文件，目录不存在则创建；max_bytes > 0 时按上限轮转。
+    pub fn open(
+        dir: &Path,
+        file_name: &str,
+        session_id: String,
+        max_bytes: u64,
+        keep: usize,
+    ) -> anyhow::Result<Arc<Self>> {
+        fs::create_dir_all(dir)?;
+        let path = dir.join(file_name);
+        // 启动即查：超限先把旧文件倒位归档，本次从新文件开始写
+        let rotated_from = if max_bytes > 0 {
+            rotate_file(&path, max_bytes, keep).ok().flatten()
+        } else {
+            None
+        };
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let logger = Arc::new(Self {
+            file: Mutex::new(file),
+            session_id,
+            path,
+            max_bytes,
+            keep,
+            writes: AtomicU64::new(0),
+        });
+        if let Some(bytes) = rotated_from {
+            logger.log(
+                EventType::State,
+                json!({ "kind": "log.rotated", "bytes": bytes, "limit_bytes": max_bytes, "keep": keep }),
+            );
+        }
+        Ok(logger)
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// 当前 JSONL 文件路径（未初始化时 None）。
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// 写一条日志：单行 JSON + 换行，写完立即 flush（落盘即完整）。
+    pub fn log(&self, event_type: EventType, payload: Value) {
+        let record = json!({
+            "ts": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            "session_id": self.session_id,
+            "event_type": event_type.as_str(),
+            "payload": payload,
+        });
+        let mut line = match serde_json::to_string(&record) {
+            Ok(s) => s,
+            Err(e) => {
+                console_err(&format!("[logger] 序列化失败: {e}"));
+                return;
+            }
+        };
+        line.push('\n');
+        let mut rotated: Option<u64> = None;
+        match self.file.lock() {
+            Ok(mut f) => {
+                // 2026-10-08 修：write_all/flush 的错误原来被 `let _ =` 吞掉——磁盘满/
+                // 文件被独占打开/AV 锁文件时事件静默丢失，时间线面板空无一物且连「写
+                // 失败」本身都无从诊断。改为失败即向 stderr 报警（只喊一次：事件高频，
+                // 逐条刷屏会把控制台冲爆）。
+                if let Err(e) = f.write_all(line.as_bytes()).and_then(|_| f.flush()) {
+                    warn_write_failed("日志", &e);
+                }
+                let n = self.writes.fetch_add(1, Ordering::Relaxed) + 1;
+                if self.max_bytes > 0 && n.is_multiple_of(ROTATE_CHECK_EVERY) {
+                    // 持锁检查 + 轮转，避免并发写者踩到换文件
+                    if let Ok(meta) = fs::metadata(&self.path)
+                        && meta.len() > self.max_bytes
+                        && archive_current(&self.path, self.keep).is_ok()
+                        && let Ok(nf) =
+                            OpenOptions::new().create(true).append(true).open(&self.path)
+                    {
+                        *f = nf;
+                        rotated = Some(meta.len());
+                    }
+                }
+            }
+            Err(_) => console_err("[logger] 日志文件锁中毒，本条未写入"),
+        }
+        if let Some(bytes) = rotated {
+            // 锁已释放，补一条轮转事件（新文件体积极小，不会再次触发）
+            self.log(
+                EventType::State,
+                json!({ "kind": "log.rotated", "bytes": bytes, "limit_bytes": self.max_bytes, "keep": self.keep }),
+            );
+        }
+    }
+
+    /// 控制台调试输出（带时间戳）；业务日志统一走 log()。
+    pub fn debug(&self, msg: &str) {
+        console(&format!(
+            "[{}] {}",
+            Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            msg
+        ));
+    }
+}
+
+/// 控制台输出一律走这里：stdout 是死管道（父进程先退出/控制台被关）时
+/// **只丢这一行，绝不 panic**。2026-11-03 真机实测：服务从 shell 管道启动、
+/// 管道端先退出后，println! 打调试日志触发 "failed printing to stdout: 管道正在
+/// 被关闭 (os error 232)" panic——整轮对话被打成 chat.turn_panicked，内容全丢。
+/// 调试输出永远不该有能力杀死业务轮次。
+pub(crate) fn console(line: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stdout(), "{line}");
+}
+
+/// stderr 版（写盘失败告警等；同样不许 panic）。
+pub(crate) fn console_err(line: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "{line}");
+}
+
+/// 归档路径：`<file>.1` 最新、`<file>.N` 最旧。
+fn backup_path(path: &Path, n: usize) -> PathBuf {
+    PathBuf::from(format!("{}.{n}", path.display()))
+}
+
+/// 写盘失败告警（只喊一次）：落盘即完整是日志/台账的契约，写失败必须留下信号——
+/// 否则磁盘满或文件被独占时所有事件静默消失，时间线面板空了都没有诊断线索。
+pub(crate) fn warn_write_failed(what: &str, e: &std::io::Error) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        console_err(&format!("[logger] {what}写盘失败（后续同类错误只报一次）: {e}"));
+    }
+}
+
+/// 旧归档倒位：`.N` 丢弃，`.N-1`→`.N` … `.1`→`.2`，把 `.1` 腾给刚归档的当前文件。
+fn shift_archives(path: &Path, keep: usize) {
+    if keep == 0 {
+        return;
+    }
+    let _ = fs::remove_file(backup_path(path, keep));
+    for i in (1..keep).rev() {
+        let from = backup_path(path, i);
+        if from.exists() {
+            let _ = fs::rename(&from, backup_path(path, i + 1));
+        }
+    }
+}
+
+/// 把当前文件转成归档 `.1`（旧归档倒位）；keep = 0 时直接删除。
+fn archive_current(path: &Path, keep: usize) -> std::io::Result<()> {
+    if keep == 0 {
+        return fs::remove_file(path);
+    }
+    shift_archives(path, keep);
+    fs::rename(path, backup_path(path, 1))
+}
+
+/// 超限则归档当前文件（保留 keep 份，更旧的丢弃），返回被归档的体积；未超限/不存在返回 None。
+fn rotate_file(path: &Path, max_bytes: u64, keep: usize) -> std::io::Result<Option<u64>> {
+    let size = match fs::metadata(path) {
+        Ok(m) => m.len(),
+        Err(_) => return Ok(None), // 文件还不存在
+    };
+    if size <= max_bytes {
+        return Ok(None);
+    }
+    archive_current(path, keep)?;
+    Ok(Some(size))
+}
+
+static LOGGER: OnceLock<Arc<Logger>> = OnceLock::new();
+
+/// 归档保留默认份数（config.toml [logging].keep_archives 缺省值）。
+pub const DEFAULT_KEEP_ARCHIVES: usize = 3;
+
+/// 进程启动时调用一次（默认轮转上限 20MB；生产走 init_full，本入口供测试用）。
+#[cfg(test)]
+pub fn init(dir: &Path, file_name: &str, session_id: String) -> anyhow::Result<()> {
+    init_full(dir, file_name, session_id, 20 * 1024 * 1024, DEFAULT_KEEP_ARCHIVES)
+}
+
+/// 初始化：轮转上限 + 归档保留份数（生产入口，走 config.toml [logging]）。
+pub fn init_full(
+    dir: &Path,
+    file_name: &str,
+    session_id: String,
+    max_bytes: u64,
+    keep: usize,
+) -> anyhow::Result<()> {
+    let logger = Logger::open(dir, file_name, session_id, max_bytes, keep)?;
+    let _ = LOGGER.set(logger);
+    Ok(())
+}
+
+pub fn get() -> &'static Arc<Logger> {
+    LOGGER.get().expect("logger 未初始化：先调用 logging::init")
+}
+
+/// 全局便捷入口：后续所有代码统一走它。
+pub fn event(event_type: EventType, payload: Value) {
+    get().log(event_type, payload);
+}
+
+/// 安全入口：logger 未初始化时静默跳过（早期启动代码 / 单测里可用，不 panic）。
+pub fn try_event(event_type: EventType, payload: Value) {
+    if let Some(l) = LOGGER.get() {
+        l.log(event_type, payload);
+    }
+}
+
+/// 当前 JSONL 日志文件路径（logger 未初始化时 None）。
+pub fn log_path() -> Option<&'static Path> {
+    LOGGER.get().map(|l| l.path())
+}
+
+/// 全局 panic 兜底（2026-10-30）：仓库里原先没有任何 panic hook——跑在 spawn 里的
+/// 任务 panic 只会静默 unwind，日志里连一行都没有。装上后任何线程的 panic 都会先落
+/// 一条 `event_type=error / kind=panic`（信息、位置、线程、栈摘要），再交给原 hook
+/// （stderr 照旧）。对话主循环另有 `run_turn_guarded` 把 panic 转成前端错误气泡。
+pub fn install_panic_hook() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // 防递归：hook 里再 panic 会 abort 整个进程
+        thread_local! {
+            static IN_HOOK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        if !IN_HOOK.with(|c| c.replace(true)) {
+            // 日志自身出问题也不许在 panic 处理里再炸（二次 panic = abort）
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let message = info
+                    .payload()
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "未知 panic（payload 不是字符串）".to_string());
+                let location = info
+                    .location()
+                    .map(|l| format!("{}:{}", l.file(), l.line()))
+                    .unwrap_or_default();
+                let thread = std::thread::current().name().unwrap_or("unnamed").to_string();
+                let backtrace =
+                    truncate_chars(&std::backtrace::Backtrace::force_capture().to_string(), 4000);
+                try_event(
+                    EventType::Error,
+                    panic_record(&message, &location, &thread, &backtrace),
+                );
+            }));
+            IN_HOOK.with(|c| c.set(false));
+        }
+        prev(info);
+    }));
+}
+
+/// 全局 panic 的 JSONL 记录形状（单测钉住字段，防以后改坏）。
+pub(crate) fn panic_record(message: &str, location: &str, thread: &str, backtrace: &str) -> Value {
+    json!({
+        "kind": "panic",
+        "message": message,
+        "location": location,
+        "thread": thread,
+        "backtrace": backtrace,
+    })
+}
+
+/// 按**字符**截断（别按字节切，多字节字符中间会 panic——本仓有前车之鉴）。
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push_str("…（已截断）");
+    out
+}
+
+pub mod trace;
+pub use trace::read_tasks_scoped_multi;
+
+/// 全局控制台调试输出。
+pub fn debug(msg: &str) {
+    get().debug(msg);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_path(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("agent-log-{}-{}", tag, uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        dir.join("a.jsonl")
+    }
+
+    #[test]
+    fn rotate_over_limit_archives_and_reports_size() {
+        let path = tmp_path("over");
+        fs::write(&path, vec![b'x'; 100]).unwrap();
+        assert_eq!(rotate_file(&path, 50, 3).unwrap(), Some(100));
+        assert!(!path.exists(), "原文件应已被归档");
+        assert!(backup_path(&path, 1).exists(), "归档文件 <file>.1 应存在");
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn rotate_under_limit_keeps_file() {
+        let path = tmp_path("under");
+        fs::write(&path, b"short").unwrap();
+        assert_eq!(rotate_file(&path, 5000, 3).unwrap(), None);
+        assert!(path.exists());
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn rotate_missing_file_is_noop() {
+        let path = tmp_path("missing");
+        assert_eq!(rotate_file(&path, 10, 3).unwrap(), None);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // —— （报告 E4）：保留多份归档，最旧的按份数上限丢弃 ——
+    #[test]
+    fn rotate_keeps_multiple_archives_and_drops_oldest() {
+        let path = tmp_path("multi");
+        for i in 1..=4u8 {
+            fs::write(&path, vec![b'a' + i; 100]).unwrap();
+            assert_eq!(rotate_file(&path, 50, 3).unwrap(), Some(100));
+        }
+        assert!(!path.exists());
+        assert_eq!(fs::read(backup_path(&path, 1)).unwrap(), vec![b'e'; 100], ".1 应是最新归档");
+        assert_eq!(fs::read(backup_path(&path, 2)).unwrap(), vec![b'd'; 100]);
+        assert_eq!(fs::read(backup_path(&path, 3)).unwrap(), vec![b'c'; 100]);
+        assert!(!backup_path(&path, 4).exists(), "超上限的最旧归档应被丢弃");
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn rotate_with_zero_keep_deletes_old_file() {
+        let path = tmp_path("keep0");
+        fs::write(&path, vec![b'x'; 100]).unwrap();
+        assert_eq!(rotate_file(&path, 50, 0).unwrap(), Some(100));
+        assert!(!path.exists() && !backup_path(&path, 1).exists(), "keep=0 应直接删除不留归档");
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// 2026-10-30：全局 panic hook 的记录形状（kind=panic + 四要素）。
+    #[test]
+    fn panic_record_has_expected_shape() {
+        let v = panic_record("boom", "src/x.rs:12", "worker-1", "stack...");
+        assert_eq!(v["kind"], json!("panic"));
+        assert_eq!(v["message"], json!("boom"));
+        assert_eq!(v["location"], json!("src/x.rs:12"));
+        assert_eq!(v["thread"], json!("worker-1"));
+        assert_eq!(v["backtrace"], json!("stack..."));
+    }
+
+    /// 栈摘要按字符截断：多字节字符中间切会 panic（本仓 decode_entities 前车之鉴）。
+    #[test]
+    fn truncate_chars_is_char_safe() {
+        let long = "中".repeat(100);
+        let cut = truncate_chars(&long, 10);
+        assert!(cut.starts_with(&"中".repeat(10)), "保留前 10 个字符: {cut}");
+        assert!(cut.ends_with("…（已截断）"));
+        assert_eq!(truncate_chars("短", 10), "短", "未超限原样返回");
+    }
+}

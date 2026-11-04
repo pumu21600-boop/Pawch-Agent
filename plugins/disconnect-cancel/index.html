@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>断线取消</title>
+<style>
+  :root { scrollbar-color: var(--line2, #454039) transparent; color-scheme: dark; }
+  body {
+    --bg: #151412; --fg: #f3f1ec; --dim: #8a8478; --line: #332f2a;
+    --hover: #262320; --btn-line: #454039; --err: #e5534b; --ok: #7bc96f; --warn: #e8a33d;
+    color-scheme: dark;
+  }
+  body.light {
+    scrollbar-color: var(--line2, #b3bac4) transparent;
+    --bg: #ffffff; --fg: #1a1a1c; --dim: #6b6b74; --line: #e4e4e8;
+    --hover: #f2f2f5; --btn-line: #d4d4da; --err: #cf222e; --ok: #1a7f37; --warn: #b25e09;
+    color-scheme: light;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 14px 16px 20px; font: 13px/1.65 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+  h3 { margin: 0 0 8px; font-size: 14px; font-weight: 650; }
+  .card { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin-bottom: 10px; }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 6px 0; }
+  .dim { color: var(--dim); font-size: 12px; }
+  .err { color: var(--err); font-size: 12px; white-space: pre-wrap; }
+  .sw { position: relative; width: 34px; height: 19px; flex: none; border-radius: 999px; border: 1px solid var(--btn-line); background: transparent; cursor: pointer; }
+  .sw::after { content: ''; position: absolute; top: 2px; left: 2px; width: 13px; height: 13px; border-radius: 50%; background: var(--dim); transition: transform .12s, background .12s; }
+  .sw.on { background: var(--ok); border-color: var(--ok); }
+  .sw.on::after { transform: translateX(15px); background: #fff; }
+  .opt { border: 1px solid var(--line); border-radius: 8px; padding: 9px 11px; margin-bottom: 8px; cursor: pointer; }
+  .opt.sel { border-color: var(--ok); }
+  .opt .t { font-weight: 600; }
+  .opt .d { color: var(--dim); font-size: 12px; margin-top: 1px; }
+</style>
+</head>
+<body>
+  <div id="body"><div class="empty">读取中…</div></div>
+
+<script>
+let seq = 0;
+const pending = new Map();
+let booted = false;
+window.addEventListener('message', (ev) => {
+  const d = ev.data || {};
+  if (d.type === 'pawch:init') {
+    document.body.classList.toggle('light', ((d.payload || {}).theme) === 'light');
+    if (!booted) { booted = true; boot(); }
+  }
+  if (d.type === 'pawch:response') {
+    const r = pending.get(d.id);
+    if (!r) return;
+    pending.delete(d.id);
+    d.ok ? r.res(d.result) : r.rej(new Error(String(d.result || '请求失败')));
+  }
+});
+function req(method, params) {
+  return new Promise((res, rej) => {
+    const id = 'r' + ++seq;
+    pending.set(id, { res, rej });
+    parent.postMessage({ type: 'pawch:request', id, method, params }, '*');
+    // 2026-10-08 修：宿主不响应（pawch:response 丢失/被早退）时 Promise 永久
+    // pending——面板卡在「读取中…」且无重试无提示，pending 条目也永不清理。
+    // 补 8s 超时（与 board/trace 同一范式）。
+    setTimeout(() => {
+      if (pending.has(id)) {
+        pending.delete(id);
+        rej(new Error('宿主未响应（超时）'));
+      }
+    }, 8000);
+  });
+}
+parent.postMessage({ type: 'pawch:hello' }, '*');
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+async function boot() { await refresh(); }
+async function refresh() {
+  try {
+    const s = await req('features.get', {});
+    render((s.features || {}).cancel_on_disconnect === true);
+  } catch (e) { $('body').innerHTML = `<div class="err">${esc(e.message || e)}</div>`; }
+}
+function render(on) {
+  $('body').innerHTML = `
+    <h3>断线取消</h3>
+    <div class="opt ${!on ? 'sel' : ''}" id="off">
+      <div class="t">后台跑完（默认）</div>
+      <div class="d">关页面/断网/刷新都不影响任务：跑完为止，刷新回来能接着聊。</div>
+    </div>
+    <div class="opt ${on ? 'sel' : ''}" id="onMode">
+      <div class="t">断开即取消</div>
+      <div class="d">检测到网页断开就取消本轮，不再继续烧 token。</div>
+    </div>
+    <div class="dim">判断依据是连接是否还在：刷新页面会重连，也会按上面选的策略处理。</div>`;
+  $('off').onclick = () => set(false);
+  $('onMode').onclick = () => set(true);
+  async function set(v) {
+    try {
+      const r = await req('features.set', { feature: 'cancel_on_disconnect', value: v });
+      render((r.features || {}).cancel_on_disconnect === true);
+    } catch (e) { alert('切换失败：' + (e.message || e)); }
+  }
+}
+</script>
+<script>
+/* 微调桥（2026-11-03 协议扩展）：宿主微调模式下本面板支持右击选元素、接收下发 CSS。
+   宿主→插件 {type:'pawch:micro', op:'enter'(listen)/'exit'/'apply'(css)}；
+   插件→宿主 {type:'pawch:micro-ack'} 与 {type:'pawch:micro-pick', pick:{sel,label,styles,x,y}}。
+   旧宿主不认识这些消息也不受影响；本段独立成块，不影响插件自身脚本。 */
+(function () {
+  var listening = false;
+  function ensureStyle(id) {
+    var el = document.getElementById(id);
+    if (!el) {
+      el = document.createElement('style');
+      el.id = id;
+      (document.head || document.documentElement).appendChild(el);
+    }
+    return el;
+  }
+  function onContext(e) {
+    if (!listening) return;
+    e.preventDefault();
+    e.stopPropagation();
+    var t = e.target;
+    if (t && t.nodeType !== 1 && t.parentElement) t = t.parentElement;
+    if (!t || !t.closest) return;
+    var btn = t.closest('button');
+    if (btn && t.closest('svg')) t = btn;
+    var SKIP = /^(active|on|sel|open|hover|running|ok|fail|err|hidden|light|dark|empty|more|dim|warn|danger|primary|ghost|flat|row)$/;
+    function esc(s) { return window.CSS && CSS.escape ? CSS.escape(s) : s; }
+    function classesOf(el) {
+      return (typeof el.className === 'string' ? el.className : (el.getAttribute && el.getAttribute('class')) || '')
+        .split(/\s+/).filter(function (c) { return c && !SKIP.test(c) && !/^s-[A-Za-z0-9_-]+$/.test(c) && !/^svelte-[A-Za-z0-9_-]+$/.test(c); });
+    }
+    // 选择器必须命中「被点的这个元素」：自身 id > 自身类名 > 最近有 id/类名的祖先 + 到目标的子路径。
+    // 旧实现拿最近的「有类名的祖先」当选择器（点 #filter 得到 .toolbar），规则永远改不到目标。
+    function selectorFor(el) {
+      if (el.id) return '#' + esc(el.id);
+      var own = classesOf(el);
+      if (own.length) return '.' + own.map(esc).join('.');
+      var tail = [], cur = el;
+      while (cur && cur !== document.body) {
+        var parent = cur.parentElement;
+        if (!parent) break;
+        var sibs = Array.prototype.filter.call(parent.children, function (x) { return x.tagName === cur.tagName; });
+        var seg = cur.tagName.toLowerCase();
+        if (sibs.length > 1) seg += ':nth-of-type(' + (sibs.indexOf(cur) + 1) + ')';
+        tail.unshift(seg);
+        if (parent.id) return '#' + esc(parent.id) + ' > ' + tail.join(' > ');
+        var pcls = classesOf(parent);
+        if (pcls.length) return '.' + pcls.map(esc).join('.') + ' > ' + tail.join(' > ');
+        cur = parent;
+      }
+      return tail.join(' > ') || el.tagName.toLowerCase();
+    }
+    var sel = selectorFor(t);
+    var labelCls = classesOf(t);
+    var label = labelCls.filter(function (c) { return c.indexOf('-') >= 0; })[0] || labelCls[0] || (t.id ? '#' + t.id : t.tagName.toLowerCase());
+    var cs = getComputedStyle(t);
+    function alphaOf(c) {
+      var m = String(c || '').match(/rgba?\(([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:[,\s/]+([\d.]+))?\)/);
+      if (!m) return /^transparent$/i.test(String(c || '').trim()) ? 0 : 1;
+      return m[4] === undefined ? 1 : parseFloat(m[4]);
+    }
+    function stylesOf(el) {
+      var s = getComputedStyle(el);
+      var b = String(s.backdropFilter || '').match(/blur\(([\d.]+)px\)/);
+      return {
+        color: s.color, bg: s.backgroundColor,
+        radius: parseFloat(s.borderTopLeftRadius) || 0,
+        border: parseFloat(s.borderTopWidth) || 0,
+        borderColor: s.borderTopColor,
+        blur: b ? parseFloat(b[1]) : 0,
+        fontSize: parseFloat(s.fontSize) || 14
+      };
+    }
+    // 背景替身：本身透明时找真正画底色的祖先（深色面板的底常是 body/根容器画的），
+    // 一并上报让宿主面板给「改上级」入口——否则改内层元素背景等于改一块透明玻璃
+    var bgHost = null;
+    if (alphaOf(cs.backgroundColor) <= 0.05) {
+      var host = t.parentElement;
+      while (host) {
+        var hs = getComputedStyle(host);
+        if (alphaOf(hs.backgroundColor) > 0.05) {
+          var hcls = classesOf(host);
+          bgHost = {
+            sel: selectorFor(host),
+            label: hcls.filter(function (c) { return c.indexOf('-') >= 0; })[0] || hcls[0] || (host.id ? '#' + host.id : host.tagName.toLowerCase()),
+            styles: stylesOf(host)
+          };
+          break;
+        }
+        host = host.parentElement;
+      }
+    }
+    parent.postMessage({ type: 'pawch:micro-pick', pick: {
+      sel: sel, label: label || sel,
+      styles: stylesOf(t),
+      bgHost: bgHost,
+      root: { sel: 'body', label: '面板底色（body）', styles: stylesOf(document.body) },
+      x: e.clientX, y: e.clientY
+    } }, '*');
+  }
+  window.addEventListener('message', function (ev) {
+    var d = ev.data || {};
+    if (d.type !== 'pawch:micro' && d.type !== 'agent:micro') return;
+    if (d.op === 'enter') {
+      listening = !!d.listen;
+      document.removeEventListener('contextmenu', onContext, true);
+      if (listening) {
+        document.addEventListener('contextmenu', onContext, true);
+        ensureStyle('pawch-micro-hover').textContent = '*:hover { outline: 1px dashed rgba(186,138,120,.55); outline-offset: -1px; }';
+      } else {
+        var hs = document.getElementById('pawch-micro-hover');
+        if (hs) hs.remove();
+      }
+      parent.postMessage({ type: 'pawch:micro-ack' }, '*');
+    } else if (d.op === 'exit') {
+      listening = false;
+      document.removeEventListener('contextmenu', onContext, true);
+      var h2 = document.getElementById('pawch-micro-hover');
+      if (h2) h2.remove();
+    } else if (d.op === 'apply') {
+      ensureStyle('pawch-micro').textContent = String(d.css || '');
+    }
+  });
+})();
+</script>
+</body>
+</html>

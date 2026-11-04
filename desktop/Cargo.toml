@@ -1,0 +1,29 @@
+[package]
+name = "pawch-agent-desktop"
+version = "0.1.0"
+edition = "2021"
+description = "Pawch Agent 桌面壳：窗口 + 托盘 + 服务保活，WebView 加载本机服务"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# unstable：child webview（add_child）所需；devtools：child webview 开真 DevTools
+tauri = { version = "2", features = ["tray-icon", "unstable", "devtools"] }
+serde_json = "1"
+# ResizeDirection 在 tauri-runtime 里 re-export 不出来（tauri::ResizeDirection 不存在），无边框边缘拉伸要用
+tauri-runtime = "2"
+# 接住 tauri/wry 内部 log::error!（child webview 创建失败原来只 log 一声且无 logger 直接蒸发）
+log = { version = "0.4", features = ["std"] }
+# 首次启动选数据目录（系统文件夹选择框）
+rfd = "0.15"
+# 写 config.toml 的 [paths] data_dir 时保留注释与其余内容
+toml_edit = "0.22"
+# 壳里打开资源管理器后把新窗口顶到前台（只有前台进程有 SetForegroundWindow 权限）
+windows-sys = { version = "0.52", features = [
+  "Win32_Foundation",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+strip = true

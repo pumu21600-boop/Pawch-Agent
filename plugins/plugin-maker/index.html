@@ -1,0 +1,550 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>插件制作器</title>
+<style>
+  :root { scrollbar-color: var(--line2, #454039) transparent; color-scheme: dark; }
+  body {
+    --bg: #151412; --fg: #f3f1ec; --dim: #8a8478; --line: #332f2a;
+    --hover: #262320; --btn-line: #454039; --err: #e5534b; --ok: #4bb543;
+    color-scheme: dark;
+  }
+  body.light {
+    scrollbar-color: var(--line2, #b3bac4) transparent;
+    --bg: #ffffff; --fg: #1a1a1c; --dim: #6b6b74; --line: #e4e4e8;
+    --hover: #f2f2f5; --btn-line: #d4d4da; --err: #cf222e; --ok: #1a7f37;
+    color-scheme: light;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 0;
+    font: 13px/1.65 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    background: var(--bg); color: var(--fg);
+  }
+  #wrap { padding: 14px 16px 6px; }
+  h3 { margin: 0 0 2px; font-size: 14px; font-weight: 650; }
+  label { display: block; font-size: 12px; color: var(--dim); margin: 10px 0 4px; }
+  textarea, select {
+    width: 100%; font: inherit; color: var(--fg); background: var(--bg);
+    border: 1px solid var(--btn-line); border-radius: 6px; padding: 6px 8px;
+  }
+  textarea { min-height: 110px; }
+  textarea:focus, select:focus { outline: none; border-color: var(--fg); }
+  .row { display: flex; gap: 8px; margin-top: 14px; }
+  button {
+    font: inherit; padding: 6px 16px; border-radius: 6px; cursor: pointer;
+    border: 1px solid var(--btn-line); background: transparent; color: var(--fg);
+  }
+  button:hover { background: var(--hover); }
+  button.primary { border-color: var(--fg); }
+  button:disabled { opacity: .5; cursor: default; }
+  button:disabled:hover { background: transparent; }
+  /* 空消息条不占位（否则弹窗下边缘和按钮之间白多一条 margin） */
+  #msg:empty { display: none; }
+  .msg { margin-top: 10px; font-size: 12px; white-space: pre-wrap; }
+  .msg.err { color: var(--err); }
+  .msg.ok { color: var(--ok); }
+</style>
+</head>
+<body>
+  <!-- 包裹层：高度只由内容决定（不受 iframe 视口钳制）——弹窗贴合就量它。
+       直接量 documentElement.scrollHeight 有个坑：它不低于当前视口，框一旦被撑大
+       就再也报不小，清空后收不回来（实测实锤） -->
+  <main id="wrap">
+  <h3>插件制作器</h3>
+  <label for="req">插件制作要求</label>
+  <textarea id="req"></textarea>
+  <label for="ws">工作区</label>
+  <select id="ws"><option>读取中…</option></select>
+  <div class="row">
+    <button id="go" class="primary" disabled>确定</button>
+    <button id="clear">清空</button>
+  </div>
+  <div id="msg" class="msg"></div>
+  </main>
+
+<script>
+// —— 插件契约 v1：等宿主 pawch:init 再发请求；pawch:request/response 按 id 配对 ——
+let seq = 0;
+const pending = new Map();
+let booted = false;
+let wsTouched = false; // 用户手选过工作区：切项目时保留他的选择，没手选过则跟随当前
+
+window.addEventListener('message', (ev) => {
+  const d = ev.data || {};
+  if (d.type === 'pawch:init') {
+    // 主题跟着宿主走（宿主切主题会重发 init）；但 boot 只跑一次
+    document.body.classList.toggle('light', ((d.payload || {}).theme) === 'light');
+    if (!booted) {
+      booted = true;
+      boot();
+    }
+  }
+  if (d.type === 'pawch:response') {
+    const r = pending.get(d.id);
+    if (!r) return;
+    pending.delete(d.id);
+    d.ok ? r.res(d.result) : r.rej(new Error(String(d.result || '请求失败')));
+  }
+  if (d.type === 'pawch:event' && d.event === 'workspace' && booted) {
+    loadWorkspaces();
+  }
+});
+
+function req(method, params) {
+  return new Promise((res, rej) => {
+    const id = 'r' + ++seq;
+    pending.set(id, { res, rej });
+    parent.postMessage({ type: 'pawch:request', id, method, params }, '*');
+  });
+}
+parent.postMessage({ type: 'pawch:hello' }, '*');
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) =>
+  String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+async function boot() {
+  $('go').onclick = go;
+  $('clear').onclick = () => {
+    $('req').value = '';
+    refresh();
+    growReq();
+    $('req').focus();
+  };
+  $('req').oninput = () => {
+    refresh();
+    growReq();
+  };
+  $('ws').onchange = () => {
+    wsTouched = true;
+  };
+  await loadWorkspaces();
+  refresh();
+  fit();
+}
+
+// 工作区列表：当前置顶 + 最近（去重）。workspace.info 是只读桥，不占权限。
+// 宿主切工作区会推 event=workspace；不重拉的话下拉一直标旧项目为「当前」，
+// 旧项目被移除后还会留着一个点进去必失败的路径。
+async function loadWorkspaces() {
+  let current = '';
+  let recent = [];
+  try {
+    const info = await req('workspace.info', {});
+    current = info.current || '';
+    recent = info.recent || [];
+  } catch (e) {
+    showMsg('读不到工作区列表：' + (e.message || e), 'err');
+  }
+  const seen = new Set();
+  const list = [];
+  for (const w of [current, ...recent]) {
+    const k = w.toLowerCase();
+    if (w && !seen.has(k)) {
+      seen.add(k);
+      list.push(w);
+    }
+  }
+  if (!list.length) list.push('');
+  const prev = $('ws').value;
+  $('ws').innerHTML = list
+    .map((w, i) => `<option value="${esc(w)}">${i === 0 ? '（当前）' : ''}${esc(w.split(/[\\/]/).filter(Boolean).pop() || w)}</option>`)
+    .join('');
+  // 用户手选过的工作区还在表里就保留；否则回到当前（默认跟随当前项目）。
+  $('ws').value = wsTouched && prev && list.includes(prev) ? prev : current || list[0] || '';
+}
+
+// 需求框随输入长高（封顶 200，超出内部滚），长高后同步弹窗高度
+function growReq() {
+  const ta = $('req');
+  ta.style.height = 'auto';
+  ta.style.height = Math.min(ta.scrollHeight, 200) + 'px';
+  fit();
+}
+
+// 内容高度上报（宿主 pawch:resize 协议）：弹窗下边缘贴着内容，不在按钮下方留空白。
+// 量 #wrap（内容驱动、不受视口钳制）——量 documentElement.scrollHeight 会导致框只能
+// 长大不能缩小（scrollHeight 不低于当前视口高度）。
+function fit() {
+  const h = Math.ceil(document.getElementById('wrap').getBoundingClientRect().height);
+  parent.postMessage({ type: 'pawch:resize', height: h }, '*');
+}
+
+function refresh() {
+  $('go').disabled = !$('req').value.trim();
+}
+
+function showMsg(text, cls) {
+  const m = $('msg');
+  m.textContent = text;
+  m.className = 'msg' + (cls ? ' ' + cls : '');
+  fit(); // 消息条出现/消失会改变内容高度，弹窗跟着贴
+}
+
+async function go() {
+  const requirements = $('req').value.trim();
+  if (!requirements) return;
+  const ws = $('ws').value;
+  $('go').disabled = true;
+  showMsg('正在新建对话…', '');
+  try {
+    // 切工作区 + 建会话 + 预填输入框，一次桥调用搞定（不代发，用户自己回车）
+    await req('session.create', { workspace: ws, text: buildPrompt(requirements, ws) });
+    showMsg(`已在「${ws}」新建对话并预填提示词。去输入框审一遍，回车发送。`, 'ok');
+    $('req').value = '';
+  } catch (e) {
+    showMsg('新建对话失败：' + (e.message || e), 'err');
+  }
+  refresh();
+}
+
+// 插入输入框的提示词 = 用户原话需求 + agent-copy 插件规范 + 安装验证引导。
+// 规范全部内联（新对话开在用户选的工作区，够不着应用目录里的参考实现）；
+// 改这段不用重编译宿主，刷新页面即生效。
+function buildPrompt(requirements, ws) {
+  return `你是 agent-copy 的插件工程师。请按下面的规范，为我制作一个插件。
+
+【我的需求】
+${requirements}
+
+【落点】
+- 工作区：${ws}
+- 插件目录：${ws}/plugins/<name>/（<name> 用小写连字符风格，仅字母数字与 - _ .；已存在就换个名字）
+
+【硬性规范（agent-copy 插件契约 v1）】
+1. 一个插件 = 一个目录 + 一份 manifest.json（不是 .zcode-plugin/plugin.json），放在上面的落点。
+2. manifest.json 字段：
+   - apiVersion: 1（必须）；source: "user"；version: "0.1.0"
+   - title / description：中文标题 + 一句话描述
+   - entry: "index.html"：面板入口页（纯工具插件不写这个字段）
+   - permissions: 只用白名单内的：composer.insert / workspace.write / bus.publish / notify / storage / usage.prices / clipboard / settings.feature / action.run / session.create
+   - 可选：ui: [{"slot":"dock","id":"<name>","title":"<标题>"}]（面板从 设置→插件 页点「打开」进入）；skills: "skills"（插件自带技能，每个子目录一份 SKILL.md）；tool_file: "x.wat"（WASM 工具文件，目录内只允许一个）
+3. 面板页跑在不透明 iframe 里，与宿主唯一通道是 postMessage 桥：
+   - 插件发 {type:'pawch:hello'}，宿主回 {type:'pawch:init', payload:{...}}
+   - 插件发 {type:'pawch:request', id, method, params}，宿主回 {type:'pawch:response', id, ok, result}，按 id 配对
+   - 只读方法：app.info / workspace.info / workspace.files / workspace.file / workspace.dir / git.status / session.info / memory.search / memory.library / features.get
+   - 写方法须在 manifest 声明权限：composer.insert / notify / bus.publish / workspace.write（弹确认）/ clipboard.write / storage.read|write|delete
+   - 不许直连 /api/*；主题跟随宿主：body.light class + CSS 变量；boot 逻辑只跑一次
+   - 微调（建议带上）：把示例末尾的「微调桥」脚本块原样放进 index.html，面板即可被宿主的界面微调模式选中（微调开着时在面板内容上右击改样式，规则随面板重载自动回放）；不带也能跑，只是微调会提示「该插件版本暂不支持」
+4. 工具插件（可选）：目录内一个 .wat 文件 + manifest tool_file，导出 describe/alloc/run，零宿主函数。
+
+【最小可用示例】
+manifest.json：
+{
+  "apiVersion": 1,
+  "source": "user",
+  "title": "我的插件",
+  "description": "一句话说明这个插件做什么",
+  "version": "0.1.0",
+  "entry": "index.html"
+}
+
+index.html：
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>我的插件</title>
+<style>
+  :root { color-scheme: dark; }
+  body { --bg:#151412; --fg:#f3f1ec; --dim:#8a8478; --line:#332f2a; margin:0; padding:16px;
+         font:13px/1.7 "Segoe UI","Microsoft YaHei",system-ui,sans-serif; background:var(--bg); color:var(--fg); }
+  body.light { --bg:#ffffff; --fg:#1a1a1c; --dim:#6b6b74; --line:#e4e4e8; color-scheme:light; }
+</style>
+</head>
+<body>
+  <h3>我的插件</h3>
+  <div id="out">加载中…</div>
+<script>
+let seq = 0; const pending = new Map(); let booted = false;
+window.addEventListener('message', (ev) => {
+  const d = ev.data || {};
+  if (d.type === 'pawch:init') {
+    document.body.classList.toggle('light', ((d.payload || {}).theme) === 'light');
+    if (!booted) { booted = true; boot(); }
+  }
+  if (d.type === 'pawch:response') {
+    const r = pending.get(d.id); if (!r) return; pending.delete(d.id);
+    d.ok ? r.res(d.result) : r.rej(new Error(String(d.result || '请求失败')));
+  }
+});
+function req(method, params) {
+  return new Promise((res, rej) => {
+    const id = 'r' + ++seq; pending.set(id, { res, rej });
+    parent.postMessage({ type: 'pawch:request', id, method, params }, '*');
+  });
+}
+parent.postMessage({ type: 'pawch:hello' }, '*');
+async function boot() {
+  const info = await req('workspace.info', {});
+  document.getElementById('out').textContent = '当前工作区：' + (info.current || '未知');
+}
+<\/script>
+<script>
+/* 微调桥（2026-11-03 协议扩展）：宿主微调模式下本面板支持右击选元素、接收下发 CSS。
+   宿主→插件 {type:'pawch:micro', op:'enter'(listen)/'exit'/'apply'(css)}；
+   插件→宿主 {type:'pawch:micro-ack'} 与 {type:'pawch:micro-pick', pick:{sel,label,styles,x,y}}。
+   旧宿主不认识这些消息也不受影响；本段独立成块，不影响插件自身脚本。 */
+(function () {
+  var listening = false;
+  function ensureStyle(id) {
+    var el = document.getElementById(id);
+    if (!el) {
+      el = document.createElement('style');
+      el.id = id;
+      (document.head || document.documentElement).appendChild(el);
+    }
+    return el;
+  }
+  function onContext(e) {
+    if (!listening) return;
+    e.preventDefault();
+    e.stopPropagation();
+    var t = e.target;
+    if (t && t.nodeType !== 1 && t.parentElement) t = t.parentElement;
+    if (!t || !t.closest) return;
+    var btn = t.closest('button');
+    if (btn && t.closest('svg')) t = btn;
+    var SKIP = /^(active|on|sel|open|hover|running|ok|fail|err|hidden|light|dark|empty|more|dim|warn|danger|primary|ghost|flat|row)$/;
+    function esc(s) { return window.CSS && CSS.escape ? CSS.escape(s) : s; }
+    function classesOf(el) {
+      return (typeof el.className === 'string' ? el.className : (el.getAttribute && el.getAttribute('class')) || '')
+        .split(/\s+/).filter(function (c) { return c && !SKIP.test(c) && !/^s-[A-Za-z0-9_-]+$/.test(c) && !/^svelte-[A-Za-z0-9_-]+$/.test(c); });
+    }
+    // 选择器必须命中「被点的这个元素」：自身 id > 自身类名 > 最近有 id/类名的祖先 + 到目标的子路径。
+    // 旧实现拿最近的「有类名的祖先」当选择器（点 #filter 得到 .toolbar），规则永远改不到目标。
+    function selectorFor(el) {
+      if (el.id) return '#' + esc(el.id);
+      var own = classesOf(el);
+      if (own.length) return '.' + own.map(esc).join('.');
+      var tail = [], cur = el;
+      while (cur && cur !== document.body) {
+        var parent = cur.parentElement;
+        if (!parent) break;
+        var sibs = Array.prototype.filter.call(parent.children, function (x) { return x.tagName === cur.tagName; });
+        var seg = cur.tagName.toLowerCase();
+        if (sibs.length > 1) seg += ':nth-of-type(' + (sibs.indexOf(cur) + 1) + ')';
+        tail.unshift(seg);
+        if (parent.id) return '#' + esc(parent.id) + ' > ' + tail.join(' > ');
+        var pcls = classesOf(parent);
+        if (pcls.length) return '.' + pcls.map(esc).join('.') + ' > ' + tail.join(' > ');
+        cur = parent;
+      }
+      return tail.join(' > ') || el.tagName.toLowerCase();
+    }
+    var sel = selectorFor(t);
+    var labelCls = classesOf(t);
+    var label = labelCls.filter(function (c) { return c.indexOf('-') >= 0; })[0] || labelCls[0] || (t.id ? '#' + t.id : t.tagName.toLowerCase());
+    var cs = getComputedStyle(t);
+    function alphaOf(c) {
+      var m = String(c || '').match(/rgba?\(([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:[,\s/]+([\d.]+))?\)/);
+      if (!m) return /^transparent$/i.test(String(c || '').trim()) ? 0 : 1;
+      return m[4] === undefined ? 1 : parseFloat(m[4]);
+    }
+    function stylesOf(el) {
+      var s = getComputedStyle(el);
+      var b = String(s.backdropFilter || '').match(/blur\(([\d.]+)px\)/);
+      return {
+        color: s.color, bg: s.backgroundColor,
+        radius: parseFloat(s.borderTopLeftRadius) || 0,
+        border: parseFloat(s.borderTopWidth) || 0,
+        borderColor: s.borderTopColor,
+        blur: b ? parseFloat(b[1]) : 0,
+        fontSize: parseFloat(s.fontSize) || 14
+      };
+    }
+    // 背景替身：本身透明时找真正画底色的祖先（深色面板的底常是 body/根容器画的），
+    // 一并上报让宿主面板给「改上级」入口——否则改内层元素背景等于改一块透明玻璃
+    var bgHost = null;
+    if (alphaOf(cs.backgroundColor) <= 0.05) {
+      var host = t.parentElement;
+      while (host) {
+        var hs = getComputedStyle(host);
+        if (alphaOf(hs.backgroundColor) > 0.05) {
+          var hcls = classesOf(host);
+          bgHost = {
+            sel: selectorFor(host),
+            label: hcls.filter(function (c) { return c.indexOf('-') >= 0; })[0] || hcls[0] || (host.id ? '#' + host.id : host.tagName.toLowerCase()),
+            styles: stylesOf(host)
+          };
+          break;
+        }
+        host = host.parentElement;
+      }
+    }
+    parent.postMessage({ type: 'pawch:micro-pick', pick: {
+      sel: sel, label: label || sel,
+      styles: stylesOf(t),
+      bgHost: bgHost,
+      root: { sel: 'body', label: '面板底色（body）', styles: stylesOf(document.body) },
+      x: e.clientX, y: e.clientY
+    } }, '*');
+  }
+  window.addEventListener('message', function (ev) {
+    var d = ev.data || {};
+    if (d.type !== 'pawch:micro' && d.type !== 'agent:micro') return;
+    if (d.op === 'enter') {
+      listening = !!d.listen;
+      document.removeEventListener('contextmenu', onContext, true);
+      if (listening) {
+        document.addEventListener('contextmenu', onContext, true);
+        ensureStyle('pawch-micro-hover').textContent = '*:hover { outline: 1px dashed rgba(186,138,120,.55); outline-offset: -1px; }';
+      } else {
+        var hs = document.getElementById('pawch-micro-hover');
+        if (hs) hs.remove();
+      }
+      parent.postMessage({ type: 'pawch:micro-ack' }, '*');
+    } else if (d.op === 'exit') {
+      listening = false;
+      document.removeEventListener('contextmenu', onContext, true);
+      var h2 = document.getElementById('pawch-micro-hover');
+      if (h2) h2.remove();
+    } else if (d.op === 'apply') {
+      ensureStyle('pawch-micro').textContent = String(d.css || '');
+    }
+  });
+})();
+<\/script>
+</body>
+</html>
+
+【安装与验证（必做）】
+1. 文件直接写进上面的插件目录即自动加载，没有额外激活步骤。（不需要任何权限的纯面板/纯工具插件，也可以改用 plugin 工具 action=install——但那样权限会被清空且落到应用目录、全局可用；凡是要用权限的插件，一律走直接写文件这条路。）
+2. 自检：manifest.json 是合法 JSON；entry 指向的文件真实存在；所有路径不出插件目录；权限都在白名单内。
+3. 让用户在 设置→插件 页找到该插件，点「打开」试用。
+
+【汇报要求】
+- 做完如实汇报：插件目录、manifest 要点、自检结果、一个试用提示词和预期效果。
+- 没验证的就说没验证，别把「写完了」说成「装好了」。`;
+}
+</script>
+<script>
+/* 微调桥（2026-11-03 协议扩展）：宿主微调模式下本面板支持右击选元素、接收下发 CSS。
+   宿主→插件 {type:'pawch:micro', op:'enter'(listen)/'exit'/'apply'(css)}；
+   插件→宿主 {type:'pawch:micro-ack'} 与 {type:'pawch:micro-pick', pick:{sel,label,styles,x,y}}。
+   旧宿主不认识这些消息也不受影响；本段独立成块，不影响插件自身脚本。 */
+(function () {
+  var listening = false;
+  function ensureStyle(id) {
+    var el = document.getElementById(id);
+    if (!el) {
+      el = document.createElement('style');
+      el.id = id;
+      (document.head || document.documentElement).appendChild(el);
+    }
+    return el;
+  }
+  function onContext(e) {
+    if (!listening) return;
+    e.preventDefault();
+    e.stopPropagation();
+    var t = e.target;
+    if (t && t.nodeType !== 1 && t.parentElement) t = t.parentElement;
+    if (!t || !t.closest) return;
+    var btn = t.closest('button');
+    if (btn && t.closest('svg')) t = btn;
+    var SKIP = /^(active|on|sel|open|hover|running|ok|fail|err|hidden|light|dark|empty|more|dim|warn|danger|primary|ghost|flat|row)$/;
+    function esc(s) { return window.CSS && CSS.escape ? CSS.escape(s) : s; }
+    function classesOf(el) {
+      return (typeof el.className === 'string' ? el.className : (el.getAttribute && el.getAttribute('class')) || '')
+        .split(/\s+/).filter(function (c) { return c && !SKIP.test(c) && !/^s-[A-Za-z0-9_-]+$/.test(c) && !/^svelte-[A-Za-z0-9_-]+$/.test(c); });
+    }
+    // 选择器必须命中「被点的这个元素」：自身 id > 自身类名 > 最近有 id/类名的祖先 + 到目标的子路径。
+    // 旧实现拿最近的「有类名的祖先」当选择器（点 #filter 得到 .toolbar），规则永远改不到目标。
+    function selectorFor(el) {
+      if (el.id) return '#' + esc(el.id);
+      var own = classesOf(el);
+      if (own.length) return '.' + own.map(esc).join('.');
+      var tail = [], cur = el;
+      while (cur && cur !== document.body) {
+        var parent = cur.parentElement;
+        if (!parent) break;
+        var sibs = Array.prototype.filter.call(parent.children, function (x) { return x.tagName === cur.tagName; });
+        var seg = cur.tagName.toLowerCase();
+        if (sibs.length > 1) seg += ':nth-of-type(' + (sibs.indexOf(cur) + 1) + ')';
+        tail.unshift(seg);
+        if (parent.id) return '#' + esc(parent.id) + ' > ' + tail.join(' > ');
+        var pcls = classesOf(parent);
+        if (pcls.length) return '.' + pcls.map(esc).join('.') + ' > ' + tail.join(' > ');
+        cur = parent;
+      }
+      return tail.join(' > ') || el.tagName.toLowerCase();
+    }
+    var sel = selectorFor(t);
+    var labelCls = classesOf(t);
+    var label = labelCls.filter(function (c) { return c.indexOf('-') >= 0; })[0] || labelCls[0] || (t.id ? '#' + t.id : t.tagName.toLowerCase());
+    var cs = getComputedStyle(t);
+    function alphaOf(c) {
+      var m = String(c || '').match(/rgba?\(([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:[,\s/]+([\d.]+))?\)/);
+      if (!m) return /^transparent$/i.test(String(c || '').trim()) ? 0 : 1;
+      return m[4] === undefined ? 1 : parseFloat(m[4]);
+    }
+    function stylesOf(el) {
+      var s = getComputedStyle(el);
+      var b = String(s.backdropFilter || '').match(/blur\(([\d.]+)px\)/);
+      return {
+        color: s.color, bg: s.backgroundColor,
+        radius: parseFloat(s.borderTopLeftRadius) || 0,
+        border: parseFloat(s.borderTopWidth) || 0,
+        borderColor: s.borderTopColor,
+        blur: b ? parseFloat(b[1]) : 0,
+        fontSize: parseFloat(s.fontSize) || 14
+      };
+    }
+    // 背景替身：本身透明时找真正画底色的祖先（深色面板的底常是 body/根容器画的），
+    // 一并上报让宿主面板给「改上级」入口——否则改内层元素背景等于改一块透明玻璃
+    var bgHost = null;
+    if (alphaOf(cs.backgroundColor) <= 0.05) {
+      var host = t.parentElement;
+      while (host) {
+        var hs = getComputedStyle(host);
+        if (alphaOf(hs.backgroundColor) > 0.05) {
+          var hcls = classesOf(host);
+          bgHost = {
+            sel: selectorFor(host),
+            label: hcls.filter(function (c) { return c.indexOf('-') >= 0; })[0] || hcls[0] || (host.id ? '#' + host.id : host.tagName.toLowerCase()),
+            styles: stylesOf(host)
+          };
+          break;
+        }
+        host = host.parentElement;
+      }
+    }
+    parent.postMessage({ type: 'pawch:micro-pick', pick: {
+      sel: sel, label: label || sel,
+      styles: stylesOf(t),
+      bgHost: bgHost,
+      root: { sel: 'body', label: '面板底色（body）', styles: stylesOf(document.body) },
+      x: e.clientX, y: e.clientY
+    } }, '*');
+  }
+  window.addEventListener('message', function (ev) {
+    var d = ev.data || {};
+    if (d.type !== 'pawch:micro' && d.type !== 'agent:micro') return;
+    if (d.op === 'enter') {
+      listening = !!d.listen;
+      document.removeEventListener('contextmenu', onContext, true);
+      if (listening) {
+        document.addEventListener('contextmenu', onContext, true);
+        ensureStyle('pawch-micro-hover').textContent = '*:hover { outline: 1px dashed rgba(186,138,120,.55); outline-offset: -1px; }';
+      } else {
+        var hs = document.getElementById('pawch-micro-hover');
+        if (hs) hs.remove();
+      }
+      parent.postMessage({ type: 'pawch:micro-ack' }, '*');
+    } else if (d.op === 'exit') {
+      listening = false;
+      document.removeEventListener('contextmenu', onContext, true);
+      var h2 = document.getElementById('pawch-micro-hover');
+      if (h2) h2.remove();
+    } else if (d.op === 'apply') {
+      ensureStyle('pawch-micro').textContent = String(d.css || '');
+    }
+  });
+})();
+</script>
+</body>
+</html>

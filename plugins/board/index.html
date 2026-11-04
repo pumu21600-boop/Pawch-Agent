@@ -1,0 +1,790 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>项目文件</title>
+    <style>
+:root {
+        /* 2026-10-02：iframe 独立文档，不吃主界面 scrollbar-color——深色下默认白滑杆 */
+        scrollbar-color: var(--line2, #454039) transparent;
+        /* iframe 文档画布兜底色：不声明时浏览器按浅色把画布兜成白色——
+           body 被微调成透明后整块面板会变全白（2026-11-03 真机实测） */
+        color-scheme: dark;
+        --bg: #151412;
+        --fg: #b8b3a9;
+        --strong: #f3f1ec;
+        --dim: #8a8478;
+        --hover: #1c1a18;
+        --sel: #262320;
+        --line: #262320;
+        --line2: #332f2a;
+        --btn: #b8b3a9;
+        --btn-hover: #f3f1ec;
+        --btn-line-h: #454039;
+        --input-bg: #1c1a18;
+        --arrow: #6e695f;
+        --arrow-h: #b8b3a9;
+        --fico: #6e695f;
+        --sep: #454039;
+        --ok: #7fd6a4;
+        --err: #ff9b9b;
+        --t-blue-bg: #1e2a3d;
+        --t-blue-fg: #9fd0ff;
+        --t-green-bg: #16301f;
+        --t-green-fg: #7fd6a4;
+        --t-red-bg: #3d1e1e;
+        --t-red-fg: #ff9b9b;
+        --t-yellow-bg: #3a3417;
+        --t-yellow-fg: #e8d47f;
+        --t-gray-bg: #332f2a;
+        --t-gray-fg: #b8b3a9;
+      }
+            /* 跟随主界面：滑杆颜色随主题切（真机实测深色白滑杆） */
+      body.light {
+        scrollbar-color: var(--line2, #b3bac4) transparent;
+        color-scheme: light;
+        --bg: #f6f7f9;
+        --fg: #1f2328;
+        --strong: #0d1117;
+        --dim: #626b78;
+        --hover: #e9eaee;
+        --sel: #dfe2e8;
+        --line: #e2e4e8;
+        --line2: #d3d6dc;
+        --btn: #4a5260;
+        --btn-hover: #0d1117;
+        --btn-line-h: #b3bac4;
+        --input-bg: #ffffff;
+        --arrow: #8b93a1;
+        --arrow-h: #4a5260;
+        --fico: #9aa1ac;
+        --sep: #9aa1ac;
+        --ok: #1a7f37;
+        --err: #cf222e;
+        --t-blue-bg: #dde9ff;
+        --t-blue-fg: #0b62d0;
+        --t-green-bg: #dcf3e5;
+        --t-green-fg: #1a7f37;
+        --t-red-bg: #ffe1e1;
+        --t-red-fg: #cf222e;
+        --t-yellow-bg: #fff3c4;
+        --t-yellow-fg: #9a6700;
+        --t-gray-bg: #e8eaee;
+        --t-gray-fg: #4a5260;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        display: flex;
+        flex-direction: column;
+        height: 100vh;
+        font: 13px/1.6 "Segoe UI", "Microsoft YaHei", sans-serif;
+        background: var(--bg);
+        color: var(--fg);
+      }
+      .head {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 10px 12px 6px;
+      }
+      .head b {
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--strong);
+        flex: none;
+      }
+      .head .flex {
+        flex: 1;
+      }
+      button {
+        padding: 5px 12px;
+        border-radius: 7px;
+        border: 1px solid var(--line2);
+        background: transparent;
+        color: var(--btn);
+        font-size: 12px;
+        cursor: pointer;
+        flex: none;
+      }
+      button:hover {
+        color: var(--btn-hover);
+        border-color: var(--btn-line-h);
+      }
+      /* 路径面包屑：字号加大、每段可点（点到哪，浏览根就到哪里） */
+      .crumb {
+        display: flex;
+        align-items: center;
+        flex-wrap: nowrap;
+        overflow-x: auto;
+        scrollbar-width: none;
+        gap: 2px;
+        padding: 2px 12px 8px;
+        font-size: 13px;
+      }
+      .crumb::-webkit-scrollbar {
+        display: none;
+      }
+      .crumb button {
+        border: none;
+        background: transparent;
+        padding: 1px 4px;
+        border-radius: 5px;
+        color: var(--dim);
+        font-size: 13px;
+        white-space: nowrap;
+      }
+      .crumb button:hover {
+        color: var(--strong);
+        background: var(--hover);
+      }
+      .crumb button.cur {
+        color: var(--strong);
+        font-weight: 600;
+      }
+      .crumb .sep {
+        color: var(--sep);
+        flex: none;
+      }
+      .toolbar {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        padding: 0 12px 8px;
+        border-bottom: 1px solid var(--line);
+      }
+      input {
+        flex: 1;
+        min-width: 0;
+        padding: 5px 9px;
+        border-radius: 7px;
+        border: 1px solid var(--line2);
+        background: var(--input-bg);
+        color: var(--fg);
+        font-size: 12px;
+      }
+      .count {
+        flex: none;
+        font-size: 12px;
+        color: var(--dim);
+        font-variant-numeric: tabular-nums;
+      }
+      .list {
+        flex: 1;
+        min-height: 120px;
+        overflow-y: auto;
+        padding: 6px;
+      }
+      /* 经典树：文件夹一行（箭头可转），文件一行；单击只选中，双击才预览 */
+      .row {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 3px 8px;
+        border-radius: 6px;
+        cursor: default;
+        user-select: none;
+        white-space: nowrap;
+      }
+      .row:hover {
+        background: var(--hover);
+      }
+      .row.sel {
+        background: var(--sel);
+      }
+      .row .arw {
+        flex: none;
+        width: 12px;
+        height: 12px;
+        color: var(--arrow);
+        transition: transform 0.12s;
+      }
+      .row.open .arw {
+        transform: rotate(90deg);
+        color: var(--btn);
+      }
+      .row .fico {
+        flex: none;
+        width: 13px;
+        height: 13px;
+        color: var(--fico);
+      }
+      .row .nm {
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .row.dir .nm {
+        color: var(--fg);
+      }
+      .row.file .nm {
+        color: var(--btn);
+      }
+      .row.loading .nm::after {
+        content: ' …';
+        color: var(--dim);
+      }
+      .row .dim {
+        color: var(--arrow);
+      }
+      .status {
+        flex: none;
+        min-height: 24px;
+        padding: 4px 12px;
+        font-size: 12px;
+        color: var(--ok);
+        border-top: 1px solid var(--line);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .status.err {
+        color: var(--err);
+      }
+      .empty {
+        padding: 24px 12px;
+        text-align: center;
+        color: var(--dim);
+        font-size: 12px;
+      }
+      .menu {
+        position: fixed;
+        z-index: 10;
+        min-width: 160px;
+        background: var(--hover);
+        border: 1px solid var(--line2);
+        border-radius: 8px;
+        padding: 4px;
+        box-shadow: 0 8px 24px rgb(0 0 0 / 32%);
+      }
+      .menu.hidden {
+        display: none;
+      }
+      .menu button {
+        display: block;
+        width: 100%;
+        text-align: left;
+        border: none;
+        background: transparent;
+        padding: 6px 10px;
+        border-radius: 6px;
+        font-size: 12px;
+        color: var(--fg);
+      }
+      .menu button:hover {
+        background: var(--sel);
+        color: var(--btn-hover);
+      }
+      .menu .sep {
+        height: 1px;
+        margin: 4px 6px;
+        background: var(--line2);
+      }
+    </style>
+  </head>
+  <body>
+    <!--
+      「项目文件」= 工作区文件树（2026-10-01 用户第三轮反馈后重做）：
+      文件夹折叠成一行、箭头点了转方向才展开（按需拉一层，不整树铺开）；
+      顶部路径面包屑可点（点到哪，浏览根到哪）；单击只选中、**双击**才在新标签页预览；
+      右键复制路径/文件名/绝对路径。数据一律走 postMessage 白名单
+      （workspace.info / workspace.dir / workspace.files / preview.open / clipboard.write / composer.insert）。
+    -->
+    <div class="head">
+      <b>项目文件</b>
+      <span class="flex"></span>
+      <button id="refresh" title="重新加载">↻</button>
+    </div>
+    <div class="crumb" id="crumb"></div>
+    <div class="toolbar">
+      <input id="filter" placeholder="过滤文件路径…" />
+      <span class="count" id="count"></span>
+    </div>
+    <div id="list" class="list"><div class="empty">加载中…</div></div>
+    <div id="status" class="status"></div>
+    <div id="menu" class="menu hidden"></div>
+
+    <script>
+      const pending = new Map();
+      let seq = 0;
+      let booted = false; // 主题切换会重发 init：换肤照做，boot 只跑一次（别把浏览状态冲掉）
+      let wsPath = '';
+      let root = ''; // 当前浏览根（工作区相对路径，'' = 工作区根）
+      let expanded = new Set(); // 展开的目录（相对路径）
+      let childCache = new Map(); // 目录 → { dirs, files, truncated }
+      let flat = []; // workspace.files 的平铺清单（过滤用）
+      let filtering = false;
+      let selection = '';
+
+      function call(method, params) {
+        return new Promise((resolve, reject) => {
+          const id = ++seq;
+          pending.set(id, { resolve, reject });
+          parent.postMessage({ type: 'pawch:request', id, method, params }, '*');
+          setTimeout(() => {
+            if (pending.has(id)) {
+              pending.delete(id);
+              reject(new Error('宿主未响应（超时）'));
+            }
+          }, 8000);
+        });
+      }
+      window.addEventListener('message', (ev) => {
+        const d = ev.data || {};
+        // pawch:init = 宿主已登记本 frame：此刻起桥调用才会被受理，初始拉数据挂这里
+        if (d.type === 'pawch:init') {
+          // 主题跟随宿主（init 里带已解析的 theme；宿主切主题会重发 init）
+          document.body.classList.toggle('light', ((d.payload || {}).theme) === 'light');
+          if (!booted) { booted = true; loadAll(); }
+          return;
+        }
+        if (d.type === 'pawch:response' && pending.has(d.id)) {
+          const p = pending.get(d.id);
+          pending.delete(d.id);
+          d.ok ? p.resolve(d.result) : p.reject(new Error(String(d.result)));
+          return;
+        }
+        // 宿主切工作区：树/平铺清单/当前浏览根全是旧工作区范围，必须重拉；
+        // 旧选中文件也一并清掉，避免预览一个已不属于当前项目的路径。
+        if (d.type === 'pawch:event' && d.event === 'workspace' && booted) {
+          selection = '';
+          loadAll();
+        }
+      });
+
+      function status(msg, isErr) {
+        const el = document.getElementById('status');
+        el.textContent = msg || '';
+        el.className = 'status' + (isErr ? ' err' : '');
+      }
+      function esc(s) {
+        return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+      }
+      function absPath(rel) {
+        // 多文件夹项目（2026-11-04）：额外根里的文件本身就是绝对路径，原样返回
+        if (/^[a-zA-Z]:[\\/]/.test(String(rel)) || String(rel).startsWith('\\\\')) return rel;
+        if (!wsPath) return rel;
+        const sep = wsPath.includes('\\') ? '\\' : '/';
+        return wsPath.replace(/[\\/]+$/, '') + sep + String(rel).replace(/\//g, sep);
+      }
+      function nameOf(rel) {
+        const i = String(rel).lastIndexOf('/');
+        return i < 0 ? rel : String(rel).slice(i + 1);
+      }
+      const ARROW = '<svg class="arw" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg>';
+      const FILE_ICO = '<svg class="fico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3.5h6.5L18 8v12.5H7z"/><path d="M13.5 3.5V8H18"/></svg>';
+
+      // —— 面包屑：完整绝对路径的每一段都可点（路径大一点、可点、点到哪到哪）——
+      // 选中文件时**跟着选中项走**：显示 工作区… › 该文件所在文件夹 › 文件名（真机实测：
+      // 选中文件上面这行路径应该变到对应文件夹）；没选中就显示当前浏览根。
+      // 文件夹段点了切浏览根（清选中）；文件名段点了在新标签页预览。
+      // 工作区外的段服务端不能列（只列工作区内目录）→ 点了回工作区根并说明——点哪都有反应。
+      function renderCrumb() {
+        const el = document.getElementById('crumb');
+        const sep = wsPath.includes('\\') ? '\\' : '/';
+        const wsNorm = String(wsPath || '').replace(/[\\/]+$/, '');
+        const wsParts = wsNorm.split(/[\\/]+/).filter(Boolean);
+        const isFile = !!selection;
+        // 多文件夹项目（2026-11-04）：浏览额外根时 focus 是绝对路径——整段展示不逐段可点
+        //（逐段拼相对路径对绝对路径无意义），点工作区根按钮返回
+        const focusRaw = String(selection || root || '');
+        const isAbsFocus = /^[a-zA-Z]:[\\/]/.test(focusRaw) || focusRaw.startsWith('\\\\');
+        const focusParts = !isAbsFocus && (selection || root) ? focusRaw.split('/').filter(Boolean) : [];
+        const folderParts = isFile && !isAbsFocus ? focusParts.slice(0, -1) : focusParts;
+        const fileName = isFile ? (isAbsFocus ? focusRaw.split(/[\\/]+/).filter(Boolean).pop() : focusParts[focusParts.length - 1]) : '';
+        let html = '';
+        wsParts.forEach((seg, i) => {
+          if (i > 0) html += '<span class="sep">›</span>';
+          const isCur = i === wsParts.length - 1 && !folderParts.length && !isFile && !isAbsFocus;
+          html += `<button data-ws="${i}" class="${isCur ? 'cur' : ''}" title="${esc(wsParts.slice(0, i + 1).join(sep))}">${esc(seg)}</button>`;
+        });
+        if (isAbsFocus) {
+          html += `<span class="sep">›</span><span class="cur" title="${esc(focusRaw)}">${esc(isFile ? fileName : focusRaw)}</span>`;
+        }
+        folderParts.forEach((seg, i) => {
+          const rel = folderParts.slice(0, i + 1).join('/');
+          const isCur = !isFile && i === folderParts.length - 1;
+          html += `<span class="sep">›</span><button data-rel="${esc(rel)}" class="${isCur ? 'cur' : ''}">${esc(seg)}</button>`;
+        });
+        if (isFile && !isAbsFocus) {
+          html += `<span class="sep">›</span><button data-file="${esc(selection)}" class="cur" title="在新标签页预览">${esc(fileName)}</button>`;
+        }
+        el.innerHTML = html;
+        el.querySelectorAll('button').forEach((b) => {
+          b.onclick = () => {
+            if (b.dataset.file !== undefined) {
+              openPreview(b.dataset.file);
+              return;
+            }
+            if (b.dataset.ws !== undefined) {
+              const idx = Number(b.dataset.ws);
+              if (idx === wsParts.length - 1) {
+                root = '';
+                status('');
+              } else {
+                root = '';
+                status(`「${b.textContent}」在工作区外，只能浏览工作区内的目录——已回到工作区根`, true);
+              }
+            } else {
+              root = b.dataset.rel || '';
+              status('');
+            }
+            selection = '';
+            render();
+          };
+        });
+        el.scrollLeft = el.scrollWidth; // 路径长了先把右端（当前目录）滚进视野
+      }
+
+      // —— 树渲染：文件夹一行，展开才往下画一层 ——
+      function rowsHtml(rel, depth) {
+        const c = childCache.get(rel);
+        const pad = 6 + depth * 14;
+        if (c === 'loading') return `<div class="row loading" style="padding-left:${pad}px">${ARROW}<span class="nm dim">加载中</span></div>`;
+        if (!c) return '';
+        let html = '';
+        // 多文件夹项目（2026-11-04）：额外根在最顶层排在主目录内容前面（多根树，同 VS Code/ZCode）。
+        // path 是绝对路径，展开/进入都直接拿它当 path 查 workspace.dir，子层拼接自然延续绝对路径。
+        if (rel === '') {
+          for (const er of c.extra_roots || []) {
+            const open = expanded.has(er.path);
+            html += `<div class="row dir${open ? ' open' : ''}" data-d="${esc(er.path)}" style="padding-left:${pad}px" title="${esc(er.path)}">${ARROW}<span class="nm">${esc(er.name)}</span><span class="dim">（额外文件夹）</span></div>`;
+            if (open) html += rowsHtml(er.path, depth + 1);
+          }
+        }
+        for (const d of c.dirs) {
+          const drel = rel ? rel + '/' + d : d;
+          const open = expanded.has(drel);
+          html += `<div class="row dir${open ? ' open' : ''}" data-d="${esc(drel)}" style="padding-left:${pad}px" title="${esc(drel)}">${ARROW}<span class="nm">${esc(d)}</span></div>`;
+          if (open) html += rowsHtml(drel, depth + 1);
+        }
+        for (const f of c.files) {
+          const frel = rel ? rel + '/' + f : f;
+          html += `<div class="row file${frel === selection ? ' sel' : ''}" data-f="${esc(frel)}" style="padding-left:${pad}px" title="${esc(absPath(frel))}">${FILE_ICO}<span class="nm">${esc(f)}</span></div>`;
+        }
+        return html;
+      }
+
+      function render() {
+        const list = document.getElementById('list');
+        renderCrumb();
+        const q = document.getElementById('filter').value.trim().toLowerCase();
+        filtering = !!q;
+        if (filtering) {
+          // 过滤态：平铺匹配（树只画了展开过的层，过滤要能搜整个工作区）
+          const shown = flat.filter((f) => f.toLowerCase().includes(q));
+          document.getElementById('count').textContent = `${shown.length} / ${flat.length}`;
+          if (!shown.length) {
+            list.innerHTML = '<div class="empty">没有匹配的文件</div>';
+            return;
+          }
+          list.innerHTML = shown
+            .map((f) => {
+              const i = f.lastIndexOf('/');
+              const dir = i < 0 ? '' : f.slice(0, i + 1);
+              const nm = i < 0 ? f : f.slice(i + 1);
+              return `<div class="row file${f === selection ? ' sel' : ''}" data-f="${esc(f)}" title="${esc(absPath(f))}">${FILE_ICO}<span class="nm"><span class="dim">${esc(dir)}</span>${esc(nm)}</span></div>`;
+            })
+            .join('');
+          bindRows();
+          return;
+        }
+        const c = childCache.get(root);
+        if (c && c !== 'loading') {
+          document.getElementById('count').textContent = `${c.dirs.length + c.files.length} 项`;
+        } else if (c === 'loading') {
+          document.getElementById('count').textContent = '…';
+        }
+        if (!childCache.has(root)) {
+          list.innerHTML = '<div class="empty">加载中…</div>';
+          return;
+        }
+        const html = rowsHtml(root, 0);
+        list.innerHTML = html || '<div class="empty">这个文件夹是空的</div>';
+        bindRows();
+      }
+
+      function bindRows() {
+        document.querySelectorAll('.row').forEach((el) => {
+          if (el.dataset.d) {
+            // 文件夹：单击展开/收起（箭头跟着转向）；双击进入（设为浏览根，面包屑随之前进）
+            el.onclick = () => {
+              selection = ''; // 焦点回到文件夹：路径栏显示浏览根
+              toggleDir(el.dataset.d);
+            };
+            el.ondblclick = () => {
+              selection = '';
+              root = el.dataset.d;
+              expanded.delete(root);
+              render();
+            };
+          } else if (el.dataset.f) {
+            // 文件：单击只选中（路径栏跟着变到该文件的文件夹），双击才预览（用户 2026-10-01 要求）
+            el.onclick = () => {
+              selection = el.dataset.f;
+              render();
+            };
+            el.ondblclick = () => openPreview(el.dataset.f);
+            el.oncontextmenu = (ev) => {
+              ev.preventDefault();
+              selection = el.dataset.f;
+              render();
+              openMenu(ev, el.dataset.f);
+            };
+          }
+        });
+      }
+
+      async function listDir(rel) {
+        childCache.set(rel, 'loading');
+        render();
+        try {
+          const r = await call('workspace.dir', { path: rel });
+          childCache.set(rel, { dirs: (r && r.dirs) || [], files: (r && r.files) || [], extra_roots: (r && r.extra_roots) || [], truncated: !!(r && r.truncated) });
+          if (r && r.truncated) status('条目较多，只列了每个类型的前 500 个', true);
+        } catch (e) {
+          childCache.delete(rel);
+          status('读取目录失败: ' + (e.message || e), true);
+        }
+        render();
+      }
+      function toggleDir(rel) {
+        if (expanded.has(rel)) {
+          expanded.delete(rel);
+          render();
+          return;
+        }
+        expanded.add(rel);
+        if (!childCache.has(rel)) {
+          listDir(rel);
+          return;
+        }
+        render();
+      }
+
+      // 双击 = 在右侧边栏新标签页预览（宿主执行；本页不弹提示）
+      async function openPreview(f) {
+        selection = f;
+        try {
+          await call('preview.open', { path: f });
+          status('');
+        } catch (e) {
+          status('打开失败: ' + (e.message || e), true);
+        }
+      }
+
+      const menu = document.getElementById('menu');
+      function openMenu(ev, f) {
+        const items = [
+          ['在新标签页预览', () => openPreview(f)],
+          ['sep'],
+          ['复制相对路径', () => copy(f, '相对路径')],
+          ['复制绝对路径', () => copy(absPath(f), '绝对路径')],
+          ['复制文件名', () => copy(nameOf(f), '文件名')],
+          ['sep'],
+          ['插入到输入框', () => insert(f)],
+        ];
+        menu.innerHTML = items
+          .map(([label, fn]) => (label === 'sep' ? '<div class="sep"></div>' : `<button data-a="${esc(label)}">${esc(label)}</button>`))
+          .join('');
+        menu.querySelectorAll('button').forEach((b, bi) => {
+          // querySelectorAll 只返回按钮（不含分隔线），与过滤掉 sep 的 items 同序；
+          // 取 [1] 才是处理函数——整个数组元素是 [label, fn]
+          const fn = items.filter((x) => x[0] !== 'sep')[bi][1];
+          b.onclick = () => {
+            menu.classList.add('hidden');
+            fn();
+          };
+        });
+        menu.classList.remove('hidden');
+        const w = menu.offsetWidth;
+        const h = menu.offsetHeight;
+        menu.style.left = Math.max(4, Math.min(ev.clientX, window.innerWidth - w - 4)) + 'px';
+        menu.style.top = Math.max(4, Math.min(ev.clientY, window.innerHeight - h - 4)) + 'px';
+      }
+      function closeMenu() {
+        menu.classList.add('hidden');
+      }
+      document.addEventListener('click', closeMenu);
+      document.addEventListener('scroll', closeMenu, true);
+      document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') closeMenu();
+      });
+
+      async function copy(text, what) {
+        try {
+          await call('clipboard.write', { text });
+          // 用户 2026-10-02：任何操作都不弹成功提示（错误照旧报），别在面板上刷「已复制…」
+          status('');
+        } catch (e) {
+          status('复制失败: ' + (e.message || e), true);
+        }
+      }
+      // 插入输入框：不弹提示——输入框本身可见，无需再报一遍
+      async function insert(f) {
+        try {
+          await call('composer.insert', { text: '@' + f + ' ' });
+        } catch (e) {
+          status('插入失败: ' + (e.message || e), true);
+        }
+      }
+
+      document.getElementById('filter').oninput = () => render();
+
+      async function loadAll() {
+        status('');
+        try {
+          const w = await call('workspace.info');
+          wsPath = (w && w.current) || '';
+        } catch {
+          wsPath = '';
+        }
+        // 平铺清单只给过滤用（树是懒加载的）
+        call('workspace.files')
+          .then((r) => {
+            flat = (r && r.files) || [];
+            if (filtering) render();
+          })
+          .catch(() => {});
+        expanded = new Set();
+        childCache = new Map();
+        root = '';
+        render();
+        listDir('');
+      }
+      document.getElementById('refresh').onclick = () => {
+        loadAll();
+      };
+
+      // 握手：宿主会回 pawch:init，收到再拉数据（未登记时桥调用会被丢弃）
+      parent.postMessage({ type: 'pawch:hello' }, '*');
+    </script>
+  <script>
+/* 微调桥（2026-11-03 协议扩展）：宿主微调模式下本面板支持右击选元素、接收下发 CSS。
+   宿主→插件 {type:'pawch:micro', op:'enter'(listen)/'exit'/'apply'(css)}；
+   插件→宿主 {type:'pawch:micro-ack'} 与 {type:'pawch:micro-pick', pick:{sel,label,styles,x,y}}。
+   旧宿主不认识这些消息也不受影响；本段独立成块，不影响插件自身脚本。 */
+(function () {
+  var listening = false;
+  function ensureStyle(id) {
+    var el = document.getElementById(id);
+    if (!el) {
+      el = document.createElement('style');
+      el.id = id;
+      (document.head || document.documentElement).appendChild(el);
+    }
+    return el;
+  }
+  function onContext(e) {
+    if (!listening) return;
+    e.preventDefault();
+    e.stopPropagation();
+    var t = e.target;
+    if (t && t.nodeType !== 1 && t.parentElement) t = t.parentElement;
+    if (!t || !t.closest) return;
+    var btn = t.closest('button');
+    if (btn && t.closest('svg')) t = btn;
+    var SKIP = /^(active|on|sel|open|hover|running|ok|fail|err|hidden|light|dark|empty|more|dim|warn|danger|primary|ghost|flat|row)$/;
+    function esc(s) { return window.CSS && CSS.escape ? CSS.escape(s) : s; }
+    function classesOf(el) {
+      return (typeof el.className === 'string' ? el.className : (el.getAttribute && el.getAttribute('class')) || '')
+        .split(/\s+/).filter(function (c) { return c && !SKIP.test(c) && !/^s-[A-Za-z0-9_-]+$/.test(c) && !/^svelte-[A-Za-z0-9_-]+$/.test(c); });
+    }
+    // 选择器必须命中「被点的这个元素」：自身 id > 自身类名 > 最近有 id/类名的祖先 + 到目标的子路径。
+    // 旧实现拿最近的「有类名的祖先」当选择器（点 #filter 得到 .toolbar），规则永远改不到目标。
+    function selectorFor(el) {
+      if (el.id) return '#' + esc(el.id);
+      var own = classesOf(el);
+      if (own.length) return '.' + own.map(esc).join('.');
+      var tail = [], cur = el;
+      while (cur && cur !== document.body) {
+        var parent = cur.parentElement;
+        if (!parent) break;
+        var sibs = Array.prototype.filter.call(parent.children, function (x) { return x.tagName === cur.tagName; });
+        var seg = cur.tagName.toLowerCase();
+        if (sibs.length > 1) seg += ':nth-of-type(' + (sibs.indexOf(cur) + 1) + ')';
+        tail.unshift(seg);
+        if (parent.id) return '#' + esc(parent.id) + ' > ' + tail.join(' > ');
+        var pcls = classesOf(parent);
+        if (pcls.length) return '.' + pcls.map(esc).join('.') + ' > ' + tail.join(' > ');
+        cur = parent;
+      }
+      return tail.join(' > ') || el.tagName.toLowerCase();
+    }
+    var sel = selectorFor(t);
+    var labelCls = classesOf(t);
+    var label = labelCls.filter(function (c) { return c.indexOf('-') >= 0; })[0] || labelCls[0] || (t.id ? '#' + t.id : t.tagName.toLowerCase());
+    var cs = getComputedStyle(t);
+    function alphaOf(c) {
+      var m = String(c || '').match(/rgba?\(([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:[,\s/]+([\d.]+))?\)/);
+      if (!m) return /^transparent$/i.test(String(c || '').trim()) ? 0 : 1;
+      return m[4] === undefined ? 1 : parseFloat(m[4]);
+    }
+    function stylesOf(el) {
+      var s = getComputedStyle(el);
+      var b = String(s.backdropFilter || '').match(/blur\(([\d.]+)px\)/);
+      return {
+        color: s.color, bg: s.backgroundColor,
+        radius: parseFloat(s.borderTopLeftRadius) || 0,
+        border: parseFloat(s.borderTopWidth) || 0,
+        borderColor: s.borderTopColor,
+        blur: b ? parseFloat(b[1]) : 0,
+        fontSize: parseFloat(s.fontSize) || 14
+      };
+    }
+    // 背景替身：本身透明时找真正画底色的祖先（深色面板的底常是 body/根容器画的），
+    // 一并上报让宿主面板给「改上级」入口——否则改内层元素背景等于改一块透明玻璃
+    var bgHost = null;
+    if (alphaOf(cs.backgroundColor) <= 0.05) {
+      var host = t.parentElement;
+      while (host) {
+        var hs = getComputedStyle(host);
+        if (alphaOf(hs.backgroundColor) > 0.05) {
+          var hcls = classesOf(host);
+          bgHost = {
+            sel: selectorFor(host),
+            label: hcls.filter(function (c) { return c.indexOf('-') >= 0; })[0] || hcls[0] || (host.id ? '#' + host.id : host.tagName.toLowerCase()),
+            styles: stylesOf(host)
+          };
+          break;
+        }
+        host = host.parentElement;
+      }
+    }
+    parent.postMessage({ type: 'pawch:micro-pick', pick: {
+      sel: sel, label: label || sel,
+      styles: stylesOf(t),
+      bgHost: bgHost,
+      root: { sel: 'body', label: '面板底色（body）', styles: stylesOf(document.body) },
+      x: e.clientX, y: e.clientY
+    } }, '*');
+  }
+  window.addEventListener('message', function (ev) {
+    var d = ev.data || {};
+    if (d.type !== 'pawch:micro' && d.type !== 'agent:micro') return;
+    if (d.op === 'enter') {
+      listening = !!d.listen;
+      document.removeEventListener('contextmenu', onContext, true);
+      if (listening) {
+        document.addEventListener('contextmenu', onContext, true);
+        ensureStyle('pawch-micro-hover').textContent = '*:hover { outline: 1px dashed rgba(186,138,120,.55); outline-offset: -1px; }';
+      } else {
+        var hs = document.getElementById('pawch-micro-hover');
+        if (hs) hs.remove();
+      }
+      parent.postMessage({ type: 'pawch:micro-ack' }, '*');
+    } else if (d.op === 'exit') {
+      listening = false;
+      document.removeEventListener('contextmenu', onContext, true);
+      var h2 = document.getElementById('pawch-micro-hover');
+      if (h2) h2.remove();
+    } else if (d.op === 'apply') {
+      ensureStyle('pawch-micro').textContent = String(d.css || '');
+    }
+  });
+})();
+</script>
+</body>
+</html>

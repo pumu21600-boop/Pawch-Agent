@@ -1,0 +1,626 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>用量价格</title>
+<style>
+  /* 主题变量：浅色靠 body.light 整体切换（主题类切在 body 自己身上） */
+  :root { scrollbar-color: var(--line2, #454039) transparent; color-scheme: dark; }
+  body {
+    --bg: #151412; --fg: #f3f1ec; --dim: #8a8478; --line: #332f2a; --line2: #454039;
+    --card: #1c1a18; --input-bg: #1c1a18; --hover: #262320; --on: #332f2a;
+    --link: #6ea8fe; --ok: #4bb543; --err: #e5534b; --warn: #e8a33d;
+    color-scheme: dark;
+  }
+  body.light {
+    scrollbar-color: var(--line2, #b3bac4) transparent;
+    --bg: #ffffff; --fg: #1a1a1c; --dim: #6b6b74; --line: #e4e4e8; --line2: #d4d4da;
+    --card: #fafafa; --input-bg: #ffffff; --hover: #f2f2f5; --on: #ededf2;
+    --link: #0b62d0; --ok: #1a7f37; --err: #cf222e; --warn: #b25e09;
+    color-scheme: light;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 14px 16px 24px;
+    font: 13px/1.6 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    background: var(--bg); color: var(--fg);
+  }
+  h3 { margin: 0 0 10px; font-size: 14px; font-weight: 650; }
+  .dim { color: var(--dim); font-size: 12px; font-weight: 400; }
+  /* 用量 | 占比圆环 | 价格：窄面板落成上下三段，圆环永远夹在两块中间 */
+  .grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; align-items: start; }
+  @media (min-width: 960px) { .grid { grid-template-columns: minmax(300px, 1fr) 300px minmax(320px, 1fr); } }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+  .row { display: flex; justify-content: space-between; gap: 10px; padding: 4px 0; }
+  .row .k { color: var(--dim); }
+  .row .v { font-variant-numeric: tabular-nums; text-align: right; }
+  .big { font-size: 18px; font-weight: 680; font-variant-numeric: tabular-nums; }
+  .empty { color: var(--dim); font-size: 12px; padding: 16px 0; text-align: center; }
+  .bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+  .seg { display: inline-flex; border: 1px solid var(--line2); border-radius: 7px; overflow: hidden; }
+  .seg button { border: 0; border-radius: 0; padding: 4px 12px; }
+  .seg button.on { background: var(--on); font-weight: 650; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { padding: 5px 6px; border-bottom: 1px solid var(--line); text-align: right; }
+  th { color: var(--dim); font-weight: 600; white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  input {
+    font: inherit; font-size: 12px; width: 100%; padding: 4px 6px;
+    border: 1px solid var(--line2); border-radius: 5px; background: var(--input-bg); color: var(--fg);
+  }
+  input[type=number] { font-variant-numeric: tabular-nums; }
+  button {
+    font: inherit; padding: 5px 12px; border-radius: 6px; cursor: pointer;
+    border: 1px solid var(--line2); background: transparent; color: var(--fg);
+  }
+  button:hover { background: var(--hover); }
+  .primary { background: var(--on); font-weight: 650; }
+  .foot { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--line); display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .msg { font-size: 12px; }
+  .foot .life { font-size: 12px; color: var(--dim); margin-left: auto; font-variant-numeric: tabular-nums; }
+  .ok { color: var(--ok); }
+  .err { color: var(--err); }
+  a { color: var(--link); cursor: pointer; text-decoration: none; }
+
+  /* 各模型占比圆环（中间那块）：费用 / Token 两种口径，占比两位小数 */
+  .ring-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
+  .ring-title { font-size: 13px; font-weight: 650; }
+  .ring-body { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; justify-content: center; }
+  .donut-box { position: relative; width: 156px; height: 156px; flex: none; }
+  .donut { width: 156px; height: 156px; transform: rotate(-90deg); }
+  .donut circle { fill: none; stroke-width: 15; }
+  .donut .track { stroke: var(--line); }
+  .donut .slice { transition: stroke-dasharray 0.25s, stroke-dashoffset 0.25s; }
+  .donut-center {
+    position: absolute; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 1px; pointer-events: none;
+  }
+  .donut-center .dc-v { font-size: 12.5px; font-weight: 680; font-variant-numeric: tabular-nums; }
+  .donut-center .dc-k { font-size: 11px; color: var(--dim); }
+  .legend { flex: 1 1 170px; min-width: 0; max-height: 206px; overflow: auto; }
+  .lg-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 12px; }
+  .lg-dot { width: 8px; height: 8px; border-radius: 2px; flex: none; }
+  .lg-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .lg-pct { font-variant-numeric: tabular-nums; font-weight: 650; }
+  .lg-val { color: var(--dim); font-variant-numeric: tabular-nums; min-width: 62px; text-align: right; }
+
+  /* 渠道 · 模型 合并选择器（对齐主界面的分组下拉：文字在左、箭头在右、当前项标「· 当前」） */
+  .picker {
+    display: flex; align-items: center; justify-content: space-between; gap: 6px;
+    width: 100%; padding: 4px 8px; border-radius: 6px; font-size: 12px; text-align: left;
+    white-space: nowrap; overflow: hidden;
+  }
+  .picker .pk-label { overflow: hidden; text-overflow: ellipsis; }
+  .picker .pk-caret { width: 12px; height: 12px; flex: none; color: var(--dim); }
+  .pk-menu {
+    position: fixed; z-index: 99999; min-width: 200px; max-width: 320px; max-height: 320px; overflow-y: auto;
+    background: var(--card); border: 1px solid var(--line2); border-radius: 9px; padding: 4px;
+    box-shadow: 0 10px 26px rgb(0 0 0 / 45%);
+    /* 面板是 iframe：滚到尽头别把滚动接力给外层，滚动条常显免得用户以为只有这几项 */
+    overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: var(--line2) transparent;
+  }
+  .pk-menu::-webkit-scrollbar { width: 8px; }
+  .pk-menu::-webkit-scrollbar-thumb { background: var(--line2); border-radius: 4px; }
+  .pk-menu::-webkit-scrollbar-track { background: transparent; }
+  .pk-menu .pk-group {
+    display: flex; align-items: center; justify-content: space-between; gap: 6px;
+    width: 100%; border: 0; background: transparent; text-align: left;
+    padding: 6px 8px; border-radius: 6px; font-size: 12px; font-weight: 650; color: var(--dim);
+  }
+  .pk-menu .pk-group:hover { background: var(--hover); color: var(--fg); }
+  .pk-menu .pk-group.cur { color: var(--fg); }
+  .pk-menu .pk-group svg { width: 12px; height: 12px; flex: none; transition: transform 0.15s; }
+  .pk-menu .pk-group.open svg { transform: rotate(90deg); }
+  .pk-menu .pk-item { display: block; width: 100%; border: 0; background: transparent; text-align: left; padding: 5px 8px 5px 22px; border-radius: 6px; font-size: 12px; }
+  .pk-menu .pk-item:hover { background: var(--hover); }
+  .pk-menu .pk-item.on { color: var(--warn, #e8a33d); font-weight: 650; }
+  .pk-menu .pk-sep { height: 1px; background: var(--line); margin: 4px 2px; }
+  .pk-menu .pk-manual { display: flex; gap: 6px; padding: 4px; }
+  .pk-menu .pk-manual input { flex: 1; }
+</style>
+</head>
+<body>
+  <h3>用量价格</h3>
+
+  <div class="grid">
+    <section class="card">
+      <div id="usageBody"><div class="empty">读取中…</div></div>
+    </section>
+
+    <section class="card">
+      <div class="ring-head">
+        <span class="ring-title">各模型占比</span>
+        <span class="seg"><button id="ringCost" class="on">费用</button><button id="ringTok">Token</button></span>
+      </div>
+      <div class="ring-body">
+        <div class="donut-box">
+          <svg class="donut" viewBox="0 0 120 120" aria-hidden="true">
+            <circle class="track" cx="60" cy="60" r="46"></circle>
+            <g id="slices"></g>
+          </svg>
+          <div class="donut-center">
+            <div class="dc-v" id="ringTotal">—</div>
+            <div class="dc-k">全部对话</div>
+          </div>
+        </div>
+        <div class="legend" id="ringLegend"><div class="empty">读取中…</div></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="bar">
+        <span class="dim">价格单位：元 / 百万 token</span>
+        <span style="flex:1"></span>
+        <button onclick="addRow()">+ 添加一行</button>
+      </div>
+      <table>
+        <thead>
+          <tr><th>渠道 · 模型</th><th>输入</th><th>缓存输入</th><th>输出</th><th></th></tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <div class="foot">
+        <button class="primary" onclick="save()">保存</button>
+        <span class="msg" id="msg"></span>
+        <span class="life" id="life"></span>
+      </div>
+    </section>
+  </div>
+
+<script>
+// —— 插件契约 v1：等宿主 pawch:init 再发请求；pawch:request/response 按 id 配对 ——
+let seq = 0;
+const pending = new Map();
+let channels = [];
+let rows = [];
+let booted = false;
+let pickerRow = -1;
+let lifetimeUsd = 0;   // 全量台账累计（价格表卡的持久展示，重算后同步）
+let ledgerRows = 0;    // 全量台账条数
+
+window.addEventListener('message', (ev) => {
+  const d = ev.data || {};
+  if (d.type === 'pawch:init') {
+    // 主题跟着宿主；boot 只跑一次——重复 init 再 load 会叠加轮询、还会冲掉没保存的新行
+    document.body.classList.toggle('light', ((d.payload || {}).theme) === 'light');
+    if (!booted) { booted = true; boot(); }
+  }
+  if (d.type === 'pawch:response') {
+    const r = pending.get(d.id);
+    if (!r) return;
+    pending.delete(d.id);
+    d.ok ? r.res(d.result) : r.rej(new Error(String(d.result || '请求失败')));
+  }
+});
+document.addEventListener('mousedown', (e) => {
+  const menu = document.getElementById('__pk');
+  if (!menu) return;
+  if (menu.contains(e.target) || (e.target.closest && e.target.closest('.picker'))) return;
+  closePicker();
+}, true);
+window.addEventListener('resize', closePicker);
+window.addEventListener('scroll', closePicker, true);
+
+function req(method, params) {
+  return new Promise((res, rej) => {
+    const id = 'r' + ++seq;
+    pending.set(id, { res, rej });
+    parent.postMessage({ type: 'pawch:request', id, method, params }, '*');
+  });
+}
+parent.postMessage({ type: 'pawch:hello' }, '*');
+
+const $ = (id) => document.getElementById(id);
+const num = (n) => (n ?? 0).toLocaleString('zh-CN');
+const say = (text, ok) => { $('msg').textContent = text; $('msg').className = 'msg ' + (ok ? 'ok' : 'err'); };
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+/** 金额统一人民币：价格表按「元 / 百万 token」存，不再做美元↔人民币换算 */
+function money(v) { return '¥' + (v ?? 0).toFixed(4); }
+
+
+/** 全量台账累计：重算后不只在提示行闪一下，价格表卡右下持续可见 */
+function renderLifetime() {
+  const el = $('life');
+  if (!el) return;
+  if (!lifetimeUsd && !ledgerRows) { el.textContent = ''; return; }
+  el.textContent = `历史累计 ${money(lifetimeUsd)} · ${num(ledgerRows)} 条`;
+}
+function toDisplay(v) { return v; }
+function toUsd(v) { return Number(v) || 0; }
+
+async function boot() {
+  $('ringCost').onclick = () => setRingView('cost');
+  $('ringTok').onclick = () => setRingView('tokens');
+  await loadPrices();
+  await refreshUsage();
+  await refreshModels();
+  let tick = 0;
+  // 本次对话口径轻，5s 一轮；各模型占比要读全量台账，15s 一轮就够
+  setInterval(() => {
+    refreshUsage();
+    if (++tick % 3 === 0) refreshModels();
+  }, 5000);
+}
+
+// —— 用量（本次对话）——
+async function refreshUsage() {
+  try {
+    const r = await req('usage.session', { group: 'model', range: 'all' });
+    renderUsage(r);
+  } catch (e) {
+    $('usageBody').innerHTML = '<div class="err">' + esc(String(e.message || e)) + '</div>';
+  }
+}
+
+function renderUsage(r) {
+  const t = r.totals || {};
+  if (!t.requests) {
+    $('usageBody').innerHTML = '<div class="empty">本次对话还没有模型调用。</div>';
+    return;
+  }
+  // 三档 token 互不重叠，口径对齐右侧价格表的「输入 / 缓存输入 / 输出」三列
+  // （缓存命中是输入的子集，记账按非缓存部分算输入价）
+  const inputOnly = Math.max((t.prompt_tokens || 0) - (t.cached_tokens || 0), 0);
+  $('usageBody').innerHTML = `
+    <div class="row"><span class="k">输入</span><span class="v big">${num(inputOnly)}</span></div>
+    <div class="row"><span class="k">缓存输入</span><span class="v big">${num(t.cached_tokens)}</span></div>
+    <div class="row"><span class="k">输出</span><span class="v big">${num(t.completion_tokens)}</span></div>
+    <div class="row"><span class="k">请求次数</span><span class="v">${num(t.requests)}</span></div>
+    <div class="row"><span class="k">费用</span><span class="v big">${money(t.cost_usd)}</span></div>`;
+}
+
+// —— 各模型占比（全量台账按模型聚合；费用 / Token 两种口径）——
+let ringRows = [];
+let ringView = 'cost';
+const RING_COLORS = ['#c08a74', '#d9a95f', '#9aa86f', '#6f97a8', '#a97ea8', '#cd7264', '#8d8bb0', '#7f9b86', '#b08e5a', '#7c8fa6', '#a8887a', '#93a38b'];
+
+async function refreshModels() {
+  try {
+    const r = await req('usage.models', {});
+    ringRows = r.rows || [];
+    lifetimeUsd = Number(r.spend_total_usd) || lifetimeUsd;
+    ledgerRows = ringRows.reduce((a, x) => a + (x.requests || 0), 0);
+    renderLifetime();
+    drawRing();
+  } catch (e) {
+    $('ringLegend').innerHTML = '<div class="err">' + esc(String(e.message || e)) + '</div>';
+  }
+}
+
+function setRingView(v) {
+  ringView = v;
+  $('ringCost').classList.toggle('on', v === 'cost');
+  $('ringTok').classList.toggle('on', v === 'tokens');
+  drawRing();
+}
+
+function ringVal(r) {
+  return ringView === 'tokens' ? (r.prompt_tokens || 0) + (r.completion_tokens || 0) : (r.cost_usd || 0);
+}
+
+function shortNum(n) {
+  if (n >= 1e8) return (n / 1e8).toFixed(2) + '亿';
+  if (n >= 1e4) return (n / 1e4).toFixed(2) + '万';
+  return num(n);
+}
+
+function drawRing() {
+  const rows = ringRows.map((r) => ({ ...r, v: ringVal(r) })).sort((a, b) => b.v - a.v);
+  const total = rows.reduce((s, r) => s + r.v, 0);
+  if (!total) {
+    $('slices').innerHTML = '';
+    $('ringTotal').textContent = ringView === 'cost' ? money(0) : '0';
+    $('ringLegend').innerHTML = '<div class="empty">' + (ringRows.length
+      ? '这些模型在价格表里还没配价（切到 Token 看用量占比）'
+      : '还没有历史记录。') + '</div>';
+    return;
+  }
+  const C = 2 * Math.PI * 46;
+  let acc = 0;
+  $('slices').innerHTML = rows.map((r, i) => {
+    if (r.v <= 0) return '';
+    const len = (r.v / total) * C;
+    const dash = Math.max(len - Math.min(1.5, len * 0.25), 0.2);
+    const svg = `<circle class="slice" cx="60" cy="60" r="46" stroke="${RING_COLORS[i % RING_COLORS.length]}" stroke-dasharray="${dash.toFixed(3)} ${(C - dash).toFixed(3)}" stroke-dashoffset="${(-acc).toFixed(3)}"></circle>`;
+    acc += len;
+    return svg;
+  }).join('');
+  $('ringTotal').textContent = ringView === 'cost' ? money(total) : shortNum(total);
+  $('ringLegend').innerHTML = rows.map((r, i) => {
+    const pct = ((r.v / total) * 100).toFixed(2);
+    // 价格表没配到的模型花了钱但金额未知：行内留一个「未计价」，不然 0.00% 会被当成没花。
+    // 只在**整行都没配到价**时标：已配价的模型即使混进个别未计价请求（本地测试、渠道
+    // 没回 usage 的调用），金额仍是实数，再标「未计价」就自相矛盾（真机实测 step-5
+    // preview 已配价却显示未计价）。零星未计价放进 tooltip，信息不丢。
+    const unpriced = r.unpriced_requests || 0;
+    const allUnpriced = unpriced > 0 && unpriced >= (r.requests || 0);
+    const tag = allUnpriced ? ' <span class="dim">未计价</span>' : '';
+    const note = unpriced > 0 && !allUnpriced ? `（其中 ${unpriced} 次请求未计价，金额未计入）` : '';
+    return `<div class="lg-row" title="${esc(r.key + note)}">
+      <span class="lg-dot" style="background:${RING_COLORS[i % RING_COLORS.length]}"></span>
+      <span class="lg-name">${esc(r.key)}${tag}</span>
+      <span class="lg-pct">${pct}%</span>
+      <span class="lg-val">${ringView === 'cost' ? money(r.cost_usd) : shortNum(r.v)}</span>
+    </div>`;
+  }).join('');
+}
+
+// —— 价格表 ——
+async function loadPrices() {
+  try {
+    const d = await req('usage.prices', {});
+    channels = d.channels || [];
+    rows = (d.prices || []).map((p) => ({ ...p }));
+    lifetimeUsd = Number(d.spend_total_usd) || 0;
+    drawRows();
+    renderLifetime();
+  } catch (e) {
+    say(String(e.message || e), false);
+  }
+}
+
+function chanOf(host) { return channels.find((c) => c.host === host); }
+function pickerLabel(r) {
+  if (!r.provider) return '选择渠道 · 模型';
+  const c = chanOf(r.provider);
+  return (c ? c.name + ' · ' : r.provider + ' · ') + (r.model || '（未选模型）');
+}
+
+function drawRows() {
+  // 重绘前记住焦点与未提交输入（onchange 只在 blur 后触发，切货币会走到这里）
+  const act = document.activeElement;
+  const tr = act && act.closest ? act.closest('#rows tr') : null;
+  const keep = tr ? {
+    row: Array.prototype.indexOf.call(tr.parentNode.children, tr),
+    col: Array.prototype.indexOf.call(tr.children, act.closest('td')),
+    value: act.value,
+    caret: act.selectionStart,
+  } : null;
+  closePicker();
+  $('rows').innerHTML = rows.map((r, i) => `<tr>
+      <td><button type="button" class="picker" onclick="togglePicker(event, ${i})">
+        <span class="pk-label">${esc(pickerLabel(r))}</span>
+        <svg class="pk-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+      </button></td>
+      <td><input type="number" step="0.0001" min="0" value="${toDisplay(r.prompt)}" onchange="setP(${i}, 'prompt', this.value)" /></td>
+      <td><input type="number" step="0.0001" min="0" value="${toDisplay(r.cached)}" onchange="setP(${i}, 'cached', this.value)" /></td>
+      <td><input type="number" step="0.0001" min="0" value="${toDisplay(r.completion)}" onchange="setP(${i}, 'completion', this.value)" /></td>
+      <td><button title="删除这一行" onclick="delRow(${i})">×</button></td>
+    </tr>`).join('');
+  if (keep && keep.col >= 0) {
+    const tr2 = $('rows').children[keep.row];
+    const td = tr2 && tr2.children[keep.col];
+    const el = td && td.querySelector('input');
+    if (el) {
+      el.value = keep.value;
+      try { el.focus(); if (keep.caret != null && el.setSelectionRange) el.setSelectionRange(keep.caret, keep.caret); } catch (e) {}
+    }
+  }
+}
+
+function closePicker() {
+  pickerRow = -1;
+  const m = document.getElementById('__pk');
+  if (m) m.remove();
+}
+
+// 渠道 · 模型合并下拉：点渠道展开它名下的模型；底部可手填不在清单里的模型 id
+function togglePicker(ev, i) {
+  ev.stopPropagation();
+  if (pickerRow === i) { closePicker(); return; }
+  closePicker();
+  pickerRow = i;
+  const btn = ev.currentTarget;
+  const r = rows[i];
+  const menu = document.createElement('div');
+  menu.className = 'pk-menu';
+  menu.id = '__pk';
+  const caret = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg>';
+  let html = '';
+  for (const c of channels) {
+    const isCur = c.host === r.provider;
+    html += `<button type="button" class="pk-group${isCur ? ' cur' : ''}" data-group="${esc(c.host)}">
+      <span>${esc(c.name)}${isCur ? ' · 当前' : ''}</span>${caret}</button>`;
+    html += `<div data-items="${esc(c.host)}" hidden>`;
+    for (const m of c.models || []) {
+      const on = isCur && m === r.model;
+      html += `<button type="button" class="pk-item${on ? ' on' : ''}" data-host="${esc(c.host)}" data-model="${esc(m)}">${esc(m)}</button>`;
+    }
+    html += '</div>';
+  }
+  html += `<div class="pk-sep"></div>
+    <div class="pk-manual"><input placeholder="手填模型 id" value="${esc(r.model)}" /><button type="button" class="pk-ok">确定</button></div>`;
+  menu.innerHTML = html;
+  document.body.appendChild(menu);
+  const rect = btn.getBoundingClientRect();
+  const below = window.innerHeight - rect.bottom - 10;
+  const up = below < 240 && rect.top > below;
+  // 高度按 iframe 可用空间收口：固定 320px 时渠道一多，底部几项被面板边界裁掉又滚不到
+  const avail = up ? rect.top - 10 : below;
+  menu.style.maxHeight = Math.round(Math.max(180, Math.min(420, avail))) + 'px';
+  menu.style.left = Math.round(rect.left) + 'px';
+  menu.style.width = Math.max(220, Math.round(rect.width)) + 'px';
+  if (up) menu.style.bottom = Math.round(window.innerHeight - rect.top + 4) + 'px';
+  else menu.style.top = Math.round(rect.bottom + 4) + 'px';
+
+  menu.querySelectorAll('.pk-group').forEach((g) => {
+    g.onclick = () => {
+      const items = menu.querySelector(`[data-items="${g.dataset.group}"]`);
+      const open = !items.hidden;
+      menu.querySelectorAll('[data-items]').forEach((d) => (d.hidden = true));
+      menu.querySelectorAll('.pk-group').forEach((x) => x.classList.remove('open'));
+      items.hidden = open;
+      g.classList.toggle('open', !open);
+      // 展开后把这组模型滚进可视区（渠道多时它可能在菜单下缘之外）
+      if (!items.hidden) items.scrollIntoView({ block: 'nearest' });
+    };
+    // 当前渠道默认展开，省一次点击
+    if (g.dataset.group === r.provider) g.click();
+  });
+  menu.querySelectorAll('.pk-item').forEach((it) => {
+    it.onclick = () => { setPair(i, it.dataset.host, it.dataset.model); closePicker(); };
+  });
+  const inp = menu.querySelector('.pk-manual input');
+  const ok = () => {
+    const mid = (inp.value || '').trim();
+    if (!mid || !r.provider) { inp.focus(); return; }
+    setPair(i, r.provider, mid);
+    closePicker();
+  };
+  menu.querySelector('.pk-ok').onclick = ok;
+  inp.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); ok(); } };
+}
+
+function setPair(i, host, model) { rows[i].provider = host; rows[i].model = model; drawRows(); }
+function addRow() { rows.push({ provider: '', model: '', prompt: 0, cached: 0, completion: 0 }); drawRows(); }
+function delRow(i) { rows.splice(i, 1); drawRows(); }
+function setP(i, k, v) { rows[i][k] = toUsd(v); }
+
+async function save() {
+  const bad = rows.find((r) => !r.provider.trim() || !r.model.trim());
+  if (bad) { say('有行的渠道或模型 id 是空的——补上或删掉该行', false); return; }
+  try {
+    const r = await req('usage.prices.save', {
+      prices: rows.map((r) => ({ provider: r.provider.trim(), model: r.model.trim(), prompt: r.prompt, cached: r.cached, completion: r.completion })),
+      currency: 'CNY',
+      usd_cny_rate: 1,
+    });
+    say(r.recomputed ? `已保存，历史 ${r.recomputed.records} 条已按新价重算（仍有 ${r.recomputed.unpriced} 条未匹配到价格）` : '已保存', true);
+    await loadPrices();
+    await refreshUsage();
+    await refreshModels();
+  } catch (e) {
+    say(String(e.message || e), false);
+  }
+}
+
+</script>
+<script>
+/* 微调桥（2026-11-03 协议扩展）：宿主微调模式下本面板支持右击选元素、接收下发 CSS。
+   宿主→插件 {type:'pawch:micro', op:'enter'(listen)/'exit'/'apply'(css)}；
+   插件→宿主 {type:'pawch:micro-ack'} 与 {type:'pawch:micro-pick', pick:{sel,label,styles,x,y}}。
+   旧宿主不认识这些消息也不受影响；本段独立成块，不影响插件自身脚本。 */
+(function () {
+  var listening = false;
+  function ensureStyle(id) {
+    var el = document.getElementById(id);
+    if (!el) {
+      el = document.createElement('style');
+      el.id = id;
+      (document.head || document.documentElement).appendChild(el);
+    }
+    return el;
+  }
+  function onContext(e) {
+    if (!listening) return;
+    e.preventDefault();
+    e.stopPropagation();
+    var t = e.target;
+    if (t && t.nodeType !== 1 && t.parentElement) t = t.parentElement;
+    if (!t || !t.closest) return;
+    var btn = t.closest('button');
+    if (btn && t.closest('svg')) t = btn;
+    var SKIP = /^(active|on|sel|open|hover|running|ok|fail|err|hidden|light|dark|empty|more|dim|warn|danger|primary|ghost|flat|row)$/;
+    function esc(s) { return window.CSS && CSS.escape ? CSS.escape(s) : s; }
+    function classesOf(el) {
+      return (typeof el.className === 'string' ? el.className : (el.getAttribute && el.getAttribute('class')) || '')
+        .split(/\s+/).filter(function (c) { return c && !SKIP.test(c) && !/^s-[A-Za-z0-9_-]+$/.test(c) && !/^svelte-[A-Za-z0-9_-]+$/.test(c); });
+    }
+    // 选择器必须命中「被点的这个元素」：自身 id > 自身类名 > 最近有 id/类名的祖先 + 到目标的子路径。
+    // 旧实现拿最近的「有类名的祖先」当选择器（点 #filter 得到 .toolbar），规则永远改不到目标。
+    function selectorFor(el) {
+      if (el.id) return '#' + esc(el.id);
+      var own = classesOf(el);
+      if (own.length) return '.' + own.map(esc).join('.');
+      var tail = [], cur = el;
+      while (cur && cur !== document.body) {
+        var parent = cur.parentElement;
+        if (!parent) break;
+        var sibs = Array.prototype.filter.call(parent.children, function (x) { return x.tagName === cur.tagName; });
+        var seg = cur.tagName.toLowerCase();
+        if (sibs.length > 1) seg += ':nth-of-type(' + (sibs.indexOf(cur) + 1) + ')';
+        tail.unshift(seg);
+        if (parent.id) return '#' + esc(parent.id) + ' > ' + tail.join(' > ');
+        var pcls = classesOf(parent);
+        if (pcls.length) return '.' + pcls.map(esc).join('.') + ' > ' + tail.join(' > ');
+        cur = parent;
+      }
+      return tail.join(' > ') || el.tagName.toLowerCase();
+    }
+    var sel = selectorFor(t);
+    var labelCls = classesOf(t);
+    var label = labelCls.filter(function (c) { return c.indexOf('-') >= 0; })[0] || labelCls[0] || (t.id ? '#' + t.id : t.tagName.toLowerCase());
+    var cs = getComputedStyle(t);
+    function alphaOf(c) {
+      var m = String(c || '').match(/rgba?\(([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:[,\s/]+([\d.]+))?\)/);
+      if (!m) return /^transparent$/i.test(String(c || '').trim()) ? 0 : 1;
+      return m[4] === undefined ? 1 : parseFloat(m[4]);
+    }
+    function stylesOf(el) {
+      var s = getComputedStyle(el);
+      var b = String(s.backdropFilter || '').match(/blur\(([\d.]+)px\)/);
+      return {
+        color: s.color, bg: s.backgroundColor,
+        radius: parseFloat(s.borderTopLeftRadius) || 0,
+        border: parseFloat(s.borderTopWidth) || 0,
+        borderColor: s.borderTopColor,
+        blur: b ? parseFloat(b[1]) : 0,
+        fontSize: parseFloat(s.fontSize) || 14
+      };
+    }
+    // 背景替身：本身透明时找真正画底色的祖先（深色面板的底常是 body/根容器画的），
+    // 一并上报让宿主面板给「改上级」入口——否则改内层元素背景等于改一块透明玻璃
+    var bgHost = null;
+    if (alphaOf(cs.backgroundColor) <= 0.05) {
+      var host = t.parentElement;
+      while (host) {
+        var hs = getComputedStyle(host);
+        if (alphaOf(hs.backgroundColor) > 0.05) {
+          var hcls = classesOf(host);
+          bgHost = {
+            sel: selectorFor(host),
+            label: hcls.filter(function (c) { return c.indexOf('-') >= 0; })[0] || hcls[0] || (host.id ? '#' + host.id : host.tagName.toLowerCase()),
+            styles: stylesOf(host)
+          };
+          break;
+        }
+        host = host.parentElement;
+      }
+    }
+    parent.postMessage({ type: 'pawch:micro-pick', pick: {
+      sel: sel, label: label || sel,
+      styles: stylesOf(t),
+      bgHost: bgHost,
+      root: { sel: 'body', label: '面板底色（body）', styles: stylesOf(document.body) },
+      x: e.clientX, y: e.clientY
+    } }, '*');
+  }
+  window.addEventListener('message', function (ev) {
+    var d = ev.data || {};
+    if (d.type !== 'pawch:micro' && d.type !== 'agent:micro') return;
+    if (d.op === 'enter') {
+      listening = !!d.listen;
+      document.removeEventListener('contextmenu', onContext, true);
+      if (listening) {
+        document.addEventListener('contextmenu', onContext, true);
+        ensureStyle('pawch-micro-hover').textContent = '*:hover { outline: 1px dashed rgba(186,138,120,.55); outline-offset: -1px; }';
+      } else {
+        var hs = document.getElementById('pawch-micro-hover');
+        if (hs) hs.remove();
+      }
+      parent.postMessage({ type: 'pawch:micro-ack' }, '*');
+    } else if (d.op === 'exit') {
+      listening = false;
+      document.removeEventListener('contextmenu', onContext, true);
+      var h2 = document.getElementById('pawch-micro-hover');
+      if (h2) h2.remove();
+    } else if (d.op === 'apply') {
+      ensureStyle('pawch-micro').textContent = String(d.css || '');
+    }
+  });
+})();
+</script>
+</body>
+</html>
