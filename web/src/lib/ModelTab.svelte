@@ -92,7 +92,6 @@
     <input
       data-field="configName"
       bind:value={configName}
-      placeholder="给这套配置起个名，如：商汤主力 / tokeness 免费"
       on:input={() => autoSave({ name: configName })}
     />
   </div>
@@ -121,7 +120,6 @@
     <input
       data-field="baseUrl"
       bind:value={baseUrl}
-      placeholder="留空用预设默认"
       on:input={() => autoSave({ base_url: baseUrl })}
     />
   </div>
@@ -132,10 +130,11 @@
       <input
         bind:value={apiKey}
         type="password"
+        class="api-key"
         style="flex: 1;"
-        placeholder={typingHint
-          ? `本配置已保存(…${typingHint})，重新输入即覆盖`
-          : '此配置还没有 key，填入即自动保存'}
+        autocomplete="new-password"
+        spellcheck="false"
+        placeholder={typingHint ? '••••••••••••••••••••' : ''}
         on:blur={() => apiKey.trim() && autoSave({})}
         on:keydown={(e) => e.key === 'Enter' && apiKey.trim() && autoSave({})}
       />
@@ -152,7 +151,6 @@
         class="model-input"
         style="flex: 1;"
         value={modelsText}
-        placeholder="直接填模型 id，多个用英文逗号隔开；或点右侧「获取模型」勾选后自动回填"
         on:input={(e) => (modelsText = e.currentTarget.value)}
         on:blur={commitModels}
         on:keydown={(e) => {
@@ -172,7 +170,6 @@
       class="num-input"
       type="number"
       min="0"
-      placeholder="默认 1000000"
       data-field="ctxLen"
       bind:value={ctxLen}
       title="决定上下文圆环预算与历史裁剪时机；新建配置默认 1000000"
@@ -183,7 +180,6 @@
       class="num-input"
       type="number"
       min="0"
-      placeholder="默认 126000"
       data-field="maxOut"
       bind:value={maxOut}
       title="随请求作为 max_tokens 发给渠道。思考开启时自动加思考余量（配置值+max(配置值,8192)）——上游把思考和正文算进同一个额度，不加余量正文会被思考挤断；端点拒收会自动回退原值。新建配置默认 126000"
@@ -194,19 +190,19 @@
   <div class="field">
     <label>采样参数（留空=渠道默认）</label>
     <div class="sub-row">
+      <div class="param-name">温度</div>
       <input
         class="num-input"
         type="number" step="0.1" min="0" max="2"
-        placeholder="温度"
         data-field="temperature"
         bind:value={temperature}
         title="temperature：越低越稳定，0=确定性输出"
         on:change={() => autoSave({ temperature: temperature === null || temperature === '' ? -1 : Number(temperature) }, 0)}
       />
+      <div class="param-name">top_p</div>
       <input
         class="num-input"
         type="number" step="0.05" min="0" max="1"
-        placeholder="top_p"
         data-field="topP"
         bind:value={topP}
         title="top_p：核采样截断"
@@ -346,6 +342,16 @@
     border-radius: 6px;
     padding: 6px 8px;
     font-size: 12px;
+  }
+  .param-name {
+    font-size: 12px;
+    color: var(--g6);
+    margin: 6px 0 4px;
+  }
+  /* 已保存 key 的圆点遮罩：后端只回尾号，真实 key 不出内存，圆点只是「已存」标记 */
+  .api-key::placeholder {
+    color: var(--g7);
+    letter-spacing: 2px;
   }
   /* 自绘下拉（Select 组件）在各容器里的尺寸：组件内部样式管外观，这里只调整体布局 */
   .field > :global(.csel-wrap) {
