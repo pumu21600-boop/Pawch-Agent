@@ -5162,7 +5162,7 @@
       await confirmAsk(`「${name}」是当前正在使用的项目，不能移除。\n先切换到其他项目，再来移除它。`, true);
       return;
     }
-    if (!(await confirmAsk(`从侧边栏移除项目「${name}」？\n只移出列表，不删除磁盘上的文件夹与会话。`))) return;
+    if (!(await confirmAsk(`移除项目「${name}」？\n这个项目下的会话会一起删除（不可恢复）；磁盘上的文件夹保留。`))) return;
     projMenuPath = null;
     await fetch('/api/workspace/remove', {
       method: 'POST',
@@ -5170,6 +5170,7 @@
       body: JSON.stringify({ path }),
     });
     await loadSettings();
+    await loadSessions(); // 会话是级联删的：列表要立刻刷新，别把已删的还挂在那
   }
 
   // —— 会话菜单四项：置顶 / 重命名 / 分叉 / 归档 ——

@@ -623,7 +623,10 @@ pub(super) async fn pick_workspace() -> (StatusCode, Json<Value>) {
     }
 }
 
-/// POST /api/workspace/remove —— 从侧边栏项目列表（recent_workspaces）移除（不删目录）。
+/// POST /api/workspace/remove —— 从侧边栏项目列表移除，并把这个工作区名下的会话一起删掉。
+/// 目录本身不动（移除项目 ≠ 删文件夹）。会话必须跟着走：只移出列表的话，会话文件还在，
+/// 侧栏会掉进「未分组」堆着一堆孤儿对话，看着像删了个寂寞（2026-11-05 用户口径：
+/// 删工作区，那些会话就应该彻底消失）。
 pub(super) async fn remove_workspace(
     State(state): State<AppState>,
     Json(req): Json<WorkspaceRequest>,
@@ -643,8 +646,26 @@ pub(super) async fn remove_workspace(
     // 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
     crate::plugin::wasm::set_disabled(&s.disabled_plugins);
     crate::mcp::sync_configs(&s.mcp_servers); // MCP 配置变更即同步管理器（幂等）
-    observability::event(EventType::State, json!({ "kind": "workspace.removed", "path": path }));
-    (StatusCode::OK, Json(json!({ "ok": true, "recent": s.recent_workspaces })))
+    // 会话级联删除：归属按 same_workspace 比（规范化后精确相等，不做子目录扩张——
+    // 子目录工作区是独立项目）。删除失败不拦整体，计数回报给前端/日志。
+    let mut removed = 0usize;
+    let mut failed = 0usize;
+    for m in state.session.list() {
+        if same_workspace(&m.workspace, path) {
+            match state.session.delete(&m.id) {
+                Ok(()) => removed += 1,
+                Err(_) => failed += 1,
+            }
+        }
+    }
+    observability::event(
+        EventType::State,
+        json!({ "kind": "workspace.removed", "path": path, "sessions_removed": removed, "sessions_failed": failed }),
+    );
+    (
+        StatusCode::OK,
+        Json(json!({ "ok": true, "recent": s.recent_workspaces, "sessions_removed": removed, "sessions_failed": failed })),
+    )
 }
 
 /// 别名写入的纯部分（测试直达，不碰 save/广播）：路径先规范化再进表——侧栏渲染用的键是
