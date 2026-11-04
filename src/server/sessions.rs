@@ -43,6 +43,12 @@ pub(super) async fn list_sessions(
     Json(json!({ "project": project, "sessions": list, "workspace_born": born }))
 }
 
+/// GET /api/running —— 正在跑的会话 id 列表（侧栏会话行转圈圈）。
+/// 前端 3 秒轮询一次；本体只是注册表 keys 快照，不碰会话文件。
+pub(super) async fn running_sessions(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({ "running": state.cancel.running_ids() }))
+}
+
 /// 目录创建时间（毫秒）。取不到（不存在/权限/文件系统不支持）返回 None——调用方
 /// 当作「不知道」，不做历史判定，宁可多显示也不误藏。
 fn dir_created_ms(p: &str) -> Option<i64> {

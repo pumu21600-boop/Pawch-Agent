@@ -116,6 +116,17 @@ impl CancelRegistry {
         }
     }
 
+    /// 正在跑的会话 id 快照（侧栏转圈圈用；不含已置取消位、尚未注销的收尾轮——
+    /// 那一轮确实还在跑，界面显示运行中是对的）。
+    pub fn running_ids(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect()
+    }
+
     /// 停止全部在跑会话，返回命中数（命令行客户端与内置页的显式「全停」）。
     pub fn cancel_all(&self) -> usize {
         let flags: Vec<Arc<CancelFlag>> = self

@@ -195,6 +195,7 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/schedules/notice", delete(dismiss_schedule_notice))
         .route("/api/session", get(get_session).delete(clear_session))
         .route("/api/sessions", get(list_sessions))
+        .route("/api/running", get(crate::server::sessions::running_sessions))
         .route("/api/sessions/new", post(new_session))
         .route("/api/sessions/open", post(open_session))
         .route("/api/sessions/transcript", get(session_transcript))

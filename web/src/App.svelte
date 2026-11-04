@@ -152,6 +152,11 @@
   })();
   let sessionMsgs = {}; // key（会话 id 或 '@new'）→ 消息数组
   let streams = {}; // key → { asstId, controller } 正在跑的那条流
+  // 服务端在跑、但本页没有流的会话（别的窗口/页面重载后）：侧栏也给转圈，
+  // 不然「原对话看着已结束，其实后台还在跑」，人就不知道该不该引导（2026-11-05 实锤）。
+  let serverRunning = {};
+  // 侧栏会话行转圈的数据源：本页流 ∪ 服务端在跑列表（模板直接读这个 Set 才有依赖）
+  $: runningIds = new Set([...Object.keys(streams), ...Object.keys(serverRunning)]);
   let outbox = {}; // key → [{ id, text, atts }] 排队待发（本轮结束后自动按序发出）
   // 服务端接管排队消息后的对账定时器（key → interval id）：本页流已死拿不到回答，
   // 轮询到服务端空闲后从会话文件重载（2026-09-27 教训，见 d.queued 分支注释）
@@ -502,8 +507,14 @@
     // 2026-10-08 修：三个根级监听器原无配对清理——生产态 App 只挂一次无感，
     // dev 的 HMR 每次热替换都销毁重建，message 监听累积会让插件桥的每次
     // pawch:request 被新旧实例各处理一次（reply 发两遍）。
+    // 侧栏「运行中」转圈：本页的流即时，服务端在跑的（别的窗口/重载后）3 秒补一次
+    refreshRunning();
+    const runT = setInterval(() => {
+      if (!document.hidden) refreshRunning();
+    }, 3000);
     return () => {
       clearInterval(t);
+      clearInterval(runT);
       clearTimeout(rzT);
       dockRo?.disconnect();
       window.removeEventListener('resize', onRz);
@@ -4651,6 +4662,19 @@
     }
   }
 
+  // 侧栏「运行中」轮询：服务端在跑的会话 id（含别的窗口 / 页面重载后本页没流的那些）。
+  // 3 秒一次、只读注册表 keys，开销可忽略；页面隐藏时不拉。
+  async function refreshRunning() {
+    try {
+      const r = await fetch('/api/running').then((x) => x.json());
+      const next = {};
+      for (const id of r.running || []) if (id) next[id] = true;
+      serverRunning = next;
+    } catch {
+      /* 服务没起/断网：保持上次状态，下一跳再试 */
+    }
+  }
+
   // 定时任务「完成记录 / 上次完成」里的「去查看」：先关掉设置弹窗，再打开对应会话
   // （/api/sessions/open 会在会话属于别的项目时先切过去）。id 空则不动。
   async function openScheduleSession(id) {
@@ -4966,7 +4990,9 @@
       return rows;
     }
     const pushGroup = (path, name, active, items) => {
-      rows.push({ type: 'proj', path, name, active, count: items.length });
+      // 项目行也带一个转圈：正在跑的会话可能属于别的项目（侧栏只展开当前项目），
+      // 不标在项目上就完全看不见它还在跑（2026-11-05 实锤「切走就以为结束了」）
+      rows.push({ type: 'proj', path, name, active, count: items.length, running: items.some((s) => runningIds.has(s.id)) });
       const expanded = !!searchQ || !!expandedFlags[path];
       if (!expanded) return;
       const capped = searchQ
@@ -7187,6 +7213,7 @@
               {/if}
             </button>
             <span class="proj-name">{row.name}{row.count ? '' : ''}</span>
+            {#if row.running}<span class="conv-spin" title="这个项目里有会话正在跑" aria-label="有会话正在运行"></span>{/if}
             {#if row.active}<span class="proj-cur" title="当前项目"></span>{/if}
             {#if row.path === '__legacy__'}
               <span class="proj-side">
@@ -7236,6 +7263,10 @@
           >
             {#if manageMode}
               <span class="conv-check" class:on={checkedIds.includes(s.id)}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg></span>
+            {/if}
+            {#if runningIds.has(s.id)}
+              <!-- 运行中：不管本页有没有这条会话的流（切走的/别的窗口起的）都转圈 -->
+              <span class="conv-spin" title="正在运行" aria-label="正在运行"></span>
             {/if}
             <span class="conv-title" title={s.title}>{s.title}</span>
             {#if !manageMode && s.pinned}
@@ -9706,6 +9737,26 @@
   .conv.active {
     background: color-mix(in srgb, var(--brand) 11%, var(--g2));
     color: var(--g7);
+  }
+  /* 运行中：会话行/项目行前的小转圈（本页的流即时，服务端在跑的靠 3 秒轮询补） */
+  .conv-spin {
+    flex: none;
+    width: 11px;
+    height: 11px;
+    border-radius: 50%;
+    border: 1.5px solid var(--g4);
+    border-top-color: var(--g7);
+    animation: conv-spin 0.8s linear infinite;
+  }
+  @keyframes conv-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .conv-spin {
+      animation-duration: 2s;
+    }
   }
   .conv-pin {
     width: 15px;
