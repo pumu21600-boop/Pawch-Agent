@@ -35,7 +35,9 @@ export function mulberry32(a) {
   };
 }
 
-/** 小星座用随机游走链（像手绘星座），大星座改用等密度星云盘 + 最小生成树 */
+/** 小星座用「2~3 个局部星群 + 抖动」散开（再交给 MST 连线，自然分叉）；
+ *  大星座改用等密度星云盘。早先是单条随机游走链，MST 只会顺着链连，
+ *  整团看起来就是一根折线（2026-11-05 用户实感「全是一条一条的线」）。 */
 function clusterPoints(count, span, seed) {
   const rnd = mulberry32(seed);
   if (count <= 1) return [{ x: 0, y: 0 }];
@@ -49,13 +51,23 @@ function clusterPoints(count, span, seed) {
     }
     return pts;
   }
-  pts.push({ x: 0, y: 0 });
-  let ang = rnd() * TAU;
-  for (let i = 1; i < count; i++) {
-    ang += (rnd() - 0.5) * 1.5;
+  // 2~3 个局部星群：每群至少一颗，其余随机落群；群内再抖开。
+  // 锚点半径压小、群内半径放大 → 群与群之间的「桥线」短，团内更像一簇星，
+  // 不会出现一根长直线横穿半个星座。
+  const groups = count <= 3 ? 1 : count <= 9 ? 2 + (rnd() < 0.4 ? 1 : 0) : 3;
+  const anchors = [];
+  for (let g = 0; g < groups; g++) {
+    const a = (g / groups) * TAU + (rnd() - 0.5) * 0.9;
+    const rr = span * (0.13 + rnd() * 0.07);
+    anchors.push({ x: Math.cos(a) * rr, y: Math.sin(a) * rr * 0.8 });
+  }
+  for (let i = 0; i < count; i++) {
+    const g = i < groups ? i : Math.floor(rnd() * groups);
+    const a = rnd() * TAU;
+    const rr = span * 0.105 * Math.sqrt(rnd());
     pts.push({
-      x: pts[i - 1].x + Math.cos(ang) * 45,
-      y: pts[i - 1].y + Math.sin(ang) * 36,
+      x: anchors[g].x + Math.cos(a) * rr,
+      y: anchors[g].y + Math.sin(a) * rr * 0.82,
     });
   }
   let minX = Infinity;

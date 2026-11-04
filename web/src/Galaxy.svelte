@@ -16,7 +16,7 @@
   // 暖夜色：全屏恒为夜幕，不跟主题切换
   const PAL = {
     core: '#fff2de',
-    grid: 'rgba(219, 205, 186, 0.075)',
+    grid: 'rgba(219, 205, 186, 0.042)',
     lineAlpha: 0.3,
     vig: 'rgba(8, 6, 5, 0.62)',
     halo: 'rgba(104, 54, 26, 0.40)',
@@ -469,8 +469,8 @@
       ctx.arc(o.x, o.y, r * cam.s, 0, TAU);
       ctx.stroke();
     }
-    for (let a = 0; a < 24; a++) {
-      const ang = (a / 24) * TAU;
+    for (let a = 0; a < 16; a++) {
+      const ang = (a / 16) * TAU;
       ctx.beginPath();
       ctx.moveTo(o.x + Math.cos(ang) * 80 * cam.s, o.y + Math.sin(ang) * 80 * cam.s);
       ctx.lineTo(o.x + Math.cos(ang) * 1480 * cam.s, o.y + Math.sin(ang) * 1480 * cam.s);
