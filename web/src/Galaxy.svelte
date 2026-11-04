@@ -559,17 +559,8 @@
         ctx.drawImage(sp, p.x - sz / 2, p.y - sz / 2, sz, sz);
         ctx.globalAlpha = 1;
       }
-      if (r > 3.0 && a > 0.5) {
-        ctx.strokeStyle = `rgba(255,244,228,${0.26 * a})`;
-        ctx.lineWidth = 0.6;
-        const len = r * 6;
-        ctx.beginPath();
-        ctx.moveTo(p.x - len, p.y);
-        ctx.lineTo(p.x + len, p.y);
-        ctx.moveTo(p.x, p.y - len);
-        ctx.lineTo(p.x, p.y + len);
-        ctx.stroke();
-      }
+      // 2026-11-05：亮星原来画一对横竖「十字星芒」线，看起来像被划了一刀，
+      // 和星座连线混在一起分不清——已去掉。层次交给 sprite 光晕 + 实心核。
 
       ctx.fillStyle = s.core;
       ctx.globalAlpha = Math.min(1, a);
