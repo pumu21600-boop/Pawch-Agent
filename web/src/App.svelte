@@ -4298,12 +4298,30 @@
   // 跑完了/没送进去会自动退回队列。
   async function sendNow(itemId, mode = 'interrupt') {
     const key = curKey();
-    const item = (outbox[key] || []).find((x) => x.id === itemId);
+    // 「服务端接管」的排队气泡不从 outbox 走：前端以为空闲时发消息，服务端回 queued
+    // 后气泡留在列表里、outbox 里那条已被摘掉（见 deliver 的 d.queued 分支）。
+    // 这时按钮要还能用——从气泡本身取回内容，否则点了没反应（引导一直发不出去）。
+    const queuedMsg = (sessionMsgs[key] || []).find((m) => m.id === itemId && m.queued);
+    const item =
+      (outbox[key] || []).find((x) => x.id === itemId) ||
+      (queuedMsg
+        ? { id: queuedMsg.id, text: queuedMsg.content, atts: queuedMsg.attachments || [], convs: queuedMsg.convs || [] }
+        : null);
     if (!item) return;
     const label = mode === 'steer' ? '引导' : '立即发送';
     // 先出队（免得本轮结束时又自动发一遍）
     outbox = { ...outbox, [key]: (outbox[key] || []).filter((x) => x.id !== itemId) };
-    if (!streams[key]) {
+    // 本页没有流不代表这一轮跑完了：页面重载/切回来后 streams 是空的，但服务端还在跑。
+    // 这时按普通消息发出去只会再被服务端排进队列（点了引导还是「排队中」）。
+    // 问一下服务端，真在跑就照常带 steer/interrupt 合进去；确实空闲才走普通一轮。
+    let running = !!streams[key];
+    if (!running && key !== '@new') {
+      try {
+        const c = await fetch(`/api/cancel?session=${encodeURIComponent(key)}`).then((r) => r.json());
+        running = !!c.running;
+      } catch {}
+    }
+    if (!running) {
       // 这一轮已经跑完了：按正常一轮发出去
       await deliver(key, item.text, item.atts, { bubbleId: item.id, convs: item.convs });
       return;
