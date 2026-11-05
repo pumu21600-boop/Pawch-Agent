@@ -1,6 +1,6 @@
 # Pawch Agent
 
-Windows 上的本地优先桌面 Agent。Rust（axum）+ Svelte，SSE 流式。
+基于Rust+svelte的Windows本地agent
 
 ## 功能
 
