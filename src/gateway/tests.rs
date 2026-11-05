@@ -685,3 +685,125 @@ Content-Length: 2
         gw.mark_thinking_degraded("https://b", "m");
         assert!(gw.take_thinking_degraded_notice("https://b", "m"), "不同渠道各自提示一次");
     }
+
+    #[test]
+    fn max_tokens_inflate_rejected_is_per_channel() {
+        let gw = Gateway::new();
+        assert!(!gw.max_tokens_inflate_rejected("https://a", "m"), "未拒收不跳过扩容");
+        gw.mark_max_tokens_inflate_rejected("https://a", "m");
+        assert!(gw.max_tokens_inflate_rejected("https://a", "m"), "登记后跳过扩容");
+        assert!(!gw.max_tokens_inflate_rejected("https://b", "m"), "不同渠道互不影响");
+        assert!(!gw.thinking_is_degraded("https://a", "m"), "扩容被拒不能登记成拒收思考");
+    }
+
+    /// 2026-11-05 回归：400「max_tokens 超限」不能被误判成「端点拒收思考参数」。
+    /// 旧顺序先剥参重试（去掉 thinking 后 max_tokens 恰好回到配置原值，于是成功），
+    /// 把渠道永久登记成 thinking_degraded——思考被关掉，每次重启还弹一次通知。
+    /// 正确行为：先用「配置原值 + 思考」重试，成功则保住思考；后续请求不再扩容。
+    #[tokio::test]
+    async fn max_tokens_400_keeps_thinking() {
+        use std::io::{Read, Write};
+
+        fn read_request(s: &mut std::net::TcpStream) -> String {
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            loop {
+                let n = s.read(&mut tmp).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..pos]).to_string();
+                    let len = head
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            if k.eq_ignore_ascii_case("content-length") {
+                                v.trim().parse::<usize>().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= pos + 4 + len {
+                        break;
+                    }
+                }
+            }
+            String::from_utf8_lossy(&buf).to_string()
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let bodies2 = bodies.clone();
+        let handle = std::thread::spawn(move || {
+            for i in 0..2 {
+                let (mut s, _) = listener.accept().unwrap();
+                let _ = s.set_nonblocking(false);
+                let raw = read_request(&mut s);
+                if let Some(body) = raw.split("\r\n\r\n").nth(1)
+                    && let Ok(v) = serde_json::from_str::<Value>(body)
+                {
+                    bodies2.lock().unwrap().push(v);
+                }
+                if i == 0 {
+                    // 与 deepseek 实际返回同形：拒的是 max_tokens 超限，不是思考字段
+                    let err = r#"{"error":{"message":"Invalid max_tokens value, the valid range of max_tokens is [1, 393216]","type":"invalid_request_error"}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        err.len(),
+                        err
+                    );
+                    let _ = s.write_all(resp.as_bytes());
+                } else {
+                    let chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        chunk.len(),
+                        chunk
+                    );
+                    let _ = s.write_all(resp.as_bytes());
+                }
+                let _ = s.flush();
+            }
+        });
+
+        init_logger();
+        let base = format!("http://127.0.0.1:{port}/v1");
+        let gw = Arc::new(Gateway::new());
+        let params = ChatParams {
+            provider_id: Some("deepseek".into()),
+            max_tokens: Some(384000),
+            thinking: Some("max".into()),
+            ..Default::default()
+        };
+        let ch = Channel::new(&base, "deepseek-flash", "sk-test", params);
+        let cancel = Arc::new(CancelFlag::new());
+        let out = gw
+            .stream_chat(
+                &UsageCtx::main("sess-max-tokens"),
+                &ch,
+                &json!([{"role":"user","content":"hi"}]),
+                None,
+                &cancel,
+                None,
+                |_| {},
+            )
+            .await;
+        handle.join().unwrap();
+
+        let captured = bodies.lock().unwrap().clone();
+        assert_eq!(captured.len(), 2, "应有一次 400 回退重试: {captured:?}");
+        assert_eq!(captured[0]["max_tokens"].as_u64(), Some(768000), "首请求是扩容值");
+        assert_eq!(captured[1]["max_tokens"].as_u64(), Some(384000), "回退重试发配置原值");
+        assert!(
+            Gateway::body_has_thinking_params(&captured[1]),
+            "回退重试必须保留思考参数: {}",
+            captured[1]
+        );
+        assert!(matches!(out, Ok(ChatOutcome::Done(_))), "回退后应成功");
+        assert!(!gw.thinking_is_degraded(&base, "deepseek-flash"), "不能误登记成端点拒收思考");
+        assert!(gw.max_tokens_inflate_rejected(&base, "deepseek-flash"), "应记住该渠道不再扩容");
+    }

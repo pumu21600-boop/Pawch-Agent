@@ -70,6 +70,10 @@ pub struct Gateway {
     /// 2026-11-05 修：原来只要登记过降级，每一轮都往 SSE 塞一条通知——用户在不同对话里
     /// 反复看到同一条提示，看起来像通知跨会话串台。降级是渠道级状态，提示一次足够。
     thinking_announced: RwLock<std::collections::HashSet<String>>,
+    /// 扩容后的 max_tokens 被端点 400 拒收过的渠道（base_url|model）：
+    /// 后续请求直接发配置原值，不再每轮先撞一次 400。与 thinking_degraded 分开记——
+    /// 这类 400 说的是 max_tokens 超限，不是端点不认思考参数，思考字段照常发送。
+    inflate_rejected: RwLock<std::collections::HashSet<String>>,
 }
 
 /// 请求体的 JSONL 摘要（完整体走 `observability::debug` 控制台，见调用处注释）。
@@ -405,6 +409,7 @@ impl Gateway {
             throttle: None,
             thinking_degraded: RwLock::new(std::collections::HashSet::new()),
             thinking_announced: RwLock::new(std::collections::HashSet::new()),
+            inflate_rejected: RwLock::new(std::collections::HashSet::new()),
         }
     }
 
@@ -431,6 +436,21 @@ impl Gateway {
 
     fn mark_thinking_degraded(&self, base_url: &str, model: &str) {
         if let Ok(mut s) = self.thinking_degraded.write() {
+            s.insert(Self::degrade_key(base_url, model));
+        }
+    }
+
+    /// 该渠道的扩容 max_tokens 是否已被端点拒收过（回退原值成功）。
+    /// 命中时本请求直接发配置原值，不再重复「发扩容值 → 400 → 重试」。
+    fn max_tokens_inflate_rejected(&self, base_url: &str, model: &str) -> bool {
+        self.inflate_rejected
+            .read()
+            .map(|s| s.contains(&Self::degrade_key(base_url, model)))
+            .unwrap_or(false)
+    }
+
+    fn mark_max_tokens_inflate_rejected(&self, base_url: &str, model: &str) {
+        if let Ok(mut s) = self.inflate_rejected.write() {
             s.insert(Self::degrade_key(base_url, model));
         }
     }
@@ -942,8 +962,10 @@ impl Gateway {
         // 「最大输出长度」会被思考吃掉导致正文莫名截断——发送值加思考余量（端点硬上限
         // 拒收时下方回退原值重试）。思考关闭/未配 max_tokens 时等价原值。
         let mut send_params = eff_params.clone();
-        let inflated = match (eff_params.max_tokens, effective_max_tokens(&eff_params)) {
-            (Some(orig), Some(eff)) if eff != orig => {
+        // 这个渠道的扩容值已经被端点拒过一次 → 直接按配置原值发，不再每轮重撞 400
+        let inflate_allowed = !self.max_tokens_inflate_rejected(base_url, model);
+        let inflated = match (inflate_allowed, eff_params.max_tokens, effective_max_tokens(&eff_params)) {
+            (true, Some(orig), Some(eff)) if eff != orig => {
                 send_params.max_tokens = Some(eff);
                 observability::event(
                     EventType::State,
@@ -998,11 +1020,52 @@ impl Gateway {
             }
         };
 
+        // 扩容回退先行：400 可能是「扩容后的 max_tokens 超出模型硬上限」，不是端点不认
+        // 思考字段。先按配置原值 + 原思考参数重试——成功则思考保住，也不会把渠道误登记
+        // 成「拒收思考」（2026-11-05：deepseek 配 384000 被翻倍到 768000，超 393216 上限；
+        // 原顺序先剥参重试成功，思考被永久关掉，且每次重启都弹一次「端点拒绝思考参数」）。
+        if response.status().as_u16() == 400 && inflated {
+            let text = response.text().await.unwrap_or_default();
+            observability::event(
+                EventType::State,
+                json!({ "kind": "gateway.max_tokens_inflate_retry", "status": 400, "url": redact_url(&url), "model": model, "error_body": text.chars().take(300).collect::<String>() }),
+            );
+            let retry_body = build_body_with_compat(model, &outgoing, true, &eff_params, tools, &compat, &ctx.session_id);
+            let sent = Self::or_cancel(
+                cancel,
+                self.send(base_url, |c| Self::auth(c.post(&url), &channel.api_key, compat.protocol).json(&retry_body)),
+            )
+            .await;
+            let Some(sent) = sent else {
+                record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("cancelled", "用户取消".into()));
+                return Ok(ChatOutcome::Cancelled);
+            };
+            response = match sent {
+                Ok(r) => r,
+                Err(e) => {
+                    record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("error", format!("{e:#}")));
+                    return Err(anyhow!(
+                        "请求渠道失败: {}（{:#}；网络层不通：检查 Clash/系统代理；若程序刚重新构建过，可能是安全软件拦了新程序的联网）",
+                        redact_url(&url),
+                        e
+                    ));
+                }
+            };
+            if response.status().is_success() {
+                // 记住这个渠道：后续请求直接发原值，不再每轮先撞一次 400
+                self.mark_max_tokens_inflate_rejected(base_url, model);
+                observability::event(
+                    EventType::State,
+                    json!({ "kind": "gateway.max_tokens_inflate_fallback", "url": redact_url(&url), "model": model, "note": "扩容值超出模型硬上限，已回退配置原值；该渠道后续不再扩容" }),
+                );
+            }
+        }
+
         // 思考参数自适应降级：400 且请求带思考字段 → 剥参重试一次；
-        // 成功则登记该渠道（后续请求不再发思考字段），失败则抛出重试的真实错误
-        let mut degrade_retried = false;
+        // 成功则登记该渠道（后续请求不再发思考字段），失败则抛出重试的真实错误。
+        // 只有「原值 + 思考」也失败（上面没跑或重试仍 400）才走到这里，
+        // 避免把 max_tokens 超限误判成端点拒绝思考参数。
         if response.status().as_u16() == 400 && !degraded && Self::body_has_thinking_params(&body) {
-            degrade_retried = true;
             let text = response.text().await.unwrap_or_default();
             observability::event(
                 EventType::State,
@@ -1039,43 +1102,6 @@ impl Gateway {
                 observability::event(
                     EventType::State,
                     json!({ "kind": "gateway.thinking_degraded", "url": redact_url(&url), "model": model, "note": "端点拒收思考参数，剥参重试成功；该渠道后续请求不再发送思考字段" }),
-                );
-            }
-        }
-
-        // 扩容回退：扩容后的 max_tokens 超出该模型硬上限被 400 拒收 → 用配置原值
-        // 重试一次（思考参数不动；剥参重试已跑过则不重复——它本来就用的原值）
-        if response.status().as_u16() == 400 && inflated && !degrade_retried {
-            let text = response.text().await.unwrap_or_default();
-            observability::event(
-                EventType::State,
-                json!({ "kind": "gateway.max_tokens_inflate_retry", "status": 400, "url": redact_url(&url), "model": model, "error_body": text.chars().take(300).collect::<String>() }),
-            );
-            let retry_body = build_body_with_compat(model, &outgoing, true, &eff_params, tools, &compat, &ctx.session_id);
-            let sent = Self::or_cancel(
-                cancel,
-                self.send(base_url, |c| Self::auth(c.post(&url), &channel.api_key, compat.protocol).json(&retry_body)),
-            )
-            .await;
-            let Some(sent) = sent else {
-                record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("cancelled", "用户取消".into()));
-                return Ok(ChatOutcome::Cancelled);
-            };
-            response = match sent {
-                Ok(r) => r,
-                Err(e) => {
-                    record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("error", format!("{e:#}")));
-                    return Err(anyhow!(
-                        "请求渠道失败: {}（{:#}；网络层不通：检查 Clash/系统代理；若程序刚重新构建过，可能是安全软件拦了新程序的联网）",
-                        redact_url(&url),
-                        e
-                    ));
-                }
-            };
-            if response.status().is_success() {
-                observability::event(
-                    EventType::State,
-                    json!({ "kind": "gateway.max_tokens_inflate_fallback", "url": redact_url(&url), "model": model, "note": "扩容值超出模型硬上限，已回退配置原值" }),
                 );
             }
         }

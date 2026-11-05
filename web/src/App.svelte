@@ -206,6 +206,13 @@
       if (k !== todoDockKey || (!wasStreaming && nowStreaming)) todoDockDismissed = false;
       todoDockKey = k;
     }
+    // 草稿附件的「未能保留」通知：等这条会话的消息数组存在了再补（否则会建出
+    // 一个只有通知的数组，loadSession 见到「已有缓存」就不重建历史了）。
+    const pend = composerNotices[k];
+    if (pend && (sessionMsgs[k] || k === '@new')) {
+      delete composerNotices[k];
+      pushMsg(k, { id: nextId(), role: 'system', content: pend });
+    }
   }
   function setMsgs(key, arr) {
     sessionMsgs = { ...sessionMsgs, [key]: arr };
@@ -223,6 +230,16 @@
   // 会话 id 从 '@new' 变成服务端分配的 id：缓冲 / 流 / 队列一起挪过去
   function rekey(from, to) {
     if (!from || from === to) return;
+    // 输入区草稿跟着 key 走（'@new' → 真 id）。当前正显示的会话先把活输入落一次，
+    // 只挪存储里的旧副本会丢掉「上次切换后又敲的那几行」。
+    const isCur = curKey() === from;
+    if (isCur) persistComposer(from);
+    const cmap = composerMap();
+    if (cmap[from]) {
+      cmap[to] = cmap[from];
+      delete cmap[from];
+      composerWrite(cmap);
+    }
     const arr = sessionMsgs[from] || [];
     const nextMsgs = { ...sessionMsgs };
     delete nextMsgs[from];
@@ -258,8 +275,8 @@
       nextM[to] = m;
       approvalBySession = nextM;
     }
-    if (curKey() === from) {
-      setCurSession(to);
+    if (isCur) {
+      setCurSession(to, true); // 草稿已挪到 to，别再拿 from 的当前输入覆盖
       messages = arr;
     }
     syncCur();
@@ -469,6 +486,8 @@
   }
   onMount(() => {
     adoptWinApi();
+    // 输入区草稿：先按本标签页当前的 key 载入（随后恢复上次会话时由 setCurSession 换成那条的）
+    restoreComposer(curKey());
     window.addEventListener('agentwinready', adoptWinApi);
     // 插件桥监听必须**同步**挂：右栏面板（trace/board/usage 等）iframe 一 load 完就发
     // pawch:hello/pawch:request（旧名 agent: 兼容一个版本），而下面那个 onMount 的启动流水线要 await
@@ -1613,7 +1632,81 @@
   }
   let rpLoading = false;
   let rpPreviewPath = ''; // 最近预览的文件（产物列表高亮用）
-  let rpPreviewCache = {}; // path → { loading, content, error, editing, draft, saving, savedAt }（标签切换不重拉）
+  let rpPreviewCache = {}; // path → { loading, content, error, editing, draft, base, editNote, saving, savedAt }（标签切换不重拉）
+
+  // —— 文件预览的未保存修改：刷新/关标签/重开程序都不丢 ——
+  // 按「工作区 + 相对路径」存（不同工作区的同名文件不串）；同时存编辑起点内容。
+  // 恢复时若磁盘内容已经变了，仍然恢复草稿，但明确提示「保存会覆盖」。
+  const FILE_DRAFT_KEY = 'pawchFileDrafts';
+  function fileDraftKey(path) {
+    return `${workspace || ''}::${path}`;
+  }
+  function fileDraftMap() {
+    try {
+      const m = JSON.parse(localStorage.getItem(FILE_DRAFT_KEY) || '{}');
+      return m && typeof m === 'object' ? m : {};
+    } catch {
+      return {};
+    }
+  }
+  function fileDraftWrite(map) {
+    try {
+      localStorage.setItem(FILE_DRAFT_KEY, JSON.stringify(map));
+    } catch {
+      /* 配额满：本次不落盘 */
+    }
+  }
+  function forgetPreviewDraft(path) {
+    const map = fileDraftMap();
+    const k = fileDraftKey(path);
+    if (map[k]) {
+      delete map[k];
+      fileDraftWrite(map);
+    }
+  }
+  /// 关页/刷新前把「正在编辑且有改动」的标签落盘；已保存/已取消的清掉。
+  function persistFileDrafts() {
+    const map = fileDraftMap();
+    const now = Date.now();
+    for (const [path, c] of Object.entries(rpPreviewCache)) {
+      if (!c) continue;
+      const k = fileDraftKey(path);
+      if (c.editing && typeof c.draft === 'string' && c.draft !== (c.content || '')) {
+        map[k] = { draft: c.draft, base: typeof c.base === 'string' ? c.base : c.content || '', ts: now };
+      } else if (!c.editing) {
+        delete map[k];
+      }
+    }
+    let raw = JSON.stringify(map);
+    if (raw.length > 2_000_000) {
+      // 太大：只留最近改的一条；仍超就整批放弃（不把 localStorage 撑爆）
+      const latest = Object.entries(map).sort((a, b) => (b[1].ts || 0) - (a[1].ts || 0))[0];
+      const trimmed = latest ? { [latest[0]]: latest[1] } : {};
+      fileDraftWrite(JSON.stringify(trimmed).length <= 2_000_000 ? trimmed : {});
+      return;
+    }
+    fileDraftWrite(map);
+  }
+  function restorePreviewDraft(path, content) {
+    const map = fileDraftMap();
+    const k = fileDraftKey(path);
+    const e = map[k];
+    if (!e || typeof e.draft !== 'string') return;
+    if (e.draft === content) {
+      delete map[k];
+      fileDraftWrite(map);
+      return;
+    }
+    const stale = typeof e.base === 'string' && e.base !== content;
+    rpSet(path, {
+      editing: true,
+      draft: e.draft,
+      base: content,
+      editNote: stale
+        ? '磁盘上的文件已变化；这是刷新前未保存的草稿，保存会覆盖磁盘上的新内容'
+        : '已恢复刷新前未保存的修改',
+    });
+  }
   let dockPaneFrames = {}; // 插件标签的 iframe（bind:this），按插件名
 
   // —— 网页（右侧面板「网页」页签）——
@@ -2640,9 +2733,16 @@
     if (!rpTabs.some((t) => t.key === p.key)) rpTabs = [...rpTabs, { key: p.key, kind: p.kind, name: p.name, title: p.title }];
     activateRpTab(p.key);
   }
-  function closeRpTab(key) {
+  async function closeRpTab(key) {
     const i = rpTabs.findIndex((t) => t.key === key);
     if (i < 0) return;
+    const t = rpTabs[i];
+    const c = t.kind === 'file' ? rpPreviewCache[t.path] : null;
+    if (c && c.editing && (c.draft || '') !== (c.content || '')) {
+      const ok = await confirmAsk(`「${t.title || t.path}」有未保存的修改，仍要关闭？`);
+      if (!ok) return;
+      forgetPreviewDraft(t.path);
+    }
     const rest = rpTabs.filter((t) => t.key !== key);
     rpTabs = rest;
     if (rpTab === key) {
@@ -2760,7 +2860,7 @@
     const kind = previewKind(path);
     const hit = rpPreviewCache[path];
     if (hit && !hit.loading && !hit.error && hit.content !== undefined && !force) return;
-    rpSet(path, { loading: true, error: '', editing: false, draft: '', savedAt: '' });
+    rpSet(path, { loading: true, error: '', editing: false, draft: '', base: '', editNote: '', savedAt: '' });
     // 图片/PDF/音视频走 /api/workspace/raw 直出渲染，不去拉文本（拉了必 400，白留一条控制台报错）
     if (kind === 'image' || kind === 'pdf' || kind === 'media') {
       rpSet(path, { loading: false, content: '', error: '' });
@@ -2786,16 +2886,21 @@
       // 文档容器走文本抽取端点，其余按文本读
       const url = kind === 'doc' ? `/api/workspace/doc?path=${encodeURIComponent(path)}` : `/api/workspace/file?path=${encodeURIComponent(path)}`;
       const r = await fetch(url).then((r) => r.json());
-      rpSet(path, { loading: false, content: r.ok ? (kind === 'doc' ? r.text : r.content) : '', error: r.ok ? '' : r.error || '读取失败' });
+      const content = r.ok ? (kind === 'doc' ? r.text : r.content) : '';
+      rpSet(path, { loading: false, content, error: r.ok ? '' : r.error || '读取失败' });
+      // 刷新/重开前只改了一半的文件：内容读回来之后把草稿铺回去（编辑态 + 可见提示）
+      if (r.ok && kind === 'text' && content && !previewTruncated(content)) restorePreviewDraft(path, content);
     } catch (e) {
       rpSet(path, { loading: false, content: '', error: e.message || String(e) });
     }
   }
   function startEditPreview(path) {
-    rpSet(path, { editing: true, draft: (rpPreviewCache[path] || {}).content || '', error: '' });
+    const base = (rpPreviewCache[path] || {}).content || '';
+    rpSet(path, { editing: true, draft: base, base, editNote: '', error: '' });
   }
   function cancelEditPreview(path) {
-    rpSet(path, { editing: false, draft: '' });
+    rpSet(path, { editing: false, draft: '', base: '', editNote: '' });
+    forgetPreviewDraft(path);
   }
   async function savePreview(path) {
     const hit = rpPreviewCache[path] || {};
@@ -2811,11 +2916,14 @@
         rpSet(path, { saving: false, error: r.error || '保存失败' });
         return;
       }
+      forgetPreviewDraft(path);
       rpSet(path, {
         saving: false,
         content: hit.draft || '',
         editing: false,
         draft: '',
+        base: '',
+        editNote: '',
         savedAt: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
       });
     } catch (e) {
@@ -3904,6 +4012,7 @@
     resetComposerHeight();
     pendingAttachments = [];
     pendingConvs = [];
+    persistComposer(key); // 已发出去：该会话的草稿要清掉，别切回来又冒出来
     if (streams[key]) {
       queueOut(key, msg, atts, convs);
       return;
@@ -3913,9 +4022,9 @@
 
   // 排队：先显示成「排队中」气泡，当前这一轮结束后自动按序发出
   function queueOut(key, text, atts, convs = []) {
-    const item = { id: nextId(), text, atts, convs };
+    const item = { id: nextId(), text, atts, convs, ts: Date.now() };
     outbox = { ...outbox, [key]: [...(outbox[key] || []), item] };
-    pushMsg(key, { id: item.id, role: 'user', content: text, attachments: atts, convs, queued: true, ts: Date.now() });
+    pushMsg(key, { id: item.id, role: 'user', content: text, attachments: atts, convs, queued: true, ts: item.ts });
   }
 
   // 把「已经上屏的那条用户气泡」转成排队（服务端说这个会话在跑时用；不新增气泡）
@@ -3926,7 +4035,7 @@
     updMsgs(key, (a) =>
       hit ? a.map((m) => (m.id === id ? { ...m, queued: true } : m)) : [...a, { id, role: 'user', content: text, attachments: atts, convs, queued: true, ts: Date.now() }]
     );
-    outbox = { ...outbox, [key]: [...(outbox[key] || []), { id, text, atts, convs }] };
+    outbox = { ...outbox, [key]: [...(outbox[key] || []), { id, text, atts, convs, ts: Date.now() }] };
     return id;
   }
 
@@ -4315,12 +4424,7 @@
         // 的话跑完一轮面板还是旧数据，得用户手点刷新
         notifyExtsSession(skey);
         // 出队（027）：这一轮跑完了，把排在最前的排队消息自动发出去（发完它再发下一条）
-        const q = outbox[skey] || [];
-        if (q.length > 0 && !streams[skey]) {
-          const [item, ...rest] = q;
-          outbox = { ...outbox, [skey]: rest };
-          deliver(skey, item.text, item.atts, { bubbleId: item.id, convs: item.convs });
-        }
+        drainOutbox(skey);
       }
     }
     return ok;
@@ -4604,9 +4708,7 @@
         clearInterval(reconcileTimers[skey]);
         delete reconcileTimers[skey];
         // 这一轮已经结束：刷新快照的使命完成，清掉避免下次误用旧内容
-        try {
-          sessionStorage.removeItem(LIVE_STASH_KEY);
-        } catch {}
+        clearLiveStash();
         if (currentSessionId !== skey) {
           // 不在这个会话的页面：丢掉本地陈旧缓冲，下次打开时从服务端重建
           const next = { ...sessionMsgs };
@@ -4620,6 +4722,13 @@
           sessionMsgs = { ...sessionMsgs, [skey]: rebuildFromSession(r.messages || []) };
           syncCur();
           loadSessions();
+        }
+        // 文件重载会把「排队中」气泡冲掉：先把 outbox 里的消息铺回气泡，再按序补发
+        // （刷新前排的队不能在重载后无声消失）。
+        const q = outbox[skey] || [];
+        if (q.length) {
+          restoreQueuedOutbox(skey, q);
+          drainOutbox(skey);
         }
       } catch (e) {
         // 网络抖动：下一跳再试；但服务长时间不可达时不能无限转——攒够次数收工
@@ -4697,6 +4806,38 @@
       sessions = [];
       // 启动路径失败必须可见：否则侧栏空着、看起来像历史全丢（2026-10-27 实锤）
       if (autoPick) startupError = `[启动失败] 读取会话列表失败：${e.message || e}`;
+    }
+  }
+
+  /// 会话清单刷新时顺手处理「内容被后台改过」的会话：
+  /// - 其它会话：丢掉本地消息缓存，下次打开从文件重建
+  /// - 当前正看着的会话：本页没在跑就直接从文件重载视图（定时/CLI 唤醒跑完要当场看见）
+  /// 只认 count 变化——改标题也会动 updated_at，但消息没变，不该白重拉。
+  async function refreshSessionsAndDropStale() {
+    const before = new Map(sessions.map((s) => [s.id, s.count === undefined ? -1 : s.count]));
+    await loadSessions();
+    if (!before.size) return; // 首次加载没有旧值可比
+    const changed = [];
+    for (const s of sessions) {
+      const prev = before.get(s.id);
+      if (prev === undefined) continue; // 新会话：本来就没有缓存
+      if ((s.count === undefined ? -1 : s.count) !== prev) changed.push(s.id);
+    }
+    if (!changed.length) return;
+    const next = { ...sessionMsgs };
+    for (const id of changed) if (!streams[id]) delete next[id];
+    sessionMsgs = next;
+    const cur = currentSessionId;
+    if (cur && changed.includes(cur) && !streams[cur]) {
+      try {
+        const r = await fetch(`/api/session?id=${encodeURIComponent(cur)}`).then((x) => x.json());
+        if (Array.isArray(r.messages) && r.messages.length) {
+          sessionMsgs = { ...sessionMsgs, [cur]: rebuildFromSession(r.messages) };
+          syncCur();
+        }
+      } catch {
+        /* 读不到就保持屏幕上的旧内容，下一轮通知再试 */
+      }
     }
   }
 
@@ -4793,18 +4934,27 @@
       fetch(`/api/cancel?session=${encodeURIComponent(id)}`)
         .then((r) => r.json())
         .then((c) => {
+          const stashed = readLiveStash(id);
           if (c.running && !streams[id]) {
             // 刷新恢复：服务端文件此刻通常只有用户消息（助手内容还在流里），先把刷新前的
             // 内存快照铺回去；跑完由 reconcileServerQueued 用落盘结果替换。
-            const stashed = readLiveStash(id);
-            if (stashed) {
+            if (stashed && Array.isArray(stashed.msgs) && stashed.msgs.length) {
               sessionMsgs = {
                 ...sessionMsgs,
-                [id]: stashed.map((m) => (m.streaming ? { ...m, streaming: false } : m)),
+                [id]: stashed.msgs.map((m) => (m.streaming ? { ...m, streaming: false } : m)),
               };
               if (currentSessionId === id) syncCur();
             }
             reconcileServerQueued(id);
+          }
+          // 刷新前排队、还没发出去的消息：会话文件里没有它们，铺回气泡并补发。
+          // 服务端还在跑就先等对账（reconcile 收尾时会接上出队）。
+          if (stashed && Array.isArray(stashed.outbox) && stashed.outbox.length) {
+            restoreQueuedOutbox(id, stashed.outbox);
+            if (!c.running) {
+              clearLiveStash();
+              drainOutbox(id);
+            }
           }
         })
         .catch(() => {});
@@ -6053,7 +6203,7 @@
     sessions_changed: {
       kind: 'sessions_changed', title: '（内部）会话清单刷新', risk: 'safe', internal: true,
       async run() {
-        await loadSessions();
+        await refreshSessionsAndDropStale();
         // 2026-10-08 修：多窗口改名后本窗口顶栏标题停在旧值——displayTitle 优先取
         // currentTitle（本地快照），只刷列表不刷它。列表标题本就是权威值（含首条
         // 消息兜底），从新列表里取当前会话的标题对齐（本窗口自己改名走本地更新）。
@@ -7040,14 +7190,25 @@
   /// 刷新/重载时把「正在跑的会话」的内存消息打个快照：整页导航会丢内存态，
   /// 服务端此刻通常只落了用户消息（助手内容还在流里），不兜这一层用户会以为内容丢了。
   /// 只存当前标签页（sessionStorage），只认 10 分钟内、同一会话、且服务端仍 running。
+  /// 排队待发的消息（outbox）一起存：服务端文件里没有它们，不存就永远发不出去了。
   const LIVE_STASH_KEY = 'pawchLiveStash';
   function stashLiveState() {
     try {
       const key = curKey();
-      if (!streams[key]) return; // 没有在跑的流，不需要兜
+      // 草稿与文件预览的未保存修改跟「有没有流」无关：每次离开页面都落一次
+      persistComposer(key);
+      persistFileDrafts();
+      if (!streams[key]) return; // 没有在跑的流，消息快照不需要兜
       const msgs = sessionMsgs[key];
       if (!msgs || !msgs.length) return;
-      const raw = JSON.stringify({ sid: currentSessionId || '', ts: Date.now(), msgs });
+      const queued = (outbox[key] || []).map((it) => ({
+        id: it.id,
+        text: it.text,
+        atts: it.atts || [],
+        convs: it.convs || [],
+        ts: it.ts || Date.now(),
+      }));
+      const raw = JSON.stringify({ sid: currentSessionId || '', ts: Date.now(), msgs, outbox: queued });
       if (raw.length > 2_000_000) return; // 超配额就放弃（会话太大，宁可不兜）
       sessionStorage.setItem(LIVE_STASH_KEY, raw);
     } catch {}
@@ -7059,13 +7220,103 @@
       const d = JSON.parse(raw);
       if (!d || d.sid !== id || !Array.isArray(d.msgs) || !d.msgs.length) return null;
       if (Date.now() - (d.ts || 0) > 10 * 60 * 1000) return null;
-      return d.msgs;
+      return d;
     } catch {
       return null;
     }
   }
-  /// 切换当前会话的唯一入口：赋值 + 广播。
-  function setCurSession(id) {
+  function clearLiveStash() {
+    try {
+      sessionStorage.removeItem(LIVE_STASH_KEY);
+    } catch {}
+  }
+  /// 刷新前排队、但还没发出去的消息：服务端会话文件里没有它们。
+  /// 从快照恢复时先把「排队中」气泡铺回去，再接上正常出队流程。
+  function restoreQueuedOutbox(key, items) {
+    const clean = items
+      .filter((it) => it && it.id)
+      .map((it) => ({ id: it.id, text: it.text || '', atts: it.atts || [], convs: it.convs || [], ts: it.ts || Date.now() }));
+    if (!clean.length) return;
+    outbox = { ...outbox, [key]: clean };
+    const have = new Set((sessionMsgs[key] || []).map((m) => m.id));
+    const bubbles = clean
+      .filter((it) => !have.has(it.id))
+      .map((it) => ({ id: it.id, role: 'user', content: it.text, attachments: it.atts, convs: it.convs, queued: true, ts: it.ts }));
+    if (bubbles.length) updMsgs(key, (a) => [...a, ...bubbles]);
+  }
+  /// 出队一条：这一轮已经结束，把排在最前的排队消息发出去（发完它再发下一条）。
+  function drainOutbox(key) {
+    const q = outbox[key] || [];
+    if (!q.length || streams[key]) return;
+    const [item, ...rest] = q;
+    outbox = { ...outbox, [key]: rest };
+    deliver(key, item.text, item.atts, { bubbleId: item.id, convs: item.convs });
+  }
+
+  // —— 输入区草稿：按会话隔离，切会话/刷新/重开程序都不丢 ——
+  // 存 localStorage（不是 sessionStorage）：关掉窗口再开，草稿也该还在。
+  // 附件是 dataURL，可能很大：先试全量，超配额就退化成只存文字/引用并记下丢掉的附件数。
+  const COMPOSER_KEY = 'pawchComposerDrafts';
+  let composerNotices = {}; // key → 待补的通知（等这条会话的消息载入后再 push，避免顶掉历史）
+  function composerMap() {
+    try {
+      const m = JSON.parse(localStorage.getItem(COMPOSER_KEY) || '{}');
+      return m && typeof m === 'object' ? m : {};
+    } catch {
+      return {};
+    }
+  }
+  function composerWrite(map) {
+    try {
+      localStorage.setItem(COMPOSER_KEY, JSON.stringify(map));
+    } catch {
+      /* 配额满：本次不落盘，内存里的草稿仍在 */
+    }
+  }
+  /// 把当前输入区存到 key 名下；空输入 = 删除该会话的草稿。
+  function persistComposer(key) {
+    const map = composerMap();
+    const entry = { text: input, atts: pendingAttachments, convs: pendingConvs, ts: Date.now() };
+    const empty = !entry.text.trim() && !entry.atts.length && !entry.convs.length;
+    if (empty) {
+      if (map[key]) {
+        delete map[key];
+        composerWrite(map);
+      }
+      return;
+    }
+    try {
+      localStorage.setItem(COMPOSER_KEY, JSON.stringify({ ...map, [key]: entry }));
+    } catch {
+      map[key] = { text: entry.text, atts: [], convs: entry.convs, dropped: entry.atts.length, ts: entry.ts };
+      composerWrite(map);
+    }
+  }
+  /// 载入 key 名下的草稿（没有就清空输入区）。附件被配额挤掉时留一句可见说明。
+  function restoreComposer(key) {
+    const map = composerMap();
+    const e = map[key];
+    input = e && typeof e.text === 'string' ? e.text : '';
+    pendingAttachments = e && Array.isArray(e.atts) ? e.atts : [];
+    pendingConvs = e && Array.isArray(e.convs) ? e.convs : [];
+    if (e && e.dropped) {
+      // 不能在这里直接 pushMsg：会话消息还没载入时 push 会建出一个「只有通知」的数组，
+      // loadSession 见到 sessionMsgs[key] 已存在就不再从文件重建——历史会整个不显示。
+      // 先挂起，等消息载入后由 syncCur 补上。
+      composerNotices[key] = `[通知] 刷新前的 ${e.dropped} 个附件体积较大，未能随草稿保留；请重新添加`;
+      delete map[key];
+      composerWrite(map);
+    }
+    tick().then(() => resetComposerHeight());
+  }
+  /// 切换当前会话的唯一入口：赋值 + 广播（草稿跟着会话走：先存旧的，再载入新的）。
+  function setCurSession(id, skipComposer = false) {
+    const prev = currentSessionId || '@new';
+    const next = id || '@new';
+    if (!skipComposer && prev !== next) {
+      persistComposer(prev);
+      restoreComposer(next);
+    }
     currentSessionId = id;
     // 本标签页「上次看的是哪条」——sessionStorage 刷新保留、重开软件/新标签页不继承，
     // 正好给「重新加载界面」兜底：整页导航会丢内存态，启动时靠它原地恢复（D6 期间
@@ -8626,6 +8877,9 @@
                   <button class="rp-refresh" title="重新读取" on:click={() => loadPreview(t.path, true)}>↻</button>
                 </div>
                 {#if (rpPreviewCache[t.path] || {}).editing}
+                  {#if (rpPreviewCache[t.path] || {}).editNote}
+                    <div class="rp-edit-note">{(rpPreviewCache[t.path] || {}).editNote}</div>
+                  {/if}
                   <textarea
                     class="rp-edit"
                     spellcheck="false"
@@ -10922,6 +11176,17 @@
   .rp-doc-paper {
     border: 1px solid var(--g3);
     border-radius: 6px;
+  }
+  .rp-edit-note {
+    flex: none;
+    margin: 0 0 6px;
+    padding: 6px 9px;
+    border-radius: 6px;
+    border: 1px solid color-mix(in srgb, var(--tint-yellow-fg) 40%, transparent);
+    background: var(--tint-yellow-bg);
+    color: var(--tint-yellow-fg);
+    font-size: 12px;
+    line-height: 1.5;
   }
   .rp-edit {
     flex: 1;
