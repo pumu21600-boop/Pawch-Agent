@@ -944,7 +944,7 @@
       startupError = `[启动失败] 读取设置失败：${e.message || e}`;
       return false;
     }
-    await loadSessions(true); // 内部失败会写 startupError（autoPick 分支）
+    await loadSessions(true, true); // 内部失败会写 startupError（autoPick 分支）；刷新后原地恢复
     return !startupError;
   }
 
@@ -4636,7 +4636,7 @@
     '新的对话';
 
   // —— 多会话：列表 / 切换 / 新建（新建不清空历史）——
-  async function loadSessions(autoPick = false) {
+  async function loadSessions(autoPick = false, restoreSaved = false) {
     try {
       const r = await fetch('/api/sessions').then((r) => r.json());
       projectName = r.project || '';
@@ -4647,17 +4647,44 @@
       // 无 workspace 标记的遗留会话不许自动弹：新建工作区会翻出最老的一批测试会话
       // （2026-09-29 真机实测「只回复两个字：收到」轮）；侧栏「未分组」里仍可手动打开。
       if (autoPick && currentSessionId === null) {
-        const mine = sessions.filter(
-          (s) =>
-            s.workspace &&
-            normPath(s.workspace).toLowerCase() === normPath(workspace).toLowerCase() &&
-            !isLegacySession(s),
-        );
-        // 重启后默认打开最近一条**有内容**的会话：侧栏最上面可能是一条空的新对话
-        // （用户刚点过「新对话」），直接打开它看起来就像「历史/思考/工具调用被清掉了」。
-        // 全空时才退回首条（保持原有的空项目行为）。
-        const pick = mine.find((s) => (s.count || 0) > 0) || mine[0];
-        if (pick) await loadSession(pick.id);
+        // 刷新/重新加载界面（整页导航）先回到本标签页上次看的那条，而不是每次都被
+        // 「最近一条非空会话」顶走。只有应用启动这条路传 restoreSaved=true；切工作区
+        // 仍走原来的自动选最近一条（那是「换项目」的语义，不是刷新）。
+        let restored = false;
+        if (restoreSaved) {
+          let saved = '';
+          try {
+            saved = sessionStorage.getItem('curSession') || '';
+          } catch {}
+          if (saved === '@new') {
+            restored = true; // 上次停在「新对话」：保持空白新对话，不跳历史
+          } else if (saved) {
+            const s = sessions.find((x) => x.id === saved);
+            if (
+              s &&
+              !s.archived &&
+              s.workspace &&
+              normPath(s.workspace).toLowerCase() === normPath(workspace).toLowerCase() &&
+              !isLegacySession(s)
+            ) {
+              await loadSession(saved);
+              restored = true;
+            }
+          }
+        }
+        if (!restored) {
+          const mine = sessions.filter(
+            (s) =>
+              s.workspace &&
+              normPath(s.workspace).toLowerCase() === normPath(workspace).toLowerCase() &&
+              !isLegacySession(s),
+          );
+          // 重启后默认打开最近一条**有内容**的会话：侧栏最上面可能是一条空的新对话
+          // （用户刚点过「新对话」），直接打开它看起来就像「历史/思考/工具调用被清掉了」。
+          // 全空时才退回首条（保持原有的空项目行为）。
+          const pick = mine.find((s) => (s.count || 0) > 0) || mine[0];
+          if (pick) await loadSession(pick.id);
+        }
       }
     } catch (e) {
       sessions = [];
@@ -6994,6 +7021,12 @@
   /// 切换当前会话的唯一入口：赋值 + 广播。
   function setCurSession(id) {
     currentSessionId = id;
+    // 本标签页「上次看的是哪条」——sessionStorage 刷新保留、重开软件/新标签页不继承，
+    // 正好给「重新加载界面」兜底：整页导航会丢内存态，启动时靠它原地恢复（D6 期间
+    // 真机反馈：左上角刷新按钮每次都会跳到最近一条对话）。null = 停在「新对话」。
+    try {
+      sessionStorage.setItem('curSession', id || '@new');
+    } catch {}
     notifyExtsSession(id);
   }
 
