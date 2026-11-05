@@ -698,6 +698,8 @@ mod tests {
     /// 被误读成「全量跑过」。本机运行时会看到 RUN，而不是 SKIPPED。
     #[test]
     fn host_limitation_report() {
+        // 单独跑（CI 的 job summary 步骤）时没有别的用例替它初始化 logger
+        init_logger();
         match restricted_host_limitation() {
             Some(reason) => println!("[sandbox-probe] SKIPPED：{reason}"),
             None => {
