@@ -93,7 +93,9 @@ jobs:
   # 供应链审计（D7）：已知漏洞 / 许可证白名单 / 依赖来源。策略见仓库根 deny.toml。
   supply-chain:
     name: 供应链（cargo deny）
-    runs-on: ubuntu-latest
+    # 必须跑 Windows：rust-toolchain.toml 钉的是 stable-x86_64-pc-windows-msvc，
+    # Linux runner 上 rustup 会直接报 `target tuple in channel name` 退出（不是 deny 的结论）。
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
