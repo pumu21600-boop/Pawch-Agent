@@ -700,39 +700,41 @@ Content-Length: 2
     /// 旧顺序先剥参重试（去掉 thinking 后 max_tokens 恰好回到配置原值，于是成功），
     /// 把渠道永久登记成 thinking_degraded——思考被关掉，每次重启还弹一次通知。
     /// 正确行为：先用「配置原值 + 思考」重试，成功则保住思考；后续请求不再扩容。
-    #[tokio::test]
-    async fn max_tokens_400_keeps_thinking() {
-        use std::io::{Read, Write};
-
-        fn read_request(s: &mut std::net::TcpStream) -> String {
-            let mut buf = Vec::new();
-            let mut tmp = [0u8; 4096];
-            loop {
-                let n = s.read(&mut tmp).unwrap_or(0);
-                if n == 0 {
+    /// 读一个完整 HTTP 请求（headers + Content-Length 指定的 body），测试 mock 用。
+    fn read_http_request(s: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        loop {
+            let n = s.read(&mut tmp).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buf[..pos]).to_string();
+                let len = head
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        if k.eq_ignore_ascii_case("content-length") {
+                            v.trim().parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                if buf.len() >= pos + 4 + len {
                     break;
                 }
-                buf.extend_from_slice(&tmp[..n]);
-                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                    let head = String::from_utf8_lossy(&buf[..pos]).to_string();
-                    let len = head
-                        .lines()
-                        .find_map(|l| {
-                            let (k, v) = l.split_once(':')?;
-                            if k.eq_ignore_ascii_case("content-length") {
-                                v.trim().parse::<usize>().ok()
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or(0);
-                    if buf.len() >= pos + 4 + len {
-                        break;
-                    }
-                }
             }
-            String::from_utf8_lossy(&buf).to_string()
         }
+        String::from_utf8_lossy(&buf).to_string()
+    }
+
+    #[tokio::test]
+    async fn max_tokens_400_keeps_thinking() {
+        use std::io::Write;
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -742,7 +744,7 @@ Content-Length: 2
             for i in 0..2 {
                 let (mut s, _) = listener.accept().unwrap();
                 let _ = s.set_nonblocking(false);
-                let raw = read_request(&mut s);
+                let raw = read_http_request(&mut s);
                 if let Some(body) = raw.split("\r\n\r\n").nth(1)
                     && let Ok(v) = serde_json::from_str::<Value>(body)
                 {
@@ -806,4 +808,77 @@ Content-Length: 2
         assert!(matches!(out, Ok(ChatOutcome::Done(_))), "回退后应成功");
         assert!(!gw.thinking_is_degraded(&base, "deepseek-flash"), "不能误登记成端点拒收思考");
         assert!(gw.max_tokens_inflate_rejected(&base, "deepseek-flash"), "应记住该渠道不再扩容");
+    }
+
+    /// 2026-11-05 回归：渠道偶发 502 时最多重试 5 次（退避 1s/2s/3s/4s/5s），
+    /// 第 6 次成功则整轮照常继续；重试请求体保持一致，不偷偷改参数。
+    #[tokio::test]
+    async fn server_error_retries_five_times_then_succeeds() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let bodies2 = bodies.clone();
+        let handle = std::thread::spawn(move || {
+            for i in 0..6 {
+                let (mut s, _) = listener.accept().unwrap();
+                let _ = s.set_nonblocking(false);
+                let raw = read_http_request(&mut s);
+                if let Some(body) = raw.split("\r\n\r\n").nth(1)
+                    && let Ok(v) = serde_json::from_str::<Value>(body)
+                {
+                    bodies2.lock().unwrap().push(v);
+                }
+                if i < 5 {
+                    let body = "error code: 502\n";
+                    let resp = format!(
+                        "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = s.write_all(resp.as_bytes());
+                } else {
+                    let chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        chunk.len(),
+                        chunk
+                    );
+                    let _ = s.write_all(resp.as_bytes());
+                }
+                let _ = s.flush();
+            }
+        });
+
+        init_logger();
+        let base = format!("http://127.0.0.1:{port}/v1");
+        let gw = Arc::new(Gateway::new());
+        let params = ChatParams {
+            provider_id: Some("deepseek".into()),
+            max_tokens: Some(384000),
+            thinking: Some("max".into()),
+            ..Default::default()
+        };
+        let ch = Channel::new(&base, "deepseek-flash", "sk-test", params);
+        let cancel = Arc::new(CancelFlag::new());
+        let started = Instant::now();
+        let out = gw
+            .stream_chat(
+                &UsageCtx::main("sess-5xx"),
+                &ch,
+                &json!([{"role":"user","content":"hi"}]),
+                None,
+                &cancel,
+                None,
+                |_| {},
+            )
+            .await;
+        handle.join().unwrap();
+
+        let captured = bodies.lock().unwrap().clone();
+        assert_eq!(captured.len(), 6, "1 次原请求 + 5 次重试: {captured:?}");
+        assert!(captured.iter().all(|b| b["max_tokens"].as_u64() == Some(768000)), "重试体保持一致");
+        assert!(matches!(out, Ok(ChatOutcome::Done(_))), "第 6 次成功后应正常完成");
+        assert!(started.elapsed() >= std::time::Duration::from_secs(15), "5 次退避应累计 15s");
     }

@@ -374,7 +374,7 @@ pub(crate) async fn dispatch(cmd: BrowserCommand, max_chars: usize) -> Result<St
                 _ => "无头 Edge/Chrome + 页面级 CDP".to_string(),
             };
             return Ok(format!(
-                "内置浏览器（{host}）。方法: {}。\n定位优先级: ref → selector → text/label 语义 → x/y 坐标；快照/定位/求值均在隔离世界执行，页面脚本无法篡改。截图类方法刷新网页面板画面；agent 侧读取页面请用 snapshot。",
+                "内置浏览器（{host}）。方法: {}。\n定位优先级: ref → selector → text/label 语义 → x/y 坐标；快照/定位/求值均在隔离世界执行，页面脚本无法篡改。截图默认把图片放进对话（silent=true 只给模型看、不展示）；agent 侧读取页面请用 snapshot。",
                 ALL_METHODS.join(" / ")
             ));
         }
@@ -671,7 +671,7 @@ pub(crate) async fn dispatch(cmd: BrowserCommand, max_chars: usize) -> Result<St
             tokio::time::sleep(Duration::from_millis(200)).await;
             Ok(format!("已从 ({fx},{fy}) 拖到 ({tx},{ty})"))
         }
-        BrowserCommand::Screenshot { reference, full_page, clip, .. } => {
+        BrowserCommand::Screenshot { reference, full_page, clip, silent, .. } => {
             // agent 侧拿不到图片内容（文本通道）：截图落进面板帧缓冲，用户可在面板直接看
             let mut params = json!({ "format": "jpeg", "quality": 80 });
             if full_page == Some(true) {
@@ -726,15 +726,50 @@ pub(crate) async fn dispatch(cmd: BrowserCommand, max_chars: usize) -> Result<St
                 .map_err(|e| BrowserError::new(ErrorCode::ExecutionError, format!("截图 base64 解码失败: {e}")))?;
             *tab.frame.lock().await = Some(Frame { data: bytes.clone() });
             let st = page_state(&tab).await?;
+            // 静默截图（2026-11-05 用户要的「自检用，别打扰对话」）：图照样内联给模型，
+            // 但不落盘、结果里也不写图片链接——前端只认链接，对话里就不会出现。
+            let silent = silent == Some(true);
             // 「聊天界面显示图片」：截图同时落一份到工作区，
-            // 返回里带 markdown 图片语法——前端 md() 把 ![](路径) 渲染成图，
-            // 模型也能据此引用（此前只推面板，聊天里什么都看不到）。
-            let shot_line = match save_shot_to_workspace(&bytes) {
-                Some(rel) => format!("\n截图已保存：{rel}\n![页面截图]({rel})\n"),
-                None => String::new(),
+            // 返回里带 markdown 图片语法——前端工具卡默认收起，看不到结果里的字，
+            // 所以前端会把这段图片直接在对话里摊开（2026-11-05 用户实锤「截完
+            // 一直不发给我，一直说保存在浏览器面板」）。截图行必须放最前：
+            // tool_result 的预览只截前 300 字，放后面会被截掉、前端就取不到图。
+            let shot_line = if silent {
+                String::new()
+            } else {
+                match save_shot_to_workspace(&bytes) {
+                    Some(rel) => format!("![页面截图]({rel})\n截图已保存：{rel}\n"),
+                    None => String::new(),
+                }
+            };
+            // 内联给模型：和 computer 截图用同一个标记（exec 层剥出后升级成多模态 tool 消息）。
+            // 只返回 markdown 路径的话模型看不见像素，就会退回去用 computer 截整个桌面——
+            // 又慢，还会把编辑器/聊天窗一起拍进去。页面截图直接内联，模型看这个就够。
+            // 超大整页图（>2MB）不内联，避免把请求撑爆；仍可用落盘路径/快照验收。
+            let inline = if bytes.len() <= 2_000_000 {
+                format!("{}{}{}", crate::computer::IMG_OPEN, data, crate::computer::IMG_CLOSE)
+            } else {
+                String::new()
+            };
+            // 「刷新到网页面板」只对无头模式成立：壳模式的面板是活页面（真 webview），
+            // 截图帧根本不进面板——旧文案让模型对用户说「已保存在浏览器面板」，
+            // 用户却只看到实时页面（2026-11-05 实锤）。
+            let panel_note = if silent {
+                if inline.is_empty() {
+                    // 静默图没有落盘路径兜底：不内联 = 模型什么都看不到，必须明说
+                    "内部截图没有内联（超过 2MB，模型看不到）；请改用局部截图"
+                } else {
+                    "内部截图（只给你自己看，未在对话中展示）"
+                }
+            } else if session.mode == HostMode::Shell {
+                "截图已拍下（网页面板显示实时页面，截图在对话里）"
+            } else {
+                "截图已刷新到网页面板"
             };
             Ok(format!(
-                "截图已刷新到网页面板{}。{}{}",
+                "{}{}{}。{}{}",
+                shot_line,
+                panel_note,
                 if full_page == Some(true) {
                     "（整页）"
                 } else if element_clip.is_some() {
@@ -742,8 +777,8 @@ pub(crate) async fn dispatch(cmd: BrowserCommand, max_chars: usize) -> Result<St
                 } else {
                     ""
                 },
-                shot_line,
-                st.render()
+                st.render(),
+                inline
             ))
         }
         BrowserCommand::GetState { .. } => {

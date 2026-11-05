@@ -543,6 +543,7 @@ pub(crate) async fn launch() -> Result<Arc<BrowserSession>, String> {
                     shell_tab: std::sync::Mutex::new(None),
                     panel_showing: std::sync::Mutex::new(false),
         shell_suppress: std::sync::Mutex::new(false),
+                    shell_suppress_applied: std::sync::Mutex::new(false),
                     shell_shown: std::sync::Mutex::new(None),
                     last_rect: std::sync::Mutex::new(None),
                     last_frame_poll_ms: AtomicU64::new(0),
@@ -588,6 +589,7 @@ pub(crate) async fn shell_launch() -> Result<Arc<BrowserSession>, String> {
         shell_tab: std::sync::Mutex::new(None),
         panel_showing: std::sync::Mutex::new(false),
                     shell_suppress: std::sync::Mutex::new(false),
+        shell_suppress_applied: std::sync::Mutex::new(false),
         shell_shown: std::sync::Mutex::new(None),
         last_rect: std::sync::Mutex::new(None),
         last_frame_poll_ms: AtomicU64::new(0),
@@ -771,7 +773,31 @@ pub(crate) async fn sync_shell_visibility(session: &Arc<BrowserSession>, tabs: &
         None
     };
     let cur = session.shell_shown.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    if cur == want_label && !session.shell_suppressed() {
+    let suppressed = session.shell_suppressed();
+    let applied = *session.shell_suppress_applied.lock().unwrap_or_else(|e| e.into_inner());
+    // 显示中的页没变、抑制状态也没变：什么都不用发。帧轮询是 33ms 一次，
+    // 每次调用都走一遍下面的隐藏/显示会把网页闪成频闪灯（2026-11-06 实测
+    // 弹窗期间 3 秒 285 条壳指令）。
+    if cur == want_label && suppressed == applied {
+        return;
+    }
+    if cur == want_label {
+        // 同一页只是换位置（弹窗让位/回位）：只改矩形，**不隐藏再显示**——
+        // 隐藏/显示各闪一次，加上回位后的矩形变化就是「闪三下」的来源。
+        if let (Some(label), Some(tab)) = (
+            want_label.as_deref(),
+            tabs.iter().find(|t| t.shell_label.as_deref() == want_label.as_deref()),
+        ) {
+            let (x, y, w, h) = shell_rect_for(session, tab).await;
+            if suppressed {
+                // 屏幕外保活：visible 保持 true（IsVisible=false 会暂停渲染），
+                // 只把 bounds 移出可视区；帧还出不出由前端实测兜底。
+                shell::rect(label, -3100.0, y.max(130.0), w, h);
+            } else {
+                shell::rect(label, x, y, w, h);
+            }
+        }
+        *session.shell_suppress_applied.lock().unwrap_or_else(|e| e.into_inner()) = suppressed;
         return;
     }
     if let Some(old) = cur.as_deref() {
@@ -783,7 +809,7 @@ pub(crate) async fn sync_shell_visibility(session: &Arc<BrowserSession>, tabs: &
     ) {
         // 先摆正矩形再显示，避免在错误位置闪一下
         let (x, y, w, h) = shell_rect_for(session, tab).await;
-        if session.shell_suppressed() {
+        if suppressed {
             // 屏幕外保活：visible 保持 true（IsVisible=false 会暂停渲染），只是 bounds
             // 移出父窗口可视区。帧还能不能出由前端实测兜底（不产帧就降级请求真藏）。
             shell::rect(label, -3100.0, y.max(130.0), w, h);
@@ -793,6 +819,7 @@ pub(crate) async fn sync_shell_visibility(session: &Arc<BrowserSession>, tabs: &
         shell::visible(label, true);
     }
     *session.shell_shown.lock().unwrap_or_else(|e| e.into_inner()) = want_label;
+    *session.shell_suppress_applied.lock().unwrap_or_else(|e| e.into_inner()) = suppressed;
 }
 
 /// shell 模式下一个标签页该占的矩形：**以面板最近一次上报的矩形为准**（x/y/w/h 四元

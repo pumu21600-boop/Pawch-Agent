@@ -263,6 +263,10 @@ pub(crate) struct BrowserSession {
     /// 前端有全屏弹层（设置/确认/大图预览等 .modal-backdrop）时上报 true，壳隐藏
     /// webview 给弹层让位；弹层关闭恢复 false。只影响壳的显示，网页本身不关。
     shell_suppress: std::sync::Mutex<bool>,
+    /// 最近一次**已应用到壳**的抑制状态。显隐同步会被帧轮询以 30 次/秒调用，
+    /// 同一状态下必须原地返回——否则每帧都重放「隐藏→移位→显示」，
+    /// 网页跟着狂闪（2026-11-06 实测弹窗期间 3 秒 285 条壳指令）。
+    shell_suppress_applied: std::sync::Mutex<bool>,
     /// shell 模式：当前在壳里显示中的 label（只发变化的显隐指令）
     shell_shown: std::sync::Mutex<Option<String>>,
     /// shell 模式：面板内容区最近一次矩形（新建 webview 时的初始位置）

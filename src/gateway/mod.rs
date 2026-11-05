@@ -552,17 +552,23 @@ impl Gateway {
                         tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
                         continue;
                     }
-                    // 2026-10-31 用户渠道实锤：上游网关间歇 502（同一渠道在 ZCode 里稳、
-                    // 在这里老断）。5xx 是网关/上游瞬态故障，此刻还没读响应体，重试安全。
-                    // 每次请求最多重试 1 次、退避 1.2s——Billing/401 这类非 5xx 不进来。
-                    if r.status().is_server_error() && attempt_5xx < 1 {
+                    // 上游网关间歇 502（同一渠道在 ZCode 里稳、在这里老断）。5xx 是网关/
+                    // 上游瞬态故障，此刻还没读响应体，重试安全。最多重试 5 次、退避
+                    // 1s/2s/3s/4s/5s（总 15s，等待可被「停止」打断），把瞬时抖动吞掉。
+                    // 每次重试前重建客户端：502 常来自边缘把旧连接弄坏，原地重试会继续
+                    // 撞同一条坏连接（新客户端 = 新连接池，重新 TCP/TLS 握手）。
+                    if r.status().is_server_error() && attempt_5xx < 5 {
                         attempt_5xx += 1;
                         let code = r.status().as_u16();
+                        if !is_loopback_base_url(base_url) {
+                            self.rebuild_client();
+                        }
+                        let wait_ms = 1000 * attempt_5xx as u64;
                         observability::event(
                             EventType::State,
-                            json!({ "kind": "gateway.retry_5xx", "status": code, "attempt": attempt_5xx }),
+                            json!({ "kind": "gateway.retry_5xx", "status": code, "attempt": attempt_5xx, "wait_ms": wait_ms }),
                         );
-                        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
                         continue;
                     }
                     return Ok(r);
@@ -1124,8 +1130,25 @@ impl Gateway {
                 EventType::Error,
                 json!({ "kind": "gateway.error", "status": status.as_u16(), "body": text }),
             );
+            if status.is_server_error() {
+                // 5xx 已重试 5 次仍失败：把耗时与响应头落下来（server/cf-ray 判断是边缘还是
+                // 上游），用户也能从错误文案看出「试过了」。
+                observability::event(
+                    EventType::State,
+                    json!({
+                        "kind": "gateway.5xx_final",
+                        "status": status.as_u16(),
+                        "elapsed_ms": started.elapsed().as_millis() as u64,
+                        "retried": 5,
+                        "http_version": http_version.clone(),
+                        "headers": header_summary.clone(),
+                        "body": text.chars().take(300).collect::<String>(),
+                    }),
+                );
+            }
             record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("error", format!("渠道返回 {status}")));
-            return Err(anyhow!("渠道返回 {status}: {text}"));
+            let retry_hint = if status.is_server_error() { "（已自动重试 5 次仍失败）" } else { "" };
+            return Err(anyhow!("渠道返回 {status}{retry_hint}: {text}"));
         }
 
         // 200 但不是事件流（中转忽略 stream:true 回一个普通 JSON / HTML 错误页）：

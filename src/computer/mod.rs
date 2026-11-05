@@ -80,6 +80,8 @@ fn record_action(line: &str, shot: Option<String>, size: Option<(u32, u32)>) {
         "kind": "computer.action",
         "action": line,
         "screenshot": shot,
+        // 会话归属：前端按这个把动作记到对应的对话下（后台会话不串台）
+        "session": crate::core::agent::current_tool_session().unwrap_or_default(),
     }));
 }
 

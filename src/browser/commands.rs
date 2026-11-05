@@ -274,6 +274,9 @@ pub enum BrowserCommand {    #[serde(rename = "navigate")]
         reference: Option<String>,
         full_page: Option<bool>,
         clip: Option<Clip>,
+        /// 内部截图：图照样内联给模型看，但不落盘、结果里不写图片链接——
+        /// 前端只认链接，对话里就不会出现（自检用，不打扰用户）。
+        silent: Option<bool>,
         tab_id: Option<String>,
     },
     #[serde(rename = "get_state")]
@@ -519,6 +522,20 @@ mod tests {
         assert!(matches!(cmd, BrowserCommand::PageText { tab_id: None }));
         let cmd = parse(r#"{"method":"page_text","tab_id":"T3"}"#).unwrap();
         assert!(matches!(cmd, BrowserCommand::PageText { tab_id: Some(_) }));
+    }
+
+    #[test]
+    fn parse_screenshot_silent_flag() {
+        // 缺省 = 交付（显示在对话里）；silent=true 才是内部截图
+        let cmd = parse(r#"{"method":"screenshot"}"#).unwrap();
+        assert!(matches!(cmd, BrowserCommand::Screenshot { silent: None, .. }));
+        let cmd = parse(r#"{"method":"screenshot","silent":true}"#).unwrap();
+        assert!(matches!(cmd, BrowserCommand::Screenshot { silent: Some(true), .. }));
+        let cmd = parse(r#"{"method":"screenshot","silent":false,"full_page":true}"#).unwrap();
+        assert!(matches!(
+            cmd,
+            BrowserCommand::Screenshot { silent: Some(false), full_page: Some(true), .. }
+        ));
     }
 
     #[test]

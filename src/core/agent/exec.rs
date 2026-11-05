@@ -44,7 +44,11 @@ pub(crate) async fn exec_tool_call(
             None => Err("子代理派发未启用（本任务没有派发器）".to_string()),
         };
     }
-    tools::execute(cfg, name, args).await
+    // 把任务会话带进工具执行上下文：computer 等工具的运行期打点据此带上会话归属，
+    // 后台会话的动作不会被前端算到当前正在看的会话头上。
+    TOOL_SESSION
+        .scope(parent_session.to_string(), tools::execute(cfg, name, args))
+        .await
 }
 
 /// 工具参数体检（2026-10-30 真机实锤后加）。

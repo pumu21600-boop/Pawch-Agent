@@ -15,7 +15,7 @@ description: 用内置浏览器打开/点击/输入/测试网页与本地页面
 - 导航：`navigate`（返回快照）/ `back` / `forward` / `reload` / `wait_for`
 - 观察：`snapshot` / `get_state` / `element_info` / `list`
 - 操作：`click` / `fill` / `type` / `press` / `scroll` / `hover` / `select` / `check` / `drag`
-- 其他：`evaluate`（隔离世界执行 JS）/ `screenshot`（刷新面板画面）/ `get_dialog` / `handle_dialog`
+- 其他：`evaluate`（隔离世界执行 JS）/ `screenshot`（截图：默认显示在对话里给用户看；`silent:true` 只给模型自己看）/ `get_dialog` / `handle_dialog`
 - 标签页：`new_tab` / `activate_tab` / `close` / `list`
 - 收尾：`close_browser`（关掉整个浏览器进程，不等 10 分钟空转回收）
 
@@ -33,6 +33,7 @@ ref 是快照时钉在元素上的编号（如 e12），跨快照稳定；DOM �
 7. **弹窗**：页面弹了 alert/confirm/prompt 会卡住页面——`get_dialog` 看内容，`handle_dialog` 接受/取消。用户也会在右侧「网页」面板看到弹窗条并可直接处理。
 8. **标签页**：`list` 看全部标签页（agent 页带 [agent] 标记、面板可见页带 [可见]）；`tab_id` 参数可操作面板里用户打开的页面；`activate_tab` 可把某页切到面板前台。
 9. **用户可见**：agent 对浏览器的一切操作实时显示在右侧「网页」面板（agent 专用页带徽章）——用户看着你点，重要操作前不必额外征求确认，但破坏性操作（提交表单、下单、删除）先用 snapshot 确认目标。
-10. **读页面用 snapshot**（elements + 正文双结构，带「屏外」标记）；`screenshot` 只是把画面刷到面板给用户看，读内容不要用它。
-11. `evaluate` 在隔离世界执行，页面脚本无法篡改结果；但它算页面操作，会走审批。
-12. 任务收尾：自己的 agent 页可以留着（复用更快），明确结束再 `close`；确认再也不用了再 `close_browser` 释放进程。
+10. **读页面用 snapshot**（elements + 正文双结构，带「屏外」标记）；`screenshot` 是视觉验收用的，读内容不要用它。
+11. **截图分交付/内部两种**：默认 `screenshot` 是交付——图直接显示在对话里给用户看；`screenshot{silent:true}` 是内部截图——只内联给你自己看，对话里不出现。做前端/网页改动时用 silent 截图自检（空白/错位/样式/报错），自己判断、继续改、再自检；用户说「截图给我看」时，先 silent 拍一张确认没问题（不对就先修），确认后再拍一张默认的交付给用户。
+12. `evaluate` 在隔离世界执行，页面脚本无法篡改结果；但它算页面操作，会走审批。
+13. 任务收尾：自己的 agent 页可以留着（复用更快），明确结束再 `close`；确认再也不用了再 `close_browser` 释放进程。

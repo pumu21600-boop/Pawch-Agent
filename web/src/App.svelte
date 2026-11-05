@@ -259,6 +259,14 @@
       nextOut[to] = q;
       outbox = nextOut;
     }
+    // 电脑操作流水跟着会话 key 走（'@new' → 真 id 时不丢）
+    if (computerLogBySession[from]) {
+      const nextLog = { ...computerLogBySession };
+      nextLog[to] = nextLog[from];
+      delete nextLog[from];
+      computerLogBySession = nextLog;
+      saveComputerLogs();
+    }
     // 027：用量账本跟着 key 走（'@new' → 真 id 时不丢记账）
     if (usageBySession[from]) {
       const u = usageBySession[from];
@@ -555,7 +563,7 @@
     expandedFlags = workspace ? { [workspace]: true } : { __ungrouped__: true };
     localStorage.setItem('projExpanded', JSON.stringify(expandedFlags));
     refreshGit(); // 顶条显示当前分支/未提交数（非仓库时自动隐藏）
-    loadVersion(); // 021：侧栏「关于」行（版本 + 运行根）
+    loadVersion(); // 版本号（插件页信息行用；侧栏不再显示版本）
     loadExt(); // 021：组件总线扩展清单（有扩展时侧栏才出入口）
     // 单元素微调标记首屏补盖（会话恢复后元素才就位，故在加载完再盖一次）
     stampMicroUids();
@@ -1892,6 +1900,19 @@
     const p = new URL(a.href, location.origin).searchParams.get('path');
     if (p) openPreviewTab(p);
   }
+  // 工具结果里的截图：browser 截图会把 `![页面截图](/api/workspace/raw?path=...)`
+  // 写在结果最前面。过程块（思考+工具）收尾后默认收起，图不能留在里面——
+  // 提到气泡层面常显，用户才真的「看得到」（2026-11-05 实锤「截完一直不发给我，
+  // 一直说保存在浏览器面板」）。只认工作区图片，别的链接不放。
+  function shotsFromParts(parts) {
+    const out = [];
+    for (const p of parts || []) {
+      if (p.type !== 'tool' || !p.preview || !p.preview.includes('/api/workspace/')) continue;
+      const m = /!\[[^\]]*\]\((\/api\/workspace\/[^)\s]+)\)/.exec(p.preview);
+      if (m && !out.includes(m[1])) out.push(m[1]);
+    }
+    return out;
+  }
   let webActiveId = '';
   let webAddress = '';
   let webBusy = false;
@@ -1951,7 +1972,7 @@
   // 壳 webview 弹窗让位（2026-10-31 用户给 ZCode 截图对照：「有弹窗的时候浏览器画面也在」）：
   // 壳里 child webview 是原生窗口，弹窗（DOM）永远盖不住它。做法：弹窗打开时服务端把
   // webview **移出屏幕外保活渲染**（visible 不关——IsVisible=false 会暂停渲染），
-  // 前端切到帧流模式（同无头模式 600ms 一帧），画面实时垫在弹窗下；弹窗关闭立即
+  // 前端切到帧流模式（弹窗态 50ms 一帧，约 20fps），画面实时垫在弹窗下；弹窗关闭立即
   // 恢复原位与原生交互。若 offscreen 不产帧（实测决定），降级为整块藏。
   let shellModalLive = false; // true = 弹窗态：webview 已移出屏幕，面板走帧流
   let shellSuppressSent = false;
@@ -1967,26 +1988,36 @@
     }).catch(() => {});
     webShotT += 1; // 立即拉一帧，不等 600ms 轮询
   }
-  function shellModalOff() {
+  async function shellModalOff() {
     if (!shellSuppressSent && !shellModalLive) return;
-    shellModalLive = false;
     if (shellSuppressSent) {
       shellSuppressSent = false;
-      webApi('/api/browser/shell-suppress', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ on: false }),
-      }).catch(() => {});
+      try {
+        await webApi('/api/browser/shell-suppress', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ on: false }),
+        });
+        // 等服务端把 webview 挪回面板原位再切回原生视图：先切会先露出空白占位、
+        // 页面随后才出现，看起来就是闪一下（2026-11-06 用户实锤「关面板闪三下」）。
+        // 帧流在这几十毫秒里继续刷新，切换是无缝的。
+        await new Promise((r) => setTimeout(r, 60));
+      } catch (e) {
+        /* 服务端失败也照常切回，别把面板卡在帧流上 */
+      }
     }
+    // 等待期间弹窗又开回来了：保持帧流，交给下一轮 shellSuppressSync 处理
+    if (document.querySelector('.modal-backdrop, .rp-add-menu, .galaxy')) return;
+    shellModalLive = false;
     webViewportKey = ''; // 强制下个心跳重发矩形（webview 回原位）
     webSyncViewport();
   }
   function shellSuppressSync() {
-    // 需要「让位」的 DOM 浮层有两类：弹窗（.modal-backdrop）和标签栏「＋」的添加菜单
-    // （.rp-add-menu）。后者 2026-11-01 用户截图实锤：菜单往下弹出正好落在网页画面上，
-    // 壳里 child webview 是原生窗口、永远浮在 DOM 之上，菜单下半截被盖住。同样按
-    // 弹窗处理——webview 移出屏幕保活 + 面板走帧流，菜单就能浮在画面上。
-    const has = !!document.querySelector('.modal-backdrop, .rp-add-menu');
+    // 需要「让位」的 DOM 浮层有三类：弹窗（.modal-backdrop）、标签栏「＋」的添加菜单
+    // （.rp-add-menu）、记忆库星云（.galaxy）。都能盖住网页菜单——壳里 child webview
+    // 是原生窗口、永远浮在 DOM 之上（2026-11-05 用户截图：浏览器开着时压在记忆库上层）。
+    // 处理同弹窗：webview 移出屏幕保活 + 面板走帧流，浮层就能完整显示。
+    const has = !!document.querySelector('.modal-backdrop, .rp-add-menu, .galaxy');
     if (has && !shellModalLive) shellModalOn();
     else if (!has && shellModalLive) shellModalOff();
   }
@@ -2215,11 +2246,15 @@
   });
 
 
-  // 帧自动刷新：面板开着且有页面时 600ms 一帧（screencast 内存直出，零 CDP 往返）。
-  // 原生托管不看帧——壳里就是真页面，帧流停掉省编码开销
+  // 帧自动刷新（screencast 内存直出，零 CDP 往返）：
+  // - 壳模式弹窗态：webview 移出屏幕保活、面板改看帧流——50ms 一帧（约 20fps）跟手，
+  //   600ms 会明显「一顿一顿」（2026-11-06 用户实锤「打开设置面板动态画面就卡」）；
+  // - 无头兜底：面板本来就只有帧流，保持 600ms 省 CPU（不是主路径）。
+  // 原生托管（壳里真页面、没有弹窗）不看帧——帧流停掉省编码开销。
   let webFrameTimer = null;
   $: if (rpTab === 'web' && rightPanelOpen && webShowShot && (!webNative || shellModalLive) && !webFrameTimer) {
-    webFrameTimer = setInterval(() => { webShotT += 1; }, 600);
+    const frameMs = shellModalLive ? 33 : 600;
+    webFrameTimer = setInterval(() => { webShotT += 1; }, frameMs);
   } else if ((rpTab !== 'web' || !rightPanelOpen || !webShowShot || (webNative && !shellModalLive)) && webFrameTimer) {
     clearInterval(webFrameTimer);
     webFrameTimer = null;
@@ -5824,7 +5859,7 @@
   // 插件页沙箱行的「检测」按钮也走这里（插件页不再给沙箱面板，用户 2026-10-03）
   let sandboxProbe = null;
   let sandboxProbeBusy = false;
-  // 021：应用版本（侧栏「关于」行）
+  // 021：应用版本（插件页信息行用；侧栏底部不再显示版本号）
   let appVersion = null;
   async function loadVersion() {
     try {
@@ -6631,12 +6666,12 @@
       kind: 'computer.action', title: '（内部）电脑操作动作', risk: 'safe', internal: true,
       args: 'action/screenshot',
       run(m) {
-        computerLive = {
-          action: m.action || '',
-          screenshot: m.screenshot || computerLive.screenshot,
-          at: Date.now(),
-        };
-        computerMark();
+        // 归属取服务端事件里的 session（工具执行会话）；老服务没有就退回当前会话
+        const key = m.session || currentSessionId || '@new';
+        if (!m.action) return;
+        const log = computerLogBySession[key] || [];
+        computerLogBySession = { ...computerLogBySession, [key]: [m.action, ...log].slice(0, 50) };
+        saveComputerLogs();
       },
     },
   };
@@ -6708,10 +6743,33 @@
   }
 
   // —— 操作电脑 UI（第 4 轮；同子代理套路：实时条 + 居中小弹窗，不落侧边栏）——
-  let computerLive = { action: '', screenshot: null, at: 0 };
+  // 每个会话各记一份完整流水（最新在前，最多 50 条）：落 localStorage，刷新/重开还在；
+  // 提示条 = 当前会话流水的最新一条。切会话看各自那份，叉掉只清当前会话。
+  const COMPUTER_LOG_KEY = 'pawchComputerLogs';
+  function loadComputerLogs() {
+    try {
+      const m = JSON.parse(localStorage.getItem(COMPUTER_LOG_KEY) || '{}');
+      return m && typeof m === 'object' ? m : {};
+    } catch {
+      return {};
+    }
+  }
+  let computerLogBySession = loadComputerLogs();
+  function saveComputerLogs() {
+    try {
+      // 会话数封顶，防止 localStorage 无限长（按插入顺序丢最老的）
+      const keys = Object.keys(computerLogBySession);
+      if (keys.length > 40) {
+        const trimmed = {};
+        for (const k of keys.slice(-40)) trimmed[k] = computerLogBySession[k];
+        computerLogBySession = trimmed;
+      }
+      localStorage.setItem(COMPUTER_LOG_KEY, JSON.stringify(computerLogBySession));
+    } catch {}
+  }
+  $: computerHint = (computerLogBySession[currentSessionId || '@new'] || [])[0] || '';
+  $: computerLog = computerLogBySession[currentSessionId || '@new'] || [];
   let computerPanelOpen = false;
-  let computerPanelTimer = null;
-  let computerState = { last_screenshot: null, last_size: null, actions: [] };
   // 面板改版：不做实时预览、不留常驻大图，也不放「最后一次
   // 操作」摘要卡——全部动作平铺成历史记录，最新的带高亮边，截图按条展开看。
   let computerOpenShots = {};
@@ -6723,50 +6781,21 @@
   function toggleComputerShot(i) {
     computerOpenShots = { ...computerOpenShots, [i]: !computerOpenShots[i] };
   }
-  // 实时条只在本页生命周期内有效（事件流断线就断）；5 秒无新动作自动收起，
-  // 之后留一颗 chip 开面板回看（别常驻占输入框上方的位）
-  let computerFresh = false;
-  let computerTimer = null;
-  // 叉掉常驻 chip 后永久不再露（localStorage 持久化，刷新/重启也算数）。
-  // 实时动作条（computer-strip）仍会在新动作后短暂出现，那是操作反馈，不是提示。
-  let computerChipDismissed = (() => {
-    try { return localStorage.getItem('computerChipDismissed') === '1'; } catch { return false; }
-  })();
-  function dismissComputerChip() {
-    computerChipDismissed = true;
-    try { localStorage.setItem('computerChipDismissed', '1'); } catch {}
-  }
-  function computerMark() {
-    computerFresh = true;
-    clearTimeout(computerTimer);
-    computerTimer = setTimeout(() => (computerFresh = false), 5000);
+  // 叉掉 = 清掉当前会话这一份记录（提示 + 流水），不永久禁用：
+  // 下次该会话再操作电脑，从新动作重新开始记，不带回之前叉掉的内容。
+  function dismissComputerHint() {
+    const key = currentSessionId || '@new';
+    const logs = { ...computerLogBySession };
+    delete logs[key];
+    computerLogBySession = logs;
+    saveComputerLogs();
   }
 
-  async function openComputerPanel() {
+  function openComputerPanel() {
     computerPanelOpen = true;
-    const r = await fetch('/api/computer/state').then((r2) => r2.json()).catch(() => null);
-    if (r) computerState = r;
-    // 面板开着时每 2s 重拉动作流水（关掉即停）：agent 还在动的话，历史记录
-    // 要跟着走。截图按条展开，不常驻。
-    clearInterval(computerPanelTimer);
-    computerPanelTimer = setInterval(() => {
-      if (!computerPanelOpen) return;
-      fetch('/api/computer/state')
-        .then((r2) => r2.json())
-        .then((s) => { if (s) computerState = s; })
-        .catch(() => {});
-    }, 2000);
   }
   function closeComputerPanel() {
     computerPanelOpen = false;
-    clearInterval(computerPanelTimer);
-    computerPanelTimer = null;
-  }
-
-  // 启动/重连时拉一次（刷新后「电脑操作」chip 入口也能出现；没有操作记录就不占位）
-  async function loadComputerState() {
-    const r = await fetch('/api/computer/state').then((r2) => r2.json()).catch(() => null);
-    if (r && (r.last_screenshot || (r.actions || []).length)) computerState = r;
   }
 
   // 可序列化的 ops 清单（剥掉 run 函数）——随 /api/ui/state 上报给后端读。
@@ -6809,7 +6838,7 @@
     // 连上/重连即重拉一次设置与插件清单（2026-10-05）：服务重启（换二进制/崩溃恢复）
     // 后事件流会断线自动重连，但断连期间推的事件全丢了——页面会一直显示重启前的旧态，
     // 用户以为「又没刷新」。onopen 在首次连接也会触发，多一次 GET 无害。
-    uiEventsSrc.onopen = () => { loadExt(); loadSettings(); loadComputerState(); loadSubagentHistory(); };
+    uiEventsSrc.onopen = () => { loadExt(); loadSettings(); loadSubagentHistory(); };
     uiEventsSrc.onmessage = async (ev) => {
       let m;
       try { m = JSON.parse(ev.data); } catch { return; }
@@ -7316,6 +7345,7 @@
     if (!skipComposer && prev !== next) {
       persistComposer(prev);
       restoreComposer(next);
+      // 电脑操作流水按会话存放（computerLogBySession）：切走自然收起，切回还在。
     }
     currentSessionId = id;
     // 本标签页「上次看的是哪条」——sessionStorage 刷新保留、重开软件/新标签页不继承，
@@ -7653,9 +7683,6 @@
       </button>
       {/if}
       <button class="foot-btn" on:click={() => (settingsOpen = true)}>设置</button>
-      {#if appVersion}
-        <div class="side-version" title={`运行根：${appVersion.root}`}>v{appVersion.version}</div>
-      {/if}
     </div>
     <div class="resize-handle" on:pointerdown={startResize}></div>
   </aside>
@@ -7851,6 +7878,7 @@
           </div>
           {/if}
         {:else if m.role === 'assistant'}
+          {@const shots = shotsFromParts(messageParts(m))}
           <div class="msg assistant" class:selecting={msgSelectMode} on:click={() => selectRow(m)}>
             {#if msgSelectMode && !m.streaming}
               <span class="msg-check" title="选中这条回复">
@@ -8012,6 +8040,17 @@
                   <div class="content" on:click={onContentClick}>{@html md(b.text)}</div>
                 {/if}
               {/each}
+              {#if shots.length}
+                <!-- browser 截图：过程块收起了也要看得见，图直接摊在回复末尾
+                     （点在图上开大图，复用 md-img 的点击预览） -->
+                <div class="msg-shots">
+                  {#each shots as src}
+                    <div class="tool-shot" on:click={onContentClick}>
+                      <img class="md-img" {src} alt="页面截图" loading="lazy" data-md-img="1" />
+                    </div>
+                  {/each}
+                </div>
+              {/if}
               {#if m.streaming && !messageParts(m).length}
                 <div class="typing"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></div>
               {/if}
@@ -8089,20 +8128,14 @@
         </div>
       {/if}
       <!-- 操作电脑实时条（第 4 轮；同子代理纪律：主区、输入框上方、不落侧边栏）。
-           只在新动作后 5 秒内占位；之后撤成 chip（有历史截图/动作就能开面板回看） -->
-      {#if computerOnUi && computerFresh && computerLive.action}
-        <div class="computer-strip">
+           常驻：出现后一直显示，切会话或点 × 才消失（用户 2026-11-05 校正：不是
+           「最后一次动作过几秒就收起」）。有任务清单时多让一点距离，别贴在清单卡片上。 -->
+      {#if computerOnUi && computerHint}
+        <div class="computer-strip" class:with-todo={todoDockVisible}>
           <span class="computer-badge">操作电脑</span>
-          <span class="computer-action" title={computerLive.action}>{computerLive.action}</span>
+          <span class="computer-action" title={computerHint}>{computerHint}</span>
           <button class="computer-strip-more" on:click={openComputerPanel}>查看屏幕</button>
-        </div>
-      {:else if computerOnUi && !computerChipDismissed && (computerLive.action || computerState.last_screenshot)}
-        <div class="subagent-chiprow">
-          <!-- 一颗可收起的 chip：左边点开面板，右边 × 收起（收起后不再出现） -->
-          <span class="chip-pill">
-            <button class="subagent-chip" on:click={openComputerPanel}>电脑操作 ×{computerState.actions.length || 1} · 查看屏幕</button>
-            <button class="chip-x" title="收起（不再出现）" aria-label="收起" on:click={dismissComputerChip}>×</button>
-          </span>
+          <button class="chip-x" title="收起（不再出现）" aria-label="收起" on:click={dismissComputerHint}>×</button>
         </div>
       {/if}
       <div class="composer">
@@ -9073,7 +9106,13 @@
                 <button class="btn ghost" on:click={() => webDialogAction(false)}>取消</button>
               </div>
             {/if}
-            <div class="web-body" bind:this={webBodyEl} bind:clientWidth={webBodyW} bind:clientHeight={webBodyH}>
+            <div
+              class="web-body"
+              class:has-shot={webShowShot && (!webNative || shellModalLive)}
+              bind:this={webBodyEl}
+              bind:clientWidth={webBodyW}
+              bind:clientHeight={webBodyH}
+            >
               {#if !webShowShot}
                 <div class="web-empty">
                   <svg class="web-globe" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.6 2.3 3.9 5.1 3.9 8.5s-1.3 6.2-3.9 8.5c-2.6-2.3-3.9-5.1-3.9-8.5s1.3-6.2 3.9-8.5Z"/></svg>
@@ -9524,18 +9563,17 @@
   </div>
 {/if}
 {#if computerPanelOpen}
-  <!-- 操作电脑面板（第 4 轮）：居中小弹窗。左=最近截图（全尺寸落盘那份，经
-       /api/workspace/raw 直出），右=动作流水。刷新/断线后的回看数据来自
-       GET /api/computer/state；实时的那张来自 SSE 事件 -->
+  <!-- 操作电脑面板（第 4 轮）：居中小弹窗。动作流水按会话存在前端（computerLog），
+       只显示当前会话这一份；截图按条从 /api/workspace/raw 直出 -->
   <div class="modal-backdrop" on:click={closeComputerPanel}>
     <div class="modal computer-modal" on:click|stopPropagation>
       <div class="modal-head">
         <b>操作电脑</b>
-        <span class="subagent-modal-count">{computerState.actions.length || (computerLive.action ? 1 : 0)} 个动作</span>
+        <span class="subagent-modal-count">{computerLog.length} 个动作</span>
       </div>
       <div class="computer-body">
         <div class="computer-log">
-          {#each computerState.actions as a, i}
+          {#each computerLog as a, i}
             <div class="computer-log-item">
               {#if shotPathOf(a)}
                 <!-- 截图条目：默认只留一行字，点开才加载这张图（不常驻） -->
@@ -9561,11 +9599,7 @@
               {/if}
             </div>
           {:else}
-            {#if computerLive.action}
-              <div class="computer-log-row last">{computerLive.action}</div>
-            {:else}
-              <div class="computer-empty">还没有操作动作</div>
-            {/if}
+            <div class="computer-empty">还没有操作动作</div>
           {/each}
         </div>
       </div>
@@ -10793,6 +10827,11 @@
     align-items: flex-start;
     justify-content: center;
   }
+  /* 帧流模式不能让滚动条参与布局：图高 = 宽 × 帧高宽比，1px 溢出就会长出滚动条，
+     宽度随即少 15px、页面整体缩一圈（2026-11-06 实锤「打开弹窗网页往里缩一点」）。 */
+  .web-body.has-shot {
+    overflow: hidden;
+  }
   .web-empty {
     margin: auto;
     text-align: center;
@@ -10855,14 +10894,6 @@
   }
   .ext-panel .rp-tabs {
     flex-wrap: nowrap;
-  }
-  .side-version {
-    flex: 0 0 100%;
-    text-align: center;
-    font-size: 11px;
-    color: var(--g4);
-    letter-spacing: 0.3px;
-    padding-top: 2px;
   }
   .rp-tabs button {
     padding: 5px 14px;
@@ -12393,6 +12424,33 @@
   .tool-caret.open {
     transform: rotate(90deg);
   }
+  /* 工具结果里的截图（browser 截图）：提到气泡层面常显（过程块收起了也看得到），
+     点开进大图预览 */
+  .msg-shots {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin: 10px 0 4px;
+  }
+  .tool-shot {
+    max-width: min(100%, 720px);
+  }
+  .tool-shot :global(.md-img) {
+    display: block;
+    max-width: 100%;
+    max-height: 420px;
+    width: auto;
+    height: auto;
+    margin: 0;
+    border: 1px solid var(--g2);
+    border-radius: 10px;
+    background: var(--g0);
+    cursor: zoom-in;
+    object-fit: contain;
+  }
+  .tool-shot :global(.md-img:hover) {
+    border-color: var(--g4);
+  }
   .tool-detail {
     margin: 2px 4px 8px 34px;
     padding: 8px 10px;
@@ -13446,9 +13504,14 @@
     gap: 8px;
     font-size: 12px;
     padding: 7px 10px;
+    margin: 0 16px 8px;
     background: var(--g2);
     border: 1px solid var(--g3);
     border-radius: 8px;
+  }
+  /* 有任务清单时清单卡片变高：条子额外上移，别贴着清单顶部 */
+  .computer-strip.with-todo {
+    margin-bottom: 16px;
   }
   .computer-badge {
     flex: none;

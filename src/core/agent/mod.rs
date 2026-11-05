@@ -27,6 +27,18 @@ pub(crate) use checkpoint::*;
 pub(crate) use exec::*;
 pub use plan::*;
 pub(crate) use summary::*;
+
+tokio::task_local! {
+    /// 当前正在执行工具的任务会话 id（工具里的运行期打点用，如 computer.action）。
+    /// 后台会话（另一条对话/子代理）操作电脑时，UI 事件必须带上它的会话归属，
+    /// 否则前端只能按「收到事件时正在看哪条」盖戳，记录会串会话。
+    pub(crate) static TOOL_SESSION: String;
+}
+
+/// 当前工具执行的会话 id；不在工具执行上下文里（单测/直调）返回 None。
+pub(crate) fn current_tool_session() -> Option<String> {
+    TOOL_SESSION.try_with(|s| s.clone()).ok()
+}
 /// 循环向外发的结构化事件（SSE 转发用）。
 pub enum AgentEvent {
     Content(String),
@@ -1391,7 +1403,7 @@ async fn describe_screenshot(
         "role": "user",
         "content": [
             { "type": "image_url", "image_url": { "url": format!("data:image/png;base64,{b64}") } },
-            { "type": "text", "text": "这是电脑当前屏幕的截图。请详细描述可见内容：窗口标题、界面文字、按钮/开关/输入框及其状态，并给出各元素大致的屏幕坐标，供一个看不见屏幕的助手据此操作。只描述事实，不要执行任何操作。" }
+            { "type": "text", "text": "这是一张屏幕/网页截图。请详细描述可见内容：窗口标题、界面文字、按钮/开关/输入框及其状态，并给出各元素大致的屏幕坐标，供一个看不见屏幕的助手据此操作。只描述事实，不要执行任何操作。" }
         ]
     }]);
     // 与附件转接同一口径：上限 1500 tokens、清空思考参数（转写要快，不要推理档）
