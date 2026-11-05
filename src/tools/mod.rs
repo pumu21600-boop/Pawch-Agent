@@ -1,4 +1,4 @@
-//! 工具系统（总架构 §5）—— 注册表 + 内置工具（施工单 002 / 005）。
+//! 工具系统（总架构 §5）—— 注册表 + 内置工具（任务单 002 / 005）。
 //!
 //! 第一批：read_file / search / web_fetch（只读，danger 0）、write_file（写，danger 1）、
 //! shell / git（执行，danger 2，走沙箱）。审批策略（suggest/auto-edit/full-auto）在核心循环

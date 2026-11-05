@@ -1,4 +1,4 @@
-//! AppContainer 沙箱模式原语（施工单 019）—— 受限 token 沙箱的升级路径
+//! AppContainer 沙箱模式原语（任务单 019）—— 受限 token 沙箱的升级路径
 //!
 //! 机制：LowBox token（由 CreateProcess 的 SECURITY_CAPABILITIES 启动属性自动创建，
 //! 见 proc.rs 的 appcontainer 分支）。

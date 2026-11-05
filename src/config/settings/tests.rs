@@ -125,7 +125,7 @@
 
     #[test]
     fn backward_compat_v0_top_level_rescue() {
-        // 施工单 001（09-02）的最初格式：顶层五字段，无 configs 无 profiles。
+        // 任务单 001（09-02）的最初格式：顶层五字段，无 configs 无 profiles。
         // 顶层 key 直接挂到挽救出的配置（不依赖 providers 预设兜底——那条路在
         // 预设 id 被收敛删除的场合会把 key 卡死在过渡槽里静默丢失）。
         let v0 = r#"{

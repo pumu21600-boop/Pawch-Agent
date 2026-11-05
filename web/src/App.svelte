@@ -1177,7 +1177,7 @@
         newModel = list[0];
         model = newModel;
       }
-      // A2（施工单 012）：能力标记归用户所有，切换/勾选模型不再改写 capabilities；
+      // A2（任务单 012）：能力标记归用户所有，切换/勾选模型不再改写 capabilities；
       // 后端仅在该配置无用户标记历史时按新模型名推导初值
       if (!(await sendSettings({ models: list, model: newModel, api_key: apiKey.trim() || undefined }))) {
         savedModels = prevModels; // F3：保存失败回滚，勾选态不许与后端脱节
@@ -5646,7 +5646,7 @@
     skillsLoading = false;
   }
 
-  // —— （施工单 016）：MCP 插件分区 ——
+  // —— （任务单 016）：MCP 插件分区 ——
   let mcpServers = [];
   let wasmPlugins = []; // WASM 工具插件清单（loadMcp 灌；此前漏声明，能力菜单一开就 ReferenceError）
   // git 运行时状态（插件分区顶部卡片）：系统装的 / 内置包解压的 / 不可用

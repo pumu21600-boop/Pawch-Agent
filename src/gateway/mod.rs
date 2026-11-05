@@ -1,4 +1,4 @@
-//! 网关 —— OpenAI 兼容 /chat/completions 单实现（施工单 001）+ 模型列表获取。
+//! 网关 —— OpenAI 兼容 /chat/completions 单实现（任务单 001）+ 模型列表获取。
 //!
 //! base_url / model / api_key 全部由调用方（设置系统）动态传入，不再写死。
 //! api_key 只出现在内存中的 Authorization 头，绝不写日志/文件。
@@ -7,7 +7,7 @@
 //! 移植自 OpenClaw v2026.8.2 packages/ai（此后按厂商规范与实测多轮修订）；响应端支持
 //! reasoning_content/reasoning/reasoning_text/reasoning_details 四字段 + 14 种思考标签剥离；
 //! 发送前按端点契约净化历史（回放字段/developer 角色/空消息过滤）。
-//! （施工单 030）：**计量收口在网关单点**——stream_chat / complete 是全部模型流量的
+//! （任务单 030）：**计量收口在网关单点**——stream_chat / complete 是全部模型流量的
 //! 唯一出入口，每次调用记一条用量台账（token 三路分计量 + 状态 + 延迟），
 //! 并在发送前过「全局花费上限」硬闸。
 
@@ -122,7 +122,7 @@ pub struct ChatParams {
     /// 端点探测线索：渠道预设 id 与实际 base_url（build_body 内部探测用）。
     pub provider_id: Option<String>,
     pub base_url: Option<String>,
-    /// A3 能力标记「工具调用」闭环（施工单 012）：false 时核心循环不携带 tools 参数，
+    /// A3 能力标记「工具调用」闭环（任务单 012）：false 时核心循环不携带 tools 参数，
     /// 模型无法发起新工具调用；历史消息里的 tool_calls 回放不受影响。默认 true。
     pub tools_enabled: bool,
     /// 能力标记「图片解析」（用户手勾的 caps.vision）：决定 tool 结果里的截图怎么投递。

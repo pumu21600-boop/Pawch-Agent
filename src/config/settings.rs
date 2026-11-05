@@ -223,7 +223,7 @@ pub struct ModelPrice {
 
 /// 一套配置（渠道信息 + 模型 + 本配置专属 key + 协议形态与采样参数 + 能力标记）。
 ///
-/// B1 清除语义（施工单 012 固化，前后端任何一方改动必须对照本条）：
+/// B1 清除语义（任务单 012 固化，前后端任何一方改动必须对照本条）：
 /// `0`=清除长度类（context_length/max_output_tokens）；负数=清除采样类（temperature/top_p）；
 /// 空串/auto=清除思考类（thinking/thinking_style）；clear_key=true=清 key。
 /// 「思考档位被吞」事故即源于此约定未成文。
@@ -320,7 +320,7 @@ impl Config {
     }
 
     /// DPAPI 解密本配置专属 key（仅内存，绝不序列化、绝不出日志）。
-    /// B2 key 回落链（施工单 012 固化）：请求显式 key > 激活配置 DPAPI key >
+    /// B2 key 回落链（任务单 012 固化）：请求显式 key > 激活配置 DPAPI key >
     /// DEEPSEEK_API_KEY 环境变量；key 永不出日志、永不出 JSONL。
     pub fn decrypted_key(&self) -> Option<String> {
         self.key_cipher.as_deref().and_then(Settings::decrypt)
@@ -393,7 +393,7 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub workspace_folders: BTreeMap<String, Vec<String>>,
 
-    /// （施工单 016）：MCP server 配置（stdio transport；工具以 mcp__<server>__<tool> 接入）
+    /// （任务单 016）：MCP server 配置（stdio transport；工具以 mcp__<server>__<tool> 接入）
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<McpServerCfg>,
 
@@ -928,7 +928,7 @@ impl Settings {
 /// （信任键合并已随验签机制移除）。解析失败返回 Err（调用方各自处理：load 备份
 /// 坏文件，重载保持内存现状）。
 ///
-/// 全史格式考古定案（2026-10-22，自 09-02 施工单 001 起 47 个提交逐代对账）：
+/// 全史格式考古定案（2026-10-22，自 09-02 任务单 001 起 47 个提交逐代对账）：
 /// - v0（09-02）：顶层 provider_id/base_url/model/models/key_cipher 五字段，无
 ///   configs——走下方挽救路径，顶层 key 直接挂到挽救出的配置（2026-10-22 垫片改：
 ///   原先绕三跳靠 providers.json 默认 base_url 兜底，预设 id 收敛删除的场合 key

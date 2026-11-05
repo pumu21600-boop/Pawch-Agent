@@ -3,7 +3,7 @@
 //! 本文件只留全局件：AppState / router / 来源校验与缓存中间件 / SSE 事件封装 / 内置冒烟页。
 //! 路由域端点在 chat / gate / settings / workspace / sessions / memory / ext / git / system。
 
-//! HTTP 层 —— 施工单 001 + 模型设置系统
+//! HTTP 层 —— 任务单 001 + 模型设置系统
 //!
 //! - 静态页托管（Svelte dist，未构建时内置页回退）
 //! - /api/providers     供应商预设列表
@@ -124,7 +124,7 @@ pub struct AppState {
     pub memory: Arc<std::sync::RwLock<Arc<crate::memory::Memory>>>,
     /// 记忆配置（切换工作区时重开 Memory 用）
     pub mem_cfg: Arc<crate::config::MemoryConfig>,
-    /// 挂起的工具审批：approval id → 决定通道（施工单 005）
+    /// 挂起的工具审批：approval id → 决定通道（任务单 005）
     pub approvals: Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>>,
     /// A3：挂起审批的附加信息 —— approval id → (scope, session_id)，
     /// 供「本会话内同类允许」在用户决定时回写记忆。
@@ -350,7 +350,7 @@ async fn guard_browser_plugin(req: Request, next: Next) -> Response {
     next.run(req).await
 }
 
-/// 本机服务的来源校验（施工单 022）。
+/// 本机服务的来源校验（任务单 022）。
 ///
 /// 绑定 `127.0.0.1` 只挡得住网络来的连接，挡不住 **DNS rebinding**：恶意页面把自己的域名
 /// 解析到 127.0.0.1，浏览器就当成同源、不触发 CORS 预检，于是能直接读 `/api/settings`、
@@ -732,7 +732,7 @@ loadProviders().then(loadSettings);
 mod tests {
     use super::*;
 
-    // —— 来源校验（施工单 022）：堵 DNS rebinding 的那三条规则 ——
+    // —— 来源校验（任务单 022）：堵 DNS rebinding 的那三条规则 ——
 
     #[test]
     fn host_parsing_covers_ipv4_ipv6_and_bare_names() {

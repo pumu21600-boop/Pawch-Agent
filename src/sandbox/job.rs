@@ -1,4 +1,4 @@
-//! Job Objects —— 施工单 004 / 任务 C
+//! Job Objects —— 任务单 004 / 任务 C
 //!
 //! 一个沙箱实例 = 一个 Job Object，包住整棵进程树：
 //! - KILL_ON_JOB_CLOSE：句柄一关整树必死，孤儿零残留（配合 Drop 双保险）

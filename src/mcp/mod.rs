@@ -1,4 +1,4 @@
-//! MCP client（施工单 016/021，/）—— stdio 与 streamable HTTP 双 transport
+//! MCP client（任务单 016/021，/）—— stdio 与 streamable HTTP 双 transport
 //!
 //! 总架构 §7：MCP 借生态省自研；进程级隔离天然防崩；tool poisoning 用
 //! 「首装确认 + 同级审批」对冲（确认前一律 Dangerous）。

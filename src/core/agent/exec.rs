@@ -127,7 +127,7 @@ pub(crate) fn short_args(args: &str, max_chars: usize) -> String {
     flat.chars().take(max_chars).collect()
 }
 
-/// A3（施工单 012）：能力标记「工具调用」闭环的核心判定——tools_enabled=false 时不带
+/// A3（任务单 012）：能力标记「工具调用」闭环的核心判定——tools_enabled=false 时不带
 /// tools 参数。独立成纯函数便于单测。
 pub(crate) fn tools_def_for(params: &ChatParams) -> Option<Value> {
     if params.tools_enabled {

@@ -1,9 +1,9 @@
-//! 钩子（施工单 027）—— 用户不改源码即可在固定挂点插入自定义动作。
+//! 钩子（任务单 027）—— 用户不改源码即可在固定挂点插入自定义动作。
 //!
 //! 承载形式：config.toml `[hooks]` 里配本地命令；事件以 JSON 从 stdin 喂给命令，
 //! `before_tool` 读 stdout 的 JSON 决定放行与否，其余挂点只作通知。
 //!
-//! 语义四条（施工单定案 7，执行不得推翻）：
+//! 语义四条（任务单定案 7，执行不得推翻）：
 //! 1. **四个挂点**：before_tool / after_tool / session_end / budget_exceeded；
 //! 2. **before_tool 只有否决权、没有放行权**——审批门（rules::needs_approval_for 单点）
 //!    语义一字不动，钩子 deny ≠ 审批通过，钩子放行 ≠ 免审批；

@@ -1347,7 +1347,7 @@ mod tests {
 
     #[test]
     fn attachments_dir_appended_to_gitignore() {
-        // A5（施工单 012）：附件目录自动进工作区 git 排除（只追加，不重写用户文件）
+        // A5（任务单 012）：附件目录自动进工作区 git 排除（只追加，不重写用户文件）
         let dir = std::env::temp_dir().join(format!("agent-a5-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         let gi = dir.join(".gitignore");

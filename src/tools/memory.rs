@@ -6,7 +6,7 @@
 //! library.json。本工具把同一条数据面接给 agent：search（关键词+语义混合）/
 //! recent（最近会话）/ similar（相似会话）/ read（读某条原文）。
 //!
-//! action=write（施工单第 2 步）：自动记忆的唯一写入口，落 <app_root>/.agent/
+//! action=write（任务单第 2 步）：自动记忆的唯一写入口，落 <app_root>/.agent/
 //! profile.md，**行级操作**（add/replace/remove/merge），匹配不上报错、绝不整段
 //! 重写——用户手改的其它行一概不动（详见 memory/profile.rs 的铁律）。定级「常规
 //! 写」：只读档每次先问、自动档静默记、完全访问档照静默（§3.7）。
