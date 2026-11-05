@@ -5,7 +5,7 @@
 - 默认：`logs/agent.jsonl`（相对工程根目录）
 - 可通过 `config.toml` 的 `[logging]` 节改 `dir` / `file` / `max_mb` / `keep_archives`
 - 追加写（append-only），进程每次启动生成新的 `session_id`
-- **轮转**（2026-09-14 补，多份归档）：单文件超过 `[logging].max_mb`（默认 20MB）就归档成
+- **轮转**（多份归档）：单文件超过 `[logging].max_mb`（默认 20MB）就归档成
   `agent.jsonl.1`（最新）再开新文件，旧归档依次倒位成 `.2`…`.N`，保留份数走 `[logging].keep_archives`
   （默认 3，0 = 归档即删）；启动时检查一次，运行中每 500 条复查一次，
   轮转本身记一条 `state / log.rotated`；`max_mb = 0` 关闭轮转
@@ -112,7 +112,7 @@
 | `memory.reindex` | 记忆库强制重建向量 | — |
 | `memory.search` | 记忆库检索 | `query`、`hits`、`mode` |
 | `memory.similar` | 「相似会话」检索 | `id`、`hits` |
-| `session.created` | 新建空会话立即落盘（09-14 补） | `session`、`workspace` |
+| `session.created` | 新建空会话立即落盘 | `session`、`workspace` |
 | `session.titled` | 会话标题自动生成 | `title` |
 | `workspace.switched` | 切换工作区 | `from`、`to` |
 | `workspace.removed` | 从项目列表移除工作区（不删目录） | `path` |
@@ -120,10 +120,10 @@
 | `git.committed` | 界面手动提交 | `id`、`files`、`manual` |
 | `attachments.gitignored` | 附件目录自动写入工作区 .gitignore | `path` |
 | `media.error` | 多模态理解调用失败（DSH 转接规范） | `modality`、`model`、`url`、`error` |
-| `log.rotated` | 日志超限归档成 `<file>.1`（2026-09-14 补；多份倒位）| `bytes`、`limit_bytes`、`keep` |
-| `steer` | 「立即发送（引导）」的消息并入了正在跑的一轮（025/027）：核心循环每个决策点取一次；没赶上本轮、在收尾续跑一轮的记 `phase: "followup"` | `count`、`step`（并入时所在步）；续跑时 `phase`、`session` |
-| `chat.steered` | 同会话运行中再发消息 → 进队列（027） | `session`、`mode`（`queue`=排队等本轮结束 / `immediate`=立即并进本轮）、`pending`（积压条数） |
-| ~~`chat.rejected`~~ | 已废弃（2026-11-03：引导/立即发送支持带附件，同会话运行中不再因附件拒收） | — |
+| `log.rotated` | 日志超限归档成 `<file>.1`（多份倒位）| `bytes`、`limit_bytes`、`keep` |
+| `steer` | 「立即发送（引导）」的消息并入了正在跑的一轮：核心循环每个决策点取一次；没赶上本轮、在收尾续跑一轮的记 `phase: "followup"` | `count`、`step`（并入时所在步）；续跑时 `phase`、`session` |
+| `chat.steered` | 同会话运行中再发消息 → 进队列 | `session`、`mode`（`queue`=排队等本轮结束 / `immediate`=立即并进本轮）、`pending`（积压条数） |
+| ~~`chat.rejected`~~ | 已废弃（引导/立即发送支持带附件，同会话运行中不再因附件拒收） | — |
 
 ### 4.x 新增 kind（只增）
 
@@ -149,8 +149,6 @@
 | `browser.tab.suspend` | 后台标签页挂起 frozen（驻留）| `id` |
 | `browser.tab.restore` | 挂起标签页解冻恢复 | `id` |
 | `browser.dialog` | 页面弹出 JS 弹窗 | `id`、`type` |
-| `browser.tab.new` | 新开标签页（agent 工作页或面板「+」）| `id`、`agent`、`url` |
-| `browser.tab.close` | 关闭标签页 | `id` |
 | `plugin.draft_submitted` | 模型自产插件进入 draft 隔离区 | `plugin`、`files`、`tools` |
 | `plugin.draft_promoted` | draft 一键转正落盘 | `plugin`、`paths` |
 | `plugin.draft_discarded` | draft 丢弃 | `plugin` |
