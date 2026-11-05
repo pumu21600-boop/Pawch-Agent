@@ -821,8 +821,16 @@
   const APPROVAL_LABELS = { 'read-only': '只读', auto: '自动', 'full-access': '完全访问' };
   // 审批档切换的请求序号：并发乱序时以「最后一次点击」为准，过期响应丢弃（F14）
   let approvalPickSeq = 0;
-  function pickApproval(m) {
+  async function pickApproval(m) {
     const key = currentSessionId || '@new';
+    // 完全访问 = 脱沙箱本机直跑，首次切档前确认一次（记在本机 localStorage，之后不再打扰）
+    if (m === 'full-access' && localStorage.getItem('fullAccessAcked') !== '1') {
+      const ok = await confirmAsk(
+        '完全访问会让命令以你的完整用户权限直接运行（不再受沙箱限制，能读写整台电脑、联网）。\n\n危险操作仍会出审批卡；要连审批一起跳过，得在 config.toml 把 unsandboxed_approval 改成 false。\n\n确定切换到完全访问？'
+      );
+      if (!ok) return;
+      localStorage.setItem('fullAccessAcked', '1');
+    }
     approvalMode = m;
     approvalBySession = { ...approvalBySession, [key]: m };
     approvalMenuOpen = false;

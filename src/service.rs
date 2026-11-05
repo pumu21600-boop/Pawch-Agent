@@ -441,6 +441,17 @@ fn run_cli(host: &str, port: u16, args: &[String]) -> ! {
             std::process::exit(1);
         }
     };
+    // D1：本机 API 要访问令牌（页面走同源 cookie；命令行读 <数据目录>/server.token 加 Bearer）
+    let token = match crate::server::auth::token_from_file() {
+        Some(t) => t,
+        None => {
+            eprintln!(
+                "[agent] 读不到访问令牌 {}（服务未启动或版本过旧）：先 pawch-agent.exe start",
+                crate::config::data_root().join(crate::server::auth::TOKEN_FILE).display()
+            );
+            std::process::exit(1);
+        }
+    };
     let body = serde_json::json!({
         "message": ra.message,
         "session_id": ra.session_id,
@@ -450,7 +461,7 @@ fn run_cli(host: &str, port: u16, args: &[String]) -> ! {
         "timeout_secs": ra.timeout_secs,
         "purpose": "cli",
     });
-    let resp = client.post(&url).json(&body).send();
+    let resp = client.post(&url).bearer_auth(&token).json(&body).send();
     let resp = match resp {
         Ok(r) => r,
         Err(e) => {

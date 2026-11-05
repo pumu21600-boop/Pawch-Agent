@@ -36,7 +36,12 @@ pub struct WinInfo {
 /// 枚举当前可见窗口（标题非空）。按 z 序（EnumWindows 序）返回。
 pub fn list_windows() -> Vec<WinInfo> {
     ENUM_BUF.with(|b| b.borrow_mut().clear());
+    // SAFETY: 该回调只由 EnumWindows 在本次同步枚举期间以系统给出的有效窗口句柄调用，
+    // 签名与 WNDENUMPROC 一致（extern "system"、BOOL 返回）；无捕获状态，也不读 _l。
     unsafe extern "system" fn cb(hwnd: HWND, _l: LPARAM) -> BOOL {
+        // SAFETY: hwnd 是 EnumWindows 传入的有效窗口句柄；buf 是栈上 [u16; 512]，长度如实
+        // 传入，GetWindowTextW 最多写 512 个单元，n≤0 时不切片。ENUM_BUF 是线程局部，
+        // 外层只在整个 EnumWindows 返回后才借用，与回调内借用不重叠。
         unsafe {
             if IsWindowVisible(hwnd) == 0 {
                 return 1;
@@ -54,6 +59,8 @@ pub fn list_windows() -> Vec<WinInfo> {
             1
         }
     }
+    // SAFETY: cb 是非捕获的 extern "system" fn，符合 WNDENUMPROC；lParam 传 0 且回调不读它；
+    // EnumWindows 同步返回，期间回调只访问线程局部缓冲与本帧栈上数据。
     unsafe {
         EnumWindows(Some(cb), 0);
     }
@@ -87,6 +94,9 @@ pub fn focus_window(hwnd: isize) -> Result<bool, String> {
     if hwnd == 0 {
         return Err("窗口句柄为空".into());
     }
+    // SAFETY: hwnd 已判非 0，调用方传入窗口句柄；Win32 只按句柄值使用，失效时 API 返回失败
+    // 而不触及 Rust 内存。AttachThreadInput/SetForegroundWindow/keybd_event 均无指针入参，
+    // GetWindowThreadProcessId 的进程 ID 输出传 NULL（API 允许）。
     unsafe {
         if IsIconic(hwnd) != 0 {
             ShowWindow(hwnd, SW_RESTORE);
@@ -166,11 +176,15 @@ pub fn shell_execute(path: &str, args: &str, workdir: &str) -> Result<(), String
 
 /// 当前前台窗口句柄（UIA 查找默认查它）。
 pub fn foreground_hwnd() -> isize {
+    // SAFETY: GetForegroundWindow 无参数，只返回当前前台窗口句柄（可能为 0，由调用方判断），
+    // 不涉及外部内存。
     unsafe { GetForegroundWindow() }
 }
 
 /// 当前前台窗口标题（诊断/验证用）。
 pub fn foreground_title() -> Option<String> {
+    // SAFETY: GetForegroundWindow 的返回值先判 0 再交给 GetWindowTextW；buf 是栈上
+    // [u16; 512]，长度如实传入，GetWindowTextW 最多写 512 个单元，n≤0 时不切片。
     unsafe {
         let hwnd = GetForegroundWindow();
         if hwnd == 0 {
@@ -320,6 +334,8 @@ pub fn find_window_loose(name: &str) -> Option<WinInfo> {
 /// 只给 opt-in 真机 e2e 收尾用——测试自己拉起来的窗口自己关掉，别留残渣。
 #[cfg(test)]
 pub fn close_window(hwnd: isize) {
+    // SAFETY: hwnd 是测试自己拉起窗口的句柄；PostMessageW 只投递一条 WM_CLOSE，不读写
+    // Rust 内存，句柄失效时仅返回失败。
     unsafe {
         PostMessageW(hwnd, 0x0010, 0, 0); // WM_CLOSE
     }
@@ -335,7 +351,11 @@ thread_local! {
 #[cfg(test)]
 pub fn edit_control_rect(hwnd: isize) -> Option<(isize, (i32, i32, i32, i32))> {
     CHILD_BUF.with(|b| b.borrow_mut().clear());
+    // SAFETY: 只由 EnumChildWindows 在同步枚举期间以系统给出的有效子窗口句柄调用，签名与
+    // WNDENUMPROC 一致；无捕获，也不读 _l。
     unsafe extern "system" fn cb(child: isize, _l: LPARAM) -> BOOL {
+        // SAFETY: child 是 EnumChildWindows 传入的有效子窗口句柄；cls 是栈上 [u16; 64]，
+        // 长度如实传入，GetClassNameW 返回写入单元数（≤64），n>0 才切片。
         unsafe {
             let mut cls = [0u16; 64];
             let n = GetClassNameW(child, cls.as_mut_ptr(), cls.len() as i32);
@@ -348,11 +368,15 @@ pub fn edit_control_rect(hwnd: isize) -> Option<(isize, (i32, i32, i32, i32))> {
             1
         }
     }
+    // SAFETY: cb 是非捕获的 extern "system" fn，符合 WNDENUMPROC；lParam 传 0 且不使用；
+    // EnumChildWindows 同步返回，期间回调只访问线程局部缓冲与本帧栈上数据。
     unsafe {
         EnumChildWindows(hwnd, Some(cb), 0);
     }
     let children: Vec<isize> = CHILD_BUF.with(|b| b.borrow().clone());
     let child = children.into_iter().next()?;
+    // SAFETY: child 来自上一个枚举且窗口仍存在（本进程 e2e 目标）；r 先初始化为全 0，
+    // GetWindowRect 成功时写入，失败时读到的仍是 0，不产生未初始化读。
     unsafe {
         let mut r = windows_sys::Win32::Foundation::RECT { left: 0, top: 0, right: 0, bottom: 0 };
         (windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(child, &mut r) != 0)
@@ -366,7 +390,11 @@ pub fn edit_control_rect(hwnd: isize) -> Option<(isize, (i32, i32, i32, i32))> {
 #[cfg(test)]
 pub fn edit_control_text(hwnd: isize) -> Option<String> {
     CHILD_BUF.with(|b| b.borrow_mut().clear());
+    // SAFETY: 只由 EnumChildWindows 在同步枚举期间以系统给出的有效子窗口句柄调用，签名与
+    // WNDENUMPROC 一致；无捕获，也不读 _l。
     unsafe extern "system" fn cb(child: isize, _l: LPARAM) -> BOOL {
+        // SAFETY: child 是 EnumChildWindows 传入的有效子窗口句柄；cls 是栈上 [u16; 64]，
+        // 长度如实传入，GetClassNameW 返回写入单元数（≤64），n>0 才切片。
         unsafe {
             let mut cls = [0u16; 64];
             let n = GetClassNameW(child, cls.as_mut_ptr(), cls.len() as i32);
@@ -379,6 +407,8 @@ pub fn edit_control_text(hwnd: isize) -> Option<String> {
             1
         }
     }
+    // SAFETY: cb 是非捕获的 extern "system" fn，符合 WNDENUMPROC；lParam 传 0 且不使用；
+    // EnumChildWindows 同步返回，期间回调只访问线程局部缓冲与本帧栈上数据。
     unsafe {
         EnumChildWindows(hwnd, Some(cb), 0);
     }
@@ -386,6 +416,9 @@ pub fn edit_control_text(hwnd: isize) -> Option<String> {
     for child in children {
         // 跨进程读文本走 SendMessageTimeoutW + WM_GETTEXT——GetWindowTextW 对别的
         // 进程的窗口经常返空（UIPI/ marshalling 限制，实测记事本就读不到）。
+        // SAFETY: child 来自上一个枚举且仍是有效窗口句柄；buf 是栈上 [u16; 4096]，wParam 传
+        // 其单元数（WM_GETTEXT 约定），lParam 传 buf 指针，系统最多写 4096 个单元；got 是
+        // 本帧有效 usize 输出变量，读回后 min(buf.len()-1) 再切片，保证不越界。
         unsafe {
             let mut buf = [0u16; 4096];
             let mut got: usize = 0;

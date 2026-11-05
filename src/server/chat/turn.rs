@@ -432,9 +432,9 @@ pub(crate) fn assemble_turn_channels(
         }
         find_channel(s, n)
     });
-    // 思考参数自适应降级登记：该端点此前 400 拒收过思考字段（剥参重试成功），
-    // 本轮起明确告知用户，不静默
-    if state.gateway.thinking_is_degraded(&base_url, &model) {
+    // 思考参数自适应降级登记：该端点此前 400 拒收过思考字段（剥参重试成功）。
+    // 同进程内只在首次提醒一次（2026-11-05：原来每轮都发，多个对话里反复出现同一条通知）
+    if state.gateway.take_thinking_degraded_notice(&base_url, &model) {
         notices.push("该端点此前拒绝了思考参数，已自动关闭思考下发（对话正常进行）".to_string());
     }
     TurnChannels { primary, summary, title, fallbacks, downgrade, vision, notices }

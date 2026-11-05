@@ -58,6 +58,8 @@ impl HandleGuard {
 impl Drop for HandleGuard {
     fn drop(&mut self) {
         if self.0 != 0 && self.0 != -1 {
+            // SAFETY: self.0 是系统 API 返回的句柄，0 与 -1（INVALID_HANDLE_VALUE）已排除，
+            // 非无效句柄才关闭；成功路径用 release 交出所有权，本 Drop 只执行一次。
             unsafe { CloseHandle(self.0) };
         }
     }
@@ -97,6 +99,8 @@ const MAX_CAPTURE_BYTES: usize = 2 * 1024 * 1024;
 /// Windows 系统目录（一般为 C:\Windows\System32）。
 pub(crate) fn system_dir() -> PathBuf {
     let mut buf = [0u16; 512];
+    // SAFETY: buf 是栈上 [u16; 512]，容量 512 如实传入；GetSystemDirectoryW 最多写 512 个
+    // UTF-16 单元（含 NUL），返回 0 或 ≥512 时走回退分支，不按返回值越界切片。
     let n = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), 512) };
     if n == 0 || n as usize >= 512 {
         return PathBuf::from("C:\\Windows\\System32");
@@ -124,6 +128,10 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> anyhow::Result<SandboxChild> {
     }
 
     unsafe {
+        // SAFETY: 块内指针都指向本帧仍存活的对象：sa 是栈上 SECURITY_ATTRIBUTES（nLength
+        // 已填对）；create_pipe 输出句柄由 HandleGuard 管理；wide() 产生的 Vec<u16> 在
+        // CreateProcessAsUserW 期间未释放；cmd_line 以 mut 传入（API 可能临时改写）；
+        // si/pi 为 mem::zeroed 的 POD 且 cb 已填。失败路径句柄全部由 HandleGuard 回收。
         // stdout/stderr 匿名管道；父端读句柄禁继承，子端拿写句柄
         let sa = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -232,6 +240,11 @@ fn spawn_appcontainer_impl(spec: &SandboxSpec) -> anyhow::Result<SandboxChild> {
     use windows_sys::Win32::Security::SECURITY_CAPABILITIES;
 
     unsafe {
+        // SAFETY: 属性列表先以 NULL 探测 attr_size 再按该大小分配 attr_buf，调用期间不释放；
+        // InitializeProcThreadAttributeList/UpdateProcThreadAttribute 的 size 参数与各自结构
+        // 匹配；sec_caps 与 sid_guard 内的 SID 在本帧存活到 CreateProcessW 返回（属性列表只在
+        // 其间被读取）；其余指针（wide() 缓冲、STARTUPINFOEXW、PROCESS_INFORMATION）同样为
+        // 本帧 POD/未释放内存，句柄由 HandleGuard 回收。
         // 1) profile + 派生 SID（allow_network 决定是否带 INTERNET_CLIENT 能力）
         let sid_guard = appcontainer::ensure_sid(spec.allow_network)
             .map_err(|e| anyhow!("AppContainer profile 失败: {e}"))?;
@@ -387,6 +400,9 @@ impl SandboxChild {
     /// 停止后子进程会继续跑到沙箱超时（2026-11-02 审计）。
     pub fn wait(mut self, timeout_ms: u32) -> anyhow::Result<SandboxOutput> {
         let (exit_code, timed_out) = unsafe {
+            // SAFETY: self.process 是 CreateProcessAsUserW/CreateProcessW 返回且由
+            // SandboxChild 独占的有效进程句柄；&mut code 是本帧有效 u32，WaitForSingleObject/
+            // GetExitCodeProcess 只在该句柄存活期间调用；击杀后等待 10s 再读退出码。
             let started = std::time::Instant::now();
             let mut code = 0u32;
             let mut killed = false;
@@ -453,6 +469,8 @@ impl SandboxChild {
     fn close_handles(&mut self) {
         if !self.closed {
             self.closed = true;
+            // SAFETY: self.process 是构造时取得、尚未关闭的有效进程句柄（closed 标志保证
+            // 只关一次）；关闭后立即置 0，后续不再使用。
             unsafe { CloseHandle(self.process) };
             self.process = 0;
         }
@@ -464,6 +482,8 @@ impl Drop for SandboxChild {
         if !self.closed {
             // 没等完就丢：整树击杀再回收，读管道线程随 EOF 自然退出
             self.job.terminate();
+            // SAFETY: 未 closed 时 self.process 仍是有效进程句柄；5s 有界等待后无论结果
+            // 如何都由 close_handles 关闭，不会在关闭后再次使用。
             unsafe { WaitForSingleObject(self.process, 5_000) };
             let _ = self.join_readers();
             self.close_handles();
@@ -474,6 +494,9 @@ impl Drop for SandboxChild {
 /// 独立线程读管道到 EOF（child 退出/被杀后写端关闭）；超限部分丢弃不累积。
 fn spawn_reader(handle: HANDLE) -> JoinHandle<String> {
     thread::spawn(move || unsafe {
+        // SAFETY: handle 是 CreatePipe 的读端且由本线程独占（release 交出所有权）；
+        // buf 是栈上 [u8; 8192]，长度如实传入；ReadFile 只在成功时经 got 报告写入字节数，
+        // 按 got 切片不越界；末尾 CloseHandle 后不再使用该句柄。
         let mut out = Vec::new();
         let mut buf = [0u8; 8192];
         loop {
@@ -502,6 +525,8 @@ fn create_pipe(sa: &SECURITY_ATTRIBUTES) -> anyhow::Result<(HANDLE, HANDLE)> {
     let mut r: HANDLE = 0;
     let mut w: HANDLE = 0;
     unsafe {
+        // SAFETY: &mut r/&mut w 是本帧有效 HANDLE 输出变量，sa 指向调用方传入且存活到调用
+        // 返回的 SECURITY_ATTRIBUTES；CreatePipe 返回 0 时直接 bail，不读未初始化的句柄。
         if CreatePipe(&mut r, &mut w, sa, 0) == 0 {
             bail!("CreatePipe 失败: {}", GetLastError());
         }

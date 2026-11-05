@@ -673,3 +673,15 @@ Content-Length: 2
         let solo = Layer("模型流超时：120 秒无新数据", None);
         assert_eq!(error_chain(&solo), "模型流超时：120 秒无新数据");
     }
+
+    #[test]
+    fn thinking_degraded_notice_only_once_per_channel() {
+        let gw = Gateway::new();
+        assert!(!gw.take_thinking_degraded_notice("https://a", "m"), "未降级不提示");
+        gw.mark_thinking_degraded("https://a", "m");
+        assert!(gw.take_thinking_degraded_notice("https://a", "m"), "首次命中要提示");
+        assert!(!gw.take_thinking_degraded_notice("https://a", "m"), "同渠道第二次不再提示");
+        assert!(gw.thinking_is_degraded("https://a", "m"), "降级登记本身还在（剥参逻辑照旧）");
+        gw.mark_thinking_degraded("https://b", "m");
+        assert!(gw.take_thinking_degraded_notice("https://b", "m"), "不同渠道各自提示一次");
+    }

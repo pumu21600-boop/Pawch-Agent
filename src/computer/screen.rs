@@ -18,6 +18,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 /// 虚拟屏几何：(x, y, width, height)。多屏拼接，左上角可能是负数。
 pub fn virtual_screen() -> (i32, i32, u32, u32) {
+    // SAFETY: GetSystemMetrics 无指针参数、无失败模式（未知索引返回 0）；返回值在此做
+    // ≤0 回退与无符号转换，不访问任何外部内存。
     unsafe {
         let x = GetSystemMetrics(SM_XVIRTUALSCREEN);
         let y = GetSystemMetrics(SM_YVIRTUALSCREEN);
@@ -34,6 +36,8 @@ pub fn virtual_screen() -> (i32, i32, u32, u32) {
 
 /// 光标位置（屏幕坐标；取不到返回 None）。
 pub fn cursor_pos() -> Option<(i32, i32)> {
+    // SAFETY: p 是本帧栈上 POINT 且已初始化，GetCursorPos 成功时写入、失败返回 0；
+    // 用 then_some 短路后不会读到未写入的值（即使读到也是已初始化的 0）。
     unsafe {
         let mut p = POINT { x: 0, y: 0 };
         (GetCursorPos(&mut p) != 0).then_some((p.x, p.y))
@@ -47,6 +51,10 @@ pub fn cursor_pos() -> Option<(i32, i32)> {
 /// （泄露一个 DC 就少一分 GDI 配额，长跑会耗尽）。PNG 编码与降采样交给
 /// 调用方（它要同时出全尺寸与内联两份）。
 pub fn capture_bgra() -> Result<(Vec<u8>, u32, u32, usize), String> {
+    // SAFETY: 所有 GDI 句柄都由本块获取并在每条返回路径释放（含 SelectObject 还原原对象）；
+    // buf 按 stride×height 分配，bmi 描述 32bpp top-down 且 biHeight=-h 与 GetDIBits 的
+    // 行数一致；bmiColors 只需一个占位元素。BitBlt 的源坐标/尺寸来自本帧虚拟屏尺寸，
+    // 目标 DC 与位图尺寸一致，失败路径同样先清理再返回。
     unsafe {
         let (vx, vy, w, h) = virtual_screen();
         if w == 0 || h == 0 {

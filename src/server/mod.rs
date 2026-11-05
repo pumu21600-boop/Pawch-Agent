@@ -45,6 +45,7 @@ pub(crate) use crate::config::AgentConfig;
 pub(crate) use crate::core::agent::{self, AgentEvent, LoopOutcome};
 
 mod chat;
+pub(crate) mod auth;
 pub(crate) mod data_admin;
 mod plugins;
 mod gate;
@@ -322,6 +323,10 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
     app = app.layer(middleware::from_fn(guard_local_only));
     // 浏览器能力闸：与 guard_local_only 同层，挡在 handler 之前
     app = app.layer(middleware::from_fn(guard_browser_plugin));
+    // 本地访问令牌（D1）：/api/* 与 /cancel 必须带 Bearer 或同源 cookie
+    app = app.layer(middleware::from_fn(auth::guard));
+    // HTML 文档响应下发令牌 cookie（最外层：静态页先拿到 cookie，页面内的 fetch 才带得上）
+    app = app.layer(middleware::from_fn(auth::issue_cookie));
     app
 }
 

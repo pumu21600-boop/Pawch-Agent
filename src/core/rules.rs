@@ -81,6 +81,13 @@ const KNOWN_TOOLS: &[&str] = &[
 
 /// 高危程序名（按第一条子命令的程序名 token 精确匹配，小写）。
 /// 覆盖删除、磁盘、注册表、账号、服务、进程终止等不可逆操作。
+/// 判级的定位：**防误操作，不防主动攻击**。
+///
+/// 这里的黑名单 + 载体扫描挡的是「模型/用户没想清楚就动手」的常见形态
+/// （`cmd /c del`、`if(del)`、`^` 转义、延迟展开、wsl 内嵌删除等），
+/// 不是安全边界：脚本文件内容、环境变量值、外部程序行为这类运行时才知道的东西
+/// 静态判不了（见下方 `test_shell_indirect_forms_are_documented_limits`）。
+/// 不可信输入别交给 agent；要硬隔离用 `appcontainer` 实验档 + 断网。
 const DANGEROUS_PROGRAMS: &[&str] = &[
     "del", "erase", "rm", "rmdir", "rd", "format", "diskpart", "cipher",
     "reg", "net", "shutdown", "taskkill", "remove-item", "ri", "del-item", "rm-item",
@@ -859,6 +866,29 @@ fn risk_simple_command(cmd: &str, ws: &Path) -> (RiskLevel, String) {
         return (RiskLevel::Dangerous, "检测到高危系统/删除命令".to_string());
     }
 
+    // 2.4) wsl 自身的破坏性动作：不带危险动词，但 --unregister 会删掉整个发行版
+    // （含其文件系统）——2026-11-05 审计补的盲区。
+    if prog == "wsl"
+        && rest
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case("--unregister") || t.eq_ignore_ascii_case("--unregister-distribution"))
+    {
+        return (
+            RiskLevel::Dangerous,
+            "wsl --unregister 会删除整个发行版（含文件系统）".into(),
+        );
+    }
+    if prog == "wslconfig"
+        && rest
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case("/u") || t.eq_ignore_ascii_case("/unregister"))
+    {
+        return (
+            RiskLevel::Dangerous,
+            "wslconfig /u 会注销发行版（删除其文件系统）".into(),
+        );
+    }
+
     // 2.5) 复合/包裹命令：危险动词藏在参数里（if exist x del x / cmd /c del /
     // powershell -c "del" / wsl rm）——载体程序名扫剩余 token，命中即高危
     if COMPOUND_WRAPPERS.contains(&prog.as_str())
@@ -1349,6 +1379,36 @@ mod tests {
         assert_eq!(evaluate_risk("shell", &json!({"command": "start http://example.com"}), &ws()).0, RiskLevel::Normal);
         // echo 引文豁免依然成立（echo 不是载体）
         assert_eq!(evaluate_risk("shell", &json!({"command": "echo \"del x\""}), &ws()).0, RiskLevel::Safe);
+    }
+
+    // —— 2026-11-05 审计 D5：wsl 自身破坏性动作 + 间接调用边界写明 ——
+    #[test]
+    fn test_shell_wsl_destructive_and_indirect_limits() {
+        // wsl --unregister 删整个发行版：命令里没有 del/rm 这类动词，靠专门规则拦
+        for cmd in [
+            "wsl --unregister Ubuntu",
+            "wsl --UNREGISTER Ubuntu-22.04",
+            "wslconfig /u Ubuntu",
+            "wslconfig /unregister Ubuntu",
+        ] {
+            let r = evaluate_risk("shell", &json!({ "command": cmd }), &ws());
+            assert_eq!(r.0, RiskLevel::Dangerous, "wsl 注销发行版应判高危: {cmd}: {}", r.1);
+        }
+        // 无害 wsl 用法不误伤
+        assert_eq!(evaluate_risk("shell", &json!({"command": "wsl --status"}), &ws()).0, RiskLevel::Normal);
+        assert_eq!(evaluate_risk("shell", &json!({"command": "wsl ls"}), &ws()).0, RiskLevel::Normal);
+
+        // 已知边界（不是 bug，定位见 DANGEROUS_PROGRAMS 上方注释与 README）：
+        // 脚本文件内容、环境变量值静态不可见——执行脚本本身按 Normal 放行，
+        // 真做了什么由脚本决定。这些断言钉住当前口径，避免以后误以为黑名单已覆盖脚本。
+        assert_eq!(evaluate_risk("shell", &json!({"command": "build.bat"}), &ws()).0, RiskLevel::Normal);
+        assert_eq!(evaluate_risk("shell", &json!({"command": "powershell -File clean.ps1"}), &ws()).0, RiskLevel::Normal);
+        assert_eq!(evaluate_risk("shell", &json!({"command": "%MYDEL% /f x"}), &ws()).0, RiskLevel::Normal);
+        // 载体名是环境变量、但载荷仍可见的形态照拦（%COMSPEC% 就是 cmd）
+        assert_eq!(
+            evaluate_risk("shell", &json!({"command": "%COMSPEC% /c del x"}), &ws()).0,
+            RiskLevel::Dangerous
+        );
     }
 
     // —— v1 修复 3：程序名精确匹配，`dirname` 不因 `dir` 前缀被误判安全 ——

@@ -66,6 +66,10 @@ pub struct Gateway {
     /// 思考参数自适应降级登记：渠道 400 拒收思考字段后剥参重试成功，
     /// 这里记下「base_url|model」，后续请求直接不发思考字段（每轮渠道组装时出人话提示）。
     thinking_degraded: RwLock<std::collections::HashSet<String>>,
+    /// 已提示过「思考参数被端点拒收」的渠道：同进程内只提示一次。
+    /// 2026-11-05 修：原来只要登记过降级，每一轮都往 SSE 塞一条通知——用户在不同对话里
+    /// 反复看到同一条提示，看起来像通知跨会话串台。降级是渠道级状态，提示一次足够。
+    thinking_announced: RwLock<std::collections::HashSet<String>>,
 }
 
 /// 请求体的 JSONL 摘要（完整体走 `observability::debug` 控制台，见调用处注释）。
@@ -400,6 +404,7 @@ impl Gateway {
             loopback_client: build_loopback_client(),
             throttle: None,
             thinking_degraded: RwLock::new(std::collections::HashSet::new()),
+            thinking_announced: RwLock::new(std::collections::HashSet::new()),
         }
     }
 
@@ -408,6 +413,19 @@ impl Gateway {
         self.thinking_degraded
             .read()
             .map(|s| s.contains(&Self::degrade_key(base_url, model)))
+            .unwrap_or(false)
+    }
+
+    /// 这次要不要给用户发「思考参数已被端点拒收」的提示：已登记降级、且本进程还没提示过。
+    /// 首次调用返回 true 并记账；同一渠道后续轮次返回 false（修「每个对话都弹一遍」）。
+    pub fn take_thinking_degraded_notice(&self, base_url: &str, model: &str) -> bool {
+        if !self.thinking_is_degraded(base_url, model) {
+            return false;
+        }
+        let key = Self::degrade_key(base_url, model);
+        self.thinking_announced
+            .write()
+            .map(|mut s| s.insert(key))
             .unwrap_or(false)
     }
 

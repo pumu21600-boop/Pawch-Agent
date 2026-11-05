@@ -693,6 +693,19 @@ mod tests {
         r
     }
 
+    /// CI 透明度（D3）：本测试恒过，只报告「探针测试是真跑还是被宿主限制跳过」。
+    /// CI 用 `--nocapture` 取这一行写进 job summary，避免托管 runner 跳过探针
+    /// 被误读成「全量跑过」。本机运行时会看到 RUN，而不是 SKIPPED。
+    #[test]
+    fn host_limitation_report() {
+        match restricted_host_limitation() {
+            Some(reason) => println!("[sandbox-probe] SKIPPED：{reason}"),
+            None => {
+                println!("[sandbox-probe] RUN：本机可拉起受限 token 子进程，探针测试全部真实执行")
+            }
+        }
+    }
+
     #[test]
     fn echo_capture() {
         init_logger();
@@ -707,6 +720,9 @@ mod tests {
     fn env_whitelist_trim() {
         init_logger();
         // 差分前提：父进程环境里塞一个密钥，沙箱子进程绝不能看见
+        // SAFETY: 单测里设置进程级环境变量；Rust 2024 下 set_var 是 unsafe（可能与并发读
+        // 环境变量竞争）。本测试进程内其它用例不读 DEEPSEEK_API_KEY，且此处只设置一次、
+        // 之后不再修改，仅用于 env_whitelist_trim 的差分断言。
         unsafe { std::env::set_var("DEEPSEEK_API_KEY", "sk-should-not-leak-42") };
         let r = probe("env_trim", probe_env_trim(limits_of(&cfg())));
         assert!(!r.detail.contains("should-not-leak"));

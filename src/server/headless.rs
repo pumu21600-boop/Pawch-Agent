@@ -629,6 +629,10 @@ mod tests {
     /// 无人值守的审批策略：默认拒绝；只有显式 approve 才放行（安全默认不可反）。
     #[test]
     fn headless_approval_policy_defaults_to_deny() {
+        // ask() 会落审批事件；单独跑这条（不并发别的用例）时 logger 还没人初始化。
+        // 用临时目录装一个，避免依赖测试执行顺序。
+        let logs = std::env::temp_dir().join(format!("agent-headless-{}", uuid::Uuid::new_v4()));
+        let _ = observability::init(&logs, "agent.jsonl", "headless-test".into());
         let (tx, _rx) = mpsc::unbounded_channel();
         let gate = |approve: bool| HeadlessGate {
             inner: ChatGate {

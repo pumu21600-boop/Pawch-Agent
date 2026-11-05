@@ -2,6 +2,7 @@
 name = "pawch-agent-desktop"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 description = "Pawch Agent 桌面壳：窗口 + 托盘 + 服务保活，WebView 加载本机服务"
 
 [build-dependencies]

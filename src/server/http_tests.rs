@@ -54,11 +54,12 @@ fn test_state(root: &std::path::Path) -> AppState {
     }
 }
 
-/// 发一个 GET（带合法 Host；不带 Origin = 非浏览器客户端），返回 (状态码, JSON)。
+/// 发一个 GET（带合法 Host + 本地访问令牌；不带 Origin = 非浏览器客户端），返回 (状态码, JSON)。
 async fn get(app: &Router, uri: &str) -> (StatusCode, Value) {
     let req = Request::builder()
         .uri(uri)
         .header("host", "127.0.0.1:5173")
+        .header("authorization", format!("Bearer {}", auth::current()))
         .body(Body::empty())
         .expect("构造请求");
     let resp = app.clone().oneshot(req).await.expect("router 不应崩溃");
@@ -130,13 +131,80 @@ async fn plugins_and_browser_state_routes_are_alive() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// D1：`/api` 必须带令牌（Bearer 或同源 cookie 二者其一）；静态首页不拦且下发 cookie。
 #[tokio::test]
-async fn non_loopback_host_is_rejected_with_human_message() {
-    let root = test_root("guard");
+async fn api_requires_token_and_accepts_bearer_or_cookie() {
+    let root = test_root("auth");
+    let app = app(&root);
+    let token = auth::current();
+
+    // 无凭证 → 401（人话错误）
+    let req = Request::builder()
+        .uri("/api/version")
+        .header("host", "127.0.0.1:5173")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "无令牌必须 401");
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains("未授权"), "401 文案要是人话: {text}");
+
+    // Bearer → 200
+    let req = Request::builder()
+        .uri("/api/version")
+        .header("host", "127.0.0.1:5173")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    // 同源 HttpOnly cookie → 200（页面走这条，不手工加头）
+    let req = Request::builder()
+        .uri("/api/version")
+        .header("host", "127.0.0.1:5173")
+        .header("cookie", format!("foo=1; pawch_token={token}"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    // 错误令牌 → 401（别把「带了头」当「带对了头」）
+    let req = Request::builder()
+        .uri("/api/version")
+        .header("host", "127.0.0.1:5173")
+        .header("authorization", "Bearer deadbeef")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+    // 静态首页（HTML 文档）不拦，并下发 Set-Cookie；页面内的 fetch 靠它过闸
+    let req = Request::builder()
+        .uri("/")
+        .header("host", "127.0.0.1:5173")
+        .header("accept", "text/html")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let set_cookie = resp
+        .headers()
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(set_cookie.contains("pawch_token="), "HTML 文档要下发令牌 cookie: {set_cookie:?}");
+    assert!(set_cookie.contains("HttpOnly"), "cookie 必须 HttpOnly: {set_cookie}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn non_loopback_host_is_rejected_with_human_message() {    let root = test_root("guard");
     let app = app(&root);
     let req = Request::builder()
         .uri("/api/version")
         .header("host", "evil.example.com")
+        .header("authorization", format!("Bearer {}", auth::current()))
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.expect("router 不应崩溃");
@@ -155,12 +223,13 @@ async fn unknown_api_route_is_404_not_html() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// 发一个 POST（空体 + 合法 Host），返回 (状态码, JSON)。
+/// 发一个 POST（空体 + 合法 Host + 本地访问令牌），返回 (状态码, JSON)。
 async fn post(app: &Router, uri: &str) -> (StatusCode, Value) {
     let req = Request::builder()
         .method("POST")
         .uri(uri)
         .header("host", "127.0.0.1:5173")
+        .header("authorization", format!("Bearer {}", auth::current()))
         .body(Body::empty())
         .expect("构造请求");
     let resp = app.clone().oneshot(req).await.expect("router 不应崩溃");

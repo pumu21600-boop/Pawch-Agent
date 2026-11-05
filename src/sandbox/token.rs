@@ -41,6 +41,8 @@ impl TokenHandle {
 impl Drop for TokenHandle {
     fn drop(&mut self) {
         if self.0 != 0 {
+            // SAFETY: self.0 是 OpenProcessToken/CreateRestrictedToken 成功返回的有效 token 句柄，
+            // 非 0 才关闭；本结构独占该句柄且 Drop 只执行一次，不会重复关闭。
             unsafe { CloseHandle(self.0) };
         }
     }
@@ -48,6 +50,8 @@ impl Drop for TokenHandle {
 
 /// 当前进程的完整 token（不剥特权、不加受限 SID）——本机直跑模式用。
 pub(crate) fn full_token() -> anyhow::Result<TokenHandle> {
+    // SAFETY: GetCurrentProcess 返回当前进程伪句柄（无需关闭、不会失败）；&mut base 是本帧
+    // 有效输出变量，OpenProcessToken 成功时写入新句柄（由 TokenHandle 独占），失败返回 0。
     unsafe {
         let mut base: HANDLE = 0;
         if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY, &mut base) == 0 {
@@ -59,6 +63,9 @@ pub(crate) fn full_token() -> anyhow::Result<TokenHandle> {
 
 /// 构造受限 token：特权全剥 + 受限 SID 白名单（见模块注释）。
 pub(crate) fn create_restricted_token() -> anyhow::Result<TokenHandle> {
+    // SAFETY: 块内所有指针都指向本帧仍存活的对象：GetCurrentProcess 是伪句柄；各输出缓冲
+    // （SID 缓冲 ≥ SECURITY_MAX_SID_SIZE、attrs 的 Sid 指向 sids 里的 Vec<u8>）在调用期间
+    // 未被移动/释放，长度如实传入；base 由 HandleCloser 在失败路径关闭，成功时只读取。
     unsafe {
         let mut base: HANDLE = 0;
         if OpenProcessToken(
@@ -115,6 +122,9 @@ pub(crate) fn create_restricted_token() -> anyhow::Result<TokenHandle> {
 
 /// 当前进程 token 里的用户 SID（拷贝到自有缓冲）。
 fn current_user_sid(token: HANDLE) -> anyhow::Result<Vec<u8>> {
+    // SAFETY: 先以 NULL/0 探测所需字节数，再按该长度分配并如实传入；成功后 buf 含一个由
+    // 系统写好的 TOKEN_USER，内部 Sid 指针指向同一缓冲内的有效 SID；GetLengthSid/CopySid
+    // 只按 SID 自身长度读写，输出 sid 缓冲按 sid_len 分配。
     unsafe {
         let mut len = 0u32;
         GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &mut len);
@@ -137,6 +147,9 @@ fn current_user_sid(token: HANDLE) -> anyhow::Result<Vec<u8>> {
 
 /// token 里的登录会话 SID（SE_GROUP_LOGON_ID 标记的那个）。
 fn logon_sid(token: HANDLE) -> anyhow::Result<Option<Vec<u8>>> {
+    // SAFETY: 同样先探测长度再按长度分配；TOKEN_GROUPS.GroupCount 由系统填写，Groups 指向
+    // buf 内等长的 SID_AND_ATTRIBUTES 数组，按该计数构造切片不越界；每个 g.Sid 是系统写入
+    // 的有效 SID，GetLengthSid/CopySid 只按 SID 自身长度访问。
     unsafe {
         let mut len = 0u32;
         GetTokenInformation(token, TokenGroups, ptr::null_mut(), 0, &mut len);
@@ -166,6 +179,8 @@ struct HandleCloser(HANDLE);
 impl Drop for HandleCloser {
     fn drop(&mut self) {
         if self.0 != 0 {
+            // SAFETY: self.0 是 OpenProcessToken 成功返回的有效句柄，非 0 才关闭；本结构是
+            // base 的唯一持有者，Drop 只执行一次，不会与 TokenHandle 重复关闭。
             unsafe { CloseHandle(self.0) };
         }
     }
@@ -173,6 +188,8 @@ impl Drop for HandleCloser {
 
 /// 探针用：当前进程的未受限 token（对照组）。
 pub(crate) fn base_token() -> anyhow::Result<TokenHandle> {
+    // SAFETY: GetCurrentProcess 是伪句柄；&mut base 是本帧有效输出变量，OpenProcessToken
+    // 成功时写入的句柄由 TokenHandle 独占并在 Drop 时关闭，失败时直接返回错误。
     unsafe {
         let mut base: HANDLE = 0;
         if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut base) == 0 {
@@ -187,6 +204,9 @@ pub(crate) fn base_token() -> anyhow::Result<TokenHandle> {
 /// 是系统固定保留（CreateRestrictedToken 既有行为，遍历检查绕过本身无害），
 /// 按名字白名单判定而不是数个数。
 pub(crate) fn enabled_privilege_names(token: HANDLE) -> anyhow::Result<Vec<String>> {
+    // SAFETY: 两次 GetTokenInformation 都先探测长度再按该长度分配；TOKEN_PRIVILEGES 的
+    // PrivilegeCount 由系统填写、Privileges 指向 buf 内等长数组；LookupPrivilegeNameW 的
+    // Luid 指向该数组元素，输出缓冲按探测到的 cap 分配且 cap 如实传入。
     unsafe {
         let mut len = 0u32;
         GetTokenInformation(token, TokenPrivileges, ptr::null_mut(), 0, &mut len);

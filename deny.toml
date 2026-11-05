@@ -1,0 +1,44 @@
+# 供应链审计（2026-11-05 审计修复 D7）：cargo deny check
+#
+# 只做三件事：已知漏洞（advisories）、许可证白名单（licenses）、依赖来源与写法（bans）。
+# 依赖升级策略不在这里管——`windows-sys` / `rand` 的升级牵动 Win32 绑定，单独排期评估。
+
+[advisories]
+version = 2
+# 被 yank 的版本要看见，但不因此让门禁红：间接依赖被 yank 会随上游自己漂移。
+yanked = "warn"
+# 豁免要写理由与到期版本；当前无豁免项。
+ignore = []
+
+[licenses]
+version = 2
+# 本仓依赖集中在这些常见开源许可下。
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    "Unlicense",
+    "BSL-1.0",
+]
+# 许可证字段识别置信度低于阈值时报出来（有些老 crate 的 license 写法不规范）
+confidence-threshold = 0.9
+
+[bans]
+# 同一 crate 多版本共存很常见（windows-sys 0.5x/0.6x 并存），先只警告不拦。
+multiple-versions = "warn"
+# 依赖里写 `*` 会导致不可复现构建：直接拒。
+wildcards = "deny"
+deny = []
+skip = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -69,6 +69,9 @@ fn send(inputs: &[INPUT]) -> u32 {
     if inputs.is_empty() {
         return 0;
     }
+    // SAFETY: SendInput 要求 cbSize 等于 size_of::<INPUT>()，这里由同一常量传入；数组指针
+    // 来自 &[INPUT] 且长度如实（inputs.len()），调用期间切片存活，元素均由 mouse_input/
+    // key_input 以 INPUT 构造器生成、布局与 INPUT 一致。
     let n = unsafe { SendInput(inputs.len() as u32, inputs.as_ptr(), size_of::<INPUT>() as i32) };
     #[cfg(debug_assertions)]
     if n != inputs.len() as u32 {
@@ -305,6 +308,8 @@ pub fn key_combo(combo: &str) -> Result<(), String> {
 
 /// 某键此刻是否按下（诊断用：验证组合键真的落下了）。
 pub fn is_key_down(vk: i32) -> bool {
+    // SAFETY: GetAsyncKeyState 无指针参数，任意 i32 虚拟键码都安全（未知码返回 0）；
+    // 返回值按 u32 取最高位判断是否按下，不涉及外部内存。
     unsafe { (GetAsyncKeyState(vk) as u32 & 0x8000) != 0 }
 }
 

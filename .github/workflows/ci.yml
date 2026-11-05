@@ -39,10 +39,19 @@ jobs:
 
       # 沙箱探针要真拉起受限进程（内存上限探针 60s），单独给时间预算。
       # 托管 runner 起不了受限 token 子进程（cmd/git 未执行即 exit 0xC0000142），
-      # 探针测试会宿主自检后跳过并留原因（probes::restricted_host_limitation），本机仍全量执行
+      # 探针测试会宿主自检后跳过并留原因（probes::restricted_host_limitation），本机仍全量执行。
+      # 跳过这件事必须看得见：下一步把原因写进 job summary，别让人误以为探针全跑了。
       - name: 测试（全量，不 fail-fast）
         run: cargo test --no-fail-fast
         timeout-minutes: 25
+
+      - name: 沙箱探针是否真跑过（写 job summary）
+        shell: pwsh
+        run: |
+          $out = (cargo test sandbox::probes::tests::host_limitation_report -- --nocapture 2>&1 | Out-String)
+          $line = ($out -split "`n" | Where-Object { $_ -match '\[sandbox-probe\]' } | Select-Object -First 1)
+          if (-not $line) { $line = '[sandbox-probe] UNKNOWN：报告测试未输出结论，请检查测试是否被编译/运行' }
+          "## 沙箱探针`n`n``" + $line.Trim() + "```n" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
 
   frontend:
     name: 前端（单测 + 构建）
@@ -80,6 +89,23 @@ jobs:
       # 写错时构建不报错、界面静默退化成默认样式（2026-10-30 实锤），所以构建后验产物。
       - name: markdown 样式产物检查
         run: node scripts/check_md_css.mjs
+
+  # 供应链审计（D7）：已知漏洞 / 许可证白名单 / 依赖来源。策略见仓库根 deny.toml。
+  supply-chain:
+    name: 供应链（cargo deny）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: taiki-e/install-action@cargo-deny
+
+      - name: 主 crate（advisories / licenses / bans / sources）
+        run: cargo deny check
+
+      # 桌面壳是独立 crate + 独立 lock（tauri 依赖面），同一份策略再过一遍
+      - name: 桌面壳 crate
+        working-directory: desktop
+        run: cargo deny --config ../deny.toml check
 
   # 桌面壳是独立 crate（start.bat 日常入口会一并起它，内置浏览器就是壳里的 child
   # webview），但它不参与根 crate 的 clippy/test——之前 CI 里连编译都没验证过，

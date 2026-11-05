@@ -56,6 +56,13 @@ async fn main() -> anyhow::Result<()> {
     // —— 配置：config.toml（server/logging/gateway 种子）——
     let config = config::load(&manifest.join("config.toml"))?;
 
+    // —— 应用数据目录（先解析：服务自管理里的 `run` 要从它读访问令牌）——
+    // 环境变量 PAWCH_AGENT_DATA_DIR > config.toml [paths].data_dir > 默认
+    // `%USERPROFILE%\.pawch-agent`。settings/logs(会话/用量)/记忆/插件/插件数据/
+    // MCP token/技能/cache 都落这里；安装目录只留程序本体与 config.toml 等只读资源。
+    let data_root = config::resolve_data_root(&config);
+    config::init_data_root(&data_root);
+
     // —— 服务自管理（前置）：start/stop/status/--install/双击智能启动——
     // 接管后直接返回，不跑服务；--minimized 后台子进程与无参服务进程继续往下走。
     let argv: Vec<String> = std::env::args().collect();
@@ -63,11 +70,6 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // —— 应用数据目录 ——
-    // 环境变量 PAWCH_AGENT_DATA_DIR > config.toml [paths].data_dir > 默认
-    // `%USERPROFILE%\.pawch-agent`。settings/logs(会话/用量)/记忆/插件/插件数据/
-    // MCP token/技能/cache 都落这里；安装目录只留程序本体与 config.toml 等只读资源。
-    let data_root = config::resolve_data_root(&config);
     if let Err(e) = std::fs::create_dir_all(&data_root) {
         anyhow::bail!(
             "应用数据目录不可用：{}（{e}）。请在 config.toml [paths] data_dir 换一个可写目录，\
@@ -75,7 +77,9 @@ async fn main() -> anyhow::Result<()> {
             data_root.display()
         );
     }
-    config::init_data_root(&data_root);
+    // 本地 API 访问令牌（D1）：首启生成 <数据目录>/server.token，页面走 cookie，
+    // CLI/eval 读文件加 Bearer 头。必须在 router 之前装好。
+    server::auth::init(&data_root);
     if data_root != manifest {
         let moved = bootstrap::migrate_legacy_data(&manifest, &data_root);
         if !moved.is_empty() {

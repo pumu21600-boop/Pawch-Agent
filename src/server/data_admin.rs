@@ -836,7 +836,13 @@ pub(super) async fn data_export(Json(req): Json<ExportReq>) -> Result<Json<Value
                 .unwrap_or(0);
             let stage = std::env::temp_dir().join(format!("pawch-export-{}-{stamp}", std::process::id()));
             let mut st = CopyStats::default();
-            let skip: &[&str] = if include_cache { &[] } else { &["cache"] };
+            // 访问令牌不进导出包：导出常被拿去备份/换机，别把本机凭证一起带走
+            // （数据目录搬迁/migrate 仍照常复制 token——那是同一台机换位置，保持凭证连续）
+            let skip: &[&str] = if include_cache {
+                &["server.token"]
+            } else {
+                &["cache", "server.token"]
+            };
             let r = (|| {
                 copy_tree(&current, &stage, skip, &mut st)?;
                 zip_dir(&stage, &dest)?;

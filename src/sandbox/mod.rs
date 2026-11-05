@@ -4,7 +4,8 @@
 //! 受限 token 管权限面（剥光全部特权 + 受限 SID 白名单）。真实隔离、不依赖管理员权限。
 //! 同步阻塞实现：工具层接入时用 tokio::task::spawn_blocking 包裹调用。
 //!
-//! 留口（不实现）：AppContainer / 网络出向限制 / 完整性降级；交互式输入（视需要）。
+//! 留口：网络出向限制目前只有 appcontainer 档的能力 SID 路径（默认断网）；
+//! restricted 档不隔离网络，要真断网需另接防火墙/驱动层（未做）。
 
 mod appcontainer;
 pub mod backend;

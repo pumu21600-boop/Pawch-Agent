@@ -13,7 +13,7 @@
 
 mod eval_core;
 
-use eval_core::{load_tasks, run_assertion, snapshot, drive_chat, drive_turn, sanitize_setup_rel, TaskReport};
+use eval_core::{http_client, load_tasks, run_assertion, snapshot, drive_chat, drive_turn, sanitize_setup_rel, TaskReport};
 use std::path::PathBuf;
 
 /// setup_files 相对路径消毒在 eval_core（sanitize_setup_rel）——与断言引擎同侧，
@@ -51,7 +51,7 @@ async fn main() {
     }
 
     // 原工作区记录：跑完恢复
-    let client = reqwest::Client::new();
+    let client = http_client();
     let original_ws: Option<String> = match client
         .get(format!("{base}/api/workspace"))
         .timeout(std::time::Duration::from_secs(5))

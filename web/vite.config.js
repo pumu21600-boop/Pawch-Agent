@@ -1,16 +1,45 @@
 import { defineConfig } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
+import fs from 'node:fs';
+import path from 'node:path';
 
 // 主服务地址（config.toml [server].port）。代理转发时把 Origin 改写成它——
 // 主服务的来源校验要求 Origin 与 Host 同源（防 DNS rebinding），
 // 而浏览器发来的是热更端口 5174，不改写会被 403。代理的意义正在于此。
 const SERVICE = 'http://127.0.0.1:5173';
 
+// D1：主服务 /api 要本地访问令牌。热更页（5174）没有 5173 下发的 cookie，
+// 代理转发时补 Authorization。token 解析顺序与服务一致：
+// PAWCH_AGENT_DATA_DIR > %LOCALAPPDATA%\Pawch Agent\.data-dir > %USERPROFILE%\.pawch-agent
+function readLocalToken() {
+  const dirs = [];
+  if (process.env.PAWCH_AGENT_DATA_DIR) dirs.push(process.env.PAWCH_AGENT_DATA_DIR);
+  try {
+    const ptr = path.join(process.env.LOCALAPPDATA || '', 'Pawch Agent', '.data-dir');
+    const t = fs.readFileSync(ptr, 'utf8').trim();
+    if (t) dirs.push(t);
+  } catch {}
+  const home = process.env.USERPROFILE || process.env.HOME;
+  if (home) dirs.push(path.join(home, '.pawch-agent'));
+  for (const dir of dirs) {
+    try {
+      const t = fs.readFileSync(path.join(dir, 'server.token'), 'utf8').trim();
+      if (t) return t;
+    } catch {}
+  }
+  console.warn('[vite] 读不到主服务访问令牌（server.token）：热更页打 /api 会 401');
+  return '';
+}
+const LOCAL_TOKEN = readLocalToken();
+
 const proxyToService = {
   target: SERVICE,
   changeOrigin: true,
   configure: (proxy) => {
-    proxy.on('proxyReq', (proxyReq) => proxyReq.setHeader('Origin', SERVICE));
+    proxy.on('proxyReq', (proxyReq) => {
+      proxyReq.setHeader('Origin', SERVICE);
+      if (LOCAL_TOKEN) proxyReq.setHeader('Authorization', `Bearer ${LOCAL_TOKEN}`);
+    });
   },
 };
 

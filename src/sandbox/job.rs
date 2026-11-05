@@ -47,6 +47,9 @@ impl JobGuard {
     /// restricted=false（本机直跑）：只留 kill-on-close 生命周期保险丝，
     /// 不限内存/进程数/CPU——那是"权限笼"的一部分，脱笼时不带。
     pub(crate) fn new(limits: &SandboxLimits, restricted: bool) -> anyhow::Result<Self> {
+        // SAFETY: CreateJobObjectW 的 lpJobAttributes/lpName 允许 NULL，返回 0 即失败并返回；
+        // 各 SetInformationJobObject 的信息结构都是本帧内 POD，mem::zeroed 得到全零合法值后
+        // 逐字段赋值，size 参数用 mem::size_of 与该信息类精确匹配；失败路径先关句柄再返回。
         unsafe {
             let handle = CreateJobObjectW(ptr::null(), ptr::null());
             if handle == 0 {
@@ -146,6 +149,8 @@ impl JobGuard {
 
     /// 把已挂起进程收进 Job（spawn 时 CREATE_SUSPENDED 后、ResumeThread 前调用）。
     pub(crate) fn assign(&self, process: HANDLE) -> anyhow::Result<()> {
+        // SAFETY: self.handle 来自 CreateJobObjectW 且由 JobGuard 持有到 Drop；process 是
+        // 调用方传入的有效进程句柄（spawn 里来自 PROCESS_INFORMATION，创建成功且尚存活）。
         unsafe {
             if AssignProcessToJobObject(self.handle, process) == 0 {
                 return Err(anyhow!("AssignProcessToJobObject 失败: {}", GetLastError()));
@@ -155,6 +160,8 @@ impl JobGuard {
     }
 
     pub(crate) fn terminate(&self) {
+        // SAFETY: self.handle 是 CreateJobObjectW 返回且仍存活的 Job 句柄；TerminateJobObject
+        // 对有效 Job 幂等，重复调用只返回失败，不涉及 Rust 内存。
         unsafe {
             TerminateJobObject(self.handle, KILL_EXIT_CODE);
         }
@@ -164,6 +171,8 @@ impl JobGuard {
 impl Drop for JobGuard {
     fn drop(&mut self) {
         self.terminate();
+        // SAFETY: self.handle 是 CreateJobObjectW 返回的有效句柄，Drop 只执行一次；上面的
+        // terminate 不关闭句柄，故这里是该句柄的唯一一次 CloseHandle。
         unsafe { CloseHandle(self.handle) };
     }
 }
@@ -182,6 +191,9 @@ mod tests {
     }
 
     fn read_limits(job: &JobGuard) -> JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+        // SAFETY: job.handle 是 JobGuard 持有的有效 Job 句柄；info 是本帧栈上 POD，
+        // mem::zeroed 后由 QueryInformationJobObject 按其 size 参数写入；ret 是本帧有效
+        // 输出变量，失败时断言报错，不返回未初始化值。
         unsafe {
             let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = mem::zeroed();
             let mut ret = 0u32;
@@ -198,6 +210,8 @@ mod tests {
     }
 
     fn read_cpu_rate(job: &JobGuard) -> JOBOBJECT_CPU_RATE_CONTROL_INFORMATION {
+        // SAFETY: job.handle 有效；info 是栈上 POD 且 size_of 与该信息类匹配，ret 为本帧
+        // 有效 u32；失败时断言报错，不返回未初始化值。
         unsafe {
             let mut info: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION = mem::zeroed();
             let mut ret = 0u32;
@@ -235,6 +249,8 @@ mod tests {
         assert_eq!(info.BasicLimitInformation.PerProcessUserTimeLimit, 5_000 * 10_000);
 
         // UI 限制是独立信息类，单独回读
+        // SAFETY: job.handle 有效；ui 是栈上 POD，QueryInformationJobObject 按 size_of 与
+        // 该信息类匹配写入，ret 为本帧有效 u32；失败时断言报错。
         unsafe {
             let mut ui: JOBOBJECT_BASIC_UI_RESTRICTIONS = mem::zeroed();
             let mut ret = 0u32;
@@ -266,6 +282,9 @@ mod tests {
         let rate = read_cpu_rate(&job);
         assert_ne!(rate.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_ENABLE, 0, "CpuRate 未启用");
         assert_ne!(rate.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP, 0, "CpuRate 非硬顶");
+        // SAFETY: rate 是 read_cpu_rate 从内核读回的结构，且上一行已断言 ControlFlags 含
+        // JOB_OBJECT_CPU_RATE_CONTROL_ENABLE；只有该控制位启用时 Anonymous 联合体的 CpuRate
+        // 分支才是内核写入的有效成员。
         let cpu = unsafe { rate.Anonymous.CpuRate };
         assert_eq!(cpu, 5_000, "CpuRate = 百分比×100（50% → 5000）");
 

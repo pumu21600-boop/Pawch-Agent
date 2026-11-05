@@ -5,6 +5,14 @@ Pawch Agent 服务的全部 HTTP / SSE 端点。服务只接受本机来源的�
 DNS rebinding，这层校验补的就是它。不带 `Origin` 的命令行客户端（curl、eval 驱动器、
 服务自管理）照常可用。
 
+**访问令牌（D1）**：`/api/*` 与 `/cancel` 还要带本地令牌，二者其一：
+
+- 页面：打开任意 HTML 文档（如 `/`）时服务下发同源 `HttpOnly; SameSite=Strict` cookie，页面内 fetch/SSE 自动携带，无需前端改动；
+- 命令行/脚本：`Authorization: Bearer <token>`，token 在 `<数据目录>/server.token`（首启生成，ACL 仅当前用户）。CLI 的 `run` 与 eval 驱动器会自动读取；`curl` 请手工加头。
+
+静态资源（页面、`/assets/*`、`/plugins/*` 插件 iframe 文档）不校验令牌。缺令牌的 `/api` 请求返回
+`401` + 人话错误。
+
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/` | Svelte 页面（未构建时内置页） |

@@ -22,6 +22,9 @@ pub const PROFILE_NAME: &str = "agent_local_sandbox";
 pub const INTERNET_CLIENT_SID: &str = "S-1-15-3-3";
 
 #[link(name = "userenv")]
+// SAFETY: 这些符号由 Windows 系统 DLL userenv.dll 提供；签名与 Windows SDK/windows-sys 的
+// CreateAppContainerProfile/DeleteAppContainerProfile 一致（输出/输入均按 Win32 契约传
+// NUL 结尾 UTF-16 与有效指针），调用方保证参数有效。
 unsafe extern "system" {
     fn CreateAppContainerProfile(
         app_container_name: *const u16,
@@ -36,10 +39,14 @@ unsafe extern "system" {
     fn DeleteAppContainerProfile(app_container_name: *const u16) -> i32;
 }
 #[link(name = "advapi32")]
+// SAFETY: ConvertStringSidToSidW 由系统 advapi32.dll 提供，签名与 windows-sys 一致：
+// 输入 NUL 结尾 UTF-16 SID 字符串，输出经 LocalAlloc 分配、须 LocalFree 释放的 PSID。
 unsafe extern "system" {
     fn ConvertStringSidToSidW(string_sid: *const u16, out_sid: *mut PSID) -> i32;
 }
 #[link(name = "kernel32")]
+// SAFETY: LocalFree 由系统 kernel32.dll 提供，签名与 windows-sys 一致（HGLOBAL/HANDLE 入参，
+// 成功返回 NULL）；本文件只用于释放 CreateAppContainerProfile 返回的 SID。
 unsafe extern "system" {
     fn LocalFree(hmem: HANDLE) -> HANDLE;
 }
@@ -57,13 +64,20 @@ fn wide(s: &str) -> Vec<u16> {
 /// **坑（真机踩过）**：DeriveAppContainerSidFromAppContainerName 是纯数学运算，
 /// profile 不存在也返回成功——CreateProcess 会报错误 2。所以这里总是重建 profile
 /// （幂等删除+创建；sandbox profile 无持久数据，代价可忽略）。
+// SAFETY: 调用方前提：同一进程内不得并发重建同名 profile（否则删除/创建会交错）；
+// 其余指针都在函数内部按帧存活，无需调用方再保证。
 pub unsafe fn ensure_sid(allow_network: bool) -> Result<SidGuard, String> {
+    // SAFETY: 契约原样透传——调用方已保证不并发重建同一 profile，参数为普通 bool。
     unsafe { recreate_profile(allow_network) }
 }
 
 /// 删除并重建 profile（能力按 allow_network），返回派生 SID。
+// SAFETY: 调用方前提同 ensure_sid：不并发重建同名 profile。函数内部所有指针都指向本帧
+// 存活的 Vec<u16>/SID，列表长度如实传入，且不保留任何借出指针到返回之后。
 pub unsafe fn recreate_profile(allow_network: bool) -> Result<SidGuard, String> {
     let name_w = wide(PROFILE_NAME);
+    // SAFETY: name_w 是本帧 NUL 结尾 UTF-16 缓冲，调用期间存活；DeleteAppContainerProfile
+    // 只读该字符串，profile 不存在时返回失败，本处按幂等语义忽略。
     unsafe {
         let _ = DeleteAppContainerProfile(name_w.as_ptr());
     }
@@ -74,6 +88,9 @@ pub unsafe fn recreate_profile(allow_network: bool) -> Result<SidGuard, String> 
     if allow_network {
         let s = wide(INTERNET_CLIENT_SID);
         let mut sid: PSID = ptr::null_mut();
+        // SAFETY: s 是本帧 NUL 结尾 UTF-16 SID 字符串，&mut sid 是本帧有效 PSID 输出变量；
+        // 失败返回 0 时不使用 sid。成功得到的 SID 仅作为 capabilities 输入指针，调用期间
+        // 不释放（系统在 CreateAppContainerProfile 内复制）。
         if unsafe { ConvertStringSidToSidW(s.as_ptr(), &mut sid) } != 0 {
             cap_sids.push(sid);
         }
@@ -89,6 +106,9 @@ pub unsafe fn recreate_profile(allow_network: bool) -> Result<SidGuard, String> 
     let desc = wide("Pawch Agent 项目沙箱（LowBox，默认断网）");
     let mut sid: PSID = ptr::null_mut();
     let hr = unsafe {
+        // SAFETY: name_w/display/desc 都是本帧 NUL 结尾 UTF-16 缓冲，调用期间存活；caps 为空
+        // 时传 NULL（避免空数组的 E_INVALIDARG），否则指向 cap_sids 派生的 SID_AND_ATTRIBUTES
+        // 数组且 count 用 len 如实传入；&mut sid 是本帧有效输出变量，成功后由 SidGuard 释放。
         CreateAppContainerProfile(
             name_w.as_ptr(),
             display.as_ptr(),
@@ -113,6 +133,8 @@ pub struct SidGuard {
 impl Drop for SidGuard {
     fn drop(&mut self) {
         if !self.sid.is_null() {
+            // SAFETY: self.sid 非空时是 CreateAppContainerProfile 分配、尚未释放的 SID；
+            // Drop 只执行一次，LocalFree 接受该系列分配器返回的指针。
             unsafe {
                 LocalFree(self.sid as HANDLE);
             }
@@ -122,11 +144,15 @@ impl Drop for SidGuard {
 
 /// SID 转字符串（icacls / 日志用）——手写转换，零额外 FFI。
 /// SID 内存布局：[Revision u8][SubAuthorityCount u8][IdentifierAuthority 6B 大端][SubAuthority u32 × N 小端]
+// SAFETY: 调用方前提：sid 要么为空（立即返回 None），要么指向系统写入的合法 SID 且在本调用
+// 期间有效。函数先校验 revision==1、子权威数 ≤15，再按 SID 头声明的长度读取。
 pub unsafe fn sid_to_string(sid: PSID) -> Option<String> {
     if sid.is_null() {
         return None;
     }
     // 指针解引用逐处显式 unsafe（edition 2024 要求，即使在 unsafe fn 体内）
+    // SAFETY: 合法 SID 布局为 [Revision][Count][6B Authority][Count×u32]；此处先校验
+    // revision==1、count ≤15 后才按该长度读取，子权威用 read_unaligned 避免对齐假设。
     unsafe {
         let p = sid as *const u8;
         if *p != 1 {

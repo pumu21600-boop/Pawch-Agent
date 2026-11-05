@@ -20,6 +20,54 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+// —— 本机服务访问令牌（D1）——
+
+/// 读本机服务令牌。顺序：`PAWCH_AGENT_TOKEN` > 数据目录 `server.token`。
+/// 数据目录解析与服务一致：`PAWCH_AGENT_DATA_DIR` > `%LOCALAPPDATA%\Pawch Agent\.data-dir`
+/// > `%USERPROFILE%\.pawch-agent`。读不到就返回 None（请求会 401，让用户看到人话）。
+pub fn auth_token() -> Option<String> {
+    if let Ok(t) = std::env::var("PAWCH_AGENT_TOKEN") {
+        let t = t.trim().to_string();
+        if !t.is_empty() {
+            return Some(t);
+        }
+    }
+    let data = std::env::var_os("PAWCH_AGENT_DATA_DIR")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            let base = std::env::var_os("LOCALAPPDATA")?;
+            let s = fs::read_to_string(
+                PathBuf::from(base).join("Pawch Agent").join(".data-dir"),
+            )
+            .ok()?;
+            let t = s.trim().to_string();
+            (!t.is_empty()).then(|| PathBuf::from(t))
+        })
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .or_else(|| std::env::var_os("HOME"))
+                .map(|h| PathBuf::from(h).join(".pawch-agent"))
+        })?;
+    let text = fs::read_to_string(data.join("server.token")).ok()?;
+    let t = text.trim().to_string();
+    (!t.is_empty()).then_some(t)
+}
+
+/// 带本地令牌的 HTTP 客户端（eval 打 /api 全走它）。
+pub fn http_client() -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(t) = auth_token()
+        && let Ok(v) = format!("Bearer {t}").parse()
+    {
+        headers.insert(reqwest::header::AUTHORIZATION, v);
+    }
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 // —— 任务定义 ——
 
 #[derive(Debug, Clone, Deserialize)]
@@ -327,7 +375,7 @@ pub async fn drive_turn(
         "approval_mode": approval_mode,
         "session_id": session_id,
     });
-    let client = reqwest::Client::new();
+    let client = http_client();
     let resp = client
         .post(&url)
         .json(&body)
