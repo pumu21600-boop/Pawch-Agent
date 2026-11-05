@@ -16,6 +16,13 @@ ignore = [
     { id = "RUSTSEC-2026-0370", reason = "zvariant 公告：rfd/ashpd 的 Linux 门户路径，Windows 构建不编译" },
     { id = "RUSTSEC-2026-0371", reason = "zbus_names 公告：rfd/ashpd 的 Linux 门户路径，Windows 构建不编译" },
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive 公告：rfd/ashpd 的 Linux 门户路径，Windows 构建不编译" },
+    # —— 桌面壳的 GTK/Linux 依赖树（tauri 全平台 lock 带进来，Windows 不编译）——
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error 停止维护：glib-macros → GTK 链，Linux 专用，Windows 壳不编译" },
+    { id = "RUSTSEC-2025-0075", reason = "unic-char-range 停止维护：tauri GTK/Linux 链，Windows 壳不编译" },
+    { id = "RUSTSEC-2025-0080", reason = "unic-common 停止维护：tauri GTK/Linux 链，Windows 壳不编译" },
+    { id = "RUSTSEC-2025-0098", reason = "unic-ucd-version 停止维护：tauri GTK/Linux 链，Windows 壳不编译" },
+    { id = "RUSTSEC-2025-0100", reason = "unic-ucd-ident 停止维护：tauri GTK/Linux 链，Windows 壳不编译" },
+    { id = "RUSTSEC-2025-0081", reason = "unic-char-property 停止维护：tauri GTK/Linux 链，Windows 壳不编译" },
 ]
 
 [licenses]
