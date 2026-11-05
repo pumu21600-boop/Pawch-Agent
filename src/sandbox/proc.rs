@@ -1,4 +1,4 @@
-//! 进程拉起与收割 —— 任务单 004 / 任务 D
+//! 进程拉起与收割
 //!
 //! 流程：受限 token + Job 就绪 → CreateProcessAsUserW(CREATE_SUSPENDED) → AssignProcessToJobObject
 //! → ResumeThread（挂起期入 Job，竞态窗口为零）→ 匿名管道收 stdout/stderr → 超时整树击杀。

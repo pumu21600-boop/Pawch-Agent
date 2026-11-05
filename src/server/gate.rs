@@ -2,7 +2,7 @@
 
 use super::*;
 
-/// 审批门（任务单 005 + 本机直跑）：SSE 发审批请求，oneshot 等用户决定；
+/// 审批门（+ 本机直跑）：SSE 发审批请求，oneshot 等用户决定；
 /// 120 秒不决定视为拒绝；用户点「停止」（取消标志）立即按拒绝返回。
 /// 档位读共享状态：侧栏切档即时生效（含进行中的请求）。
 pub(super) struct ChatGate {
@@ -79,7 +79,7 @@ impl agent::ApprovalGate for ChatGate {
 
     // 审批判定单点：只保留细粒度 needs_approval_for。
     // 旧版按工具静态 danger_level 的 needs_approval(mode, danger_level) 已随
-    // 任务单 013 A2 删除——两套判定并存会造成语义分裂，禁止再加回来。
+    // A2 删除——两套判定并存会造成语义分裂，禁止再加回来。
     fn needs_approval_for(&self, tool: &str, args_json: &str) -> bool {
         self.needs_approval_for_in(&crate::tools::workspace_root(), tool, args_json)
     }

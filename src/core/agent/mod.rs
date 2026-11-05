@@ -1,4 +1,4 @@
-//! 核心循环 v1（任务单 003）
+//! 核心循环 v1
 //!
 //! 任务消息 → 模型（带 tools）→ 若返回 tool_calls 则执行回填继续；纯文本则终止。
 //! 步数上限 cfg.max_steps：0 = 不限；失控由取消标志/花费硬闸
@@ -89,7 +89,7 @@ pub struct Plan {
 pub const SUMMARY_PREFIX: &str = "【历史摘要】";
 
 /// B3：Plan 档 system prompt 增量。
-/// 红线（坑 13/任务单 013 红线 9）：不注入模型身份/人设——这里是纯任务行为约束与计划格式约定。
+/// 红线（坑 13/ 红线 9）：不注入模型身份/人设——这里是纯任务行为约束与计划格式约定。
 pub const PLAN_PROMPT: &str = "\
 [Plan 模式]\n\
 当前处于 Plan（规划）档：只允许只读类操作（查看文件、搜索代码、只读命令）。写文件与改动类命令会被直接拒绝，请勿尝试。\n\
@@ -142,7 +142,7 @@ pub struct AskSink {
 
 /// 审批判定**单点**：一律走 `ApprovalGate::needs_approval_for`（细粒度，见
 /// `core::rules::evaluate_risk` + `should_ask_approval` 的档位映射）。
-/// 旧的按工具静态 danger_level 判定的 `needs_approval` 已在任务单 013 A2 中删除——
+/// 旧的按工具静态 danger_level 判定的 `needs_approval` 已在 A2 中删除
 /// 两套判定并存会造成语义分裂，此后再无第二处审批判定入口。
 /// （工具静态 danger_level 现仅用于「是否拍影子仓库检查点」，不参与审批判定。）
 ///
@@ -617,7 +617,7 @@ pub async fn run_task(
     // 会话标题素材：本任务第一次最终回答（引导续跑后不从「好的已结束」生成标题）
     let mut title_source: Option<String> = None;
 
-    // A3 能力标记「工具调用」闭环（任务单 012）：capabilities.tools=false 时不携带 tools
+    // A3 能力标记「工具调用」闭环：capabilities.tools=false 时不携带 tools
     // 参数，模型无法发起新工具调用；历史消息里的 tool_calls 回放不受影响（replay 只动消息字段）。
     let tools_def = tools_def_for(&primary.params);
     // 工具定义随每次请求发给模型（渠道计入 prompt tokens），圆环必须算上——
@@ -1499,7 +1499,7 @@ mod tests {
 
     #[test]
     fn tools_def_follows_capability_mark() {
-        // A3（任务单 012）：capabilities.tools=false → 请求不携带 tools 参数
+        // A3：capabilities.tools=false → 请求不携带 tools 参数
         let mut p = ChatParams::default();
         assert!(tools_def_for(&p).is_some(), "默认（tools=true）携带 tools");
         p.tools_enabled = false;

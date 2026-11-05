@@ -1,4 +1,4 @@
-//! 受限 token —— 任务单 004 / 任务 B
+//! 受限 token
 //!
 //! `CreateRestrictedToken`：DISABLE_MAX_PRIVILEGE 剥光全部特权 + 受限 SID 白名单
 //! （当前用户 / Everyone / BUILTIN\Users / Authenticated Users）。

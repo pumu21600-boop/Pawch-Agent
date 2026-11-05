@@ -191,7 +191,7 @@ const SENSITIVE_SUFFIXES: &[&str] = &[".pem", ".key", ".p12", ".pfx", ".jks", ".
 
 /// 评估具体工具调用的风险等级并给出判定依据。
 pub fn evaluate_risk(tool_name: &str, args: &Value, workspace_root: &Path) -> (RiskLevel, String) {
-    // （任务单 016）：MCP 动态工具——档位由 plugin 层按「首装确认 + server 配置」判定：
+    // MCP 动态工具——档位由 plugin 层按「首装确认 + server 配置」判定：
     // 未确认/禁用/未知 → Dangerous（总架构 §7 tool poisoning 防线）；确认后 Normal/Dangerous。
     if let Some(rest) = tool_name.strip_prefix(crate::plugin::wasm::PREFIX) {
         return match crate::plugin::wasm::risk_for(tool_name) {

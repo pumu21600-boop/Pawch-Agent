@@ -46,5 +46,5 @@ pub(crate) async fn cancel_status(State(state): State<AppState>, Query(q): Query
     }
 }
 
-// —— （任务单 014）：trace 时间线 ——
+// —— trace 时间线
 

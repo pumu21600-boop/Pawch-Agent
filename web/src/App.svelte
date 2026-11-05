@@ -493,6 +493,8 @@
     document.addEventListener('click', closeMenusOnOutside);
     // Ctrl+T 思考三态轮换（ZCode 同款）；同样必须配对清理（HMR 不累积）
     document.addEventListener('keydown', thinkHotkey);
+    // 刷新/关页前把正在跑的会话快照进 sessionStorage（重载后由 loadSession 兜回来）
+    window.addEventListener('beforeunload', stashLiveState);
     // 输入框上方 dock（审批/提问/任务清单）长高时，聊天区底部留白跟着长：
     // footer 是绝对定位浮层，固定 170px 留白会让展开的清单盖住最后几条消息。
     let dockRo = null;
@@ -523,6 +525,7 @@
       window.removeEventListener('message', onExtMessage);
       document.removeEventListener('click', closeMenusOnOutside);
       document.removeEventListener('keydown', thinkHotkey);
+      window.removeEventListener('beforeunload', stashLiveState);
     };
   });
 
@@ -1177,7 +1180,7 @@
         newModel = list[0];
         model = newModel;
       }
-      // A2（任务单 012）：能力标记归用户所有，切换/勾选模型不再改写 capabilities；
+      // A2：能力标记归用户所有，切换/勾选模型不再改写 capabilities；
       // 后端仅在该配置无用户标记历史时按新模型名推导初值
       if (!(await sendSettings({ models: list, model: newModel, api_key: apiKey.trim() || undefined }))) {
         savedModels = prevModels; // F3：保存失败回滚，勾选态不许与后端脱节
@@ -4600,6 +4603,10 @@
         if (c.running) return; // 服务端还在跑：继续等
         clearInterval(reconcileTimers[skey]);
         delete reconcileTimers[skey];
+        // 这一轮已经结束：刷新快照的使命完成，清掉避免下次误用旧内容
+        try {
+          sessionStorage.removeItem(LIVE_STASH_KEY);
+        } catch {}
         if (currentSessionId !== skey) {
           // 不在这个会话的页面：丢掉本地陈旧缓冲，下次打开时从服务端重建
           const next = { ...sessionMsgs };
@@ -4786,7 +4793,19 @@
       fetch(`/api/cancel?session=${encodeURIComponent(id)}`)
         .then((r) => r.json())
         .then((c) => {
-          if (c.running && !streams[id]) reconcileServerQueued(id);
+          if (c.running && !streams[id]) {
+            // 刷新恢复：服务端文件此刻通常只有用户消息（助手内容还在流里），先把刷新前的
+            // 内存快照铺回去；跑完由 reconcileServerQueued 用落盘结果替换。
+            const stashed = readLiveStash(id);
+            if (stashed) {
+              sessionMsgs = {
+                ...sessionMsgs,
+                [id]: stashed.map((m) => (m.streaming ? { ...m, streaming: false } : m)),
+              };
+              if (currentSessionId === id) syncCur();
+            }
+            reconcileServerQueued(id);
+          }
         })
         .catch(() => {});
       syncCur();
@@ -5646,7 +5665,7 @@
     skillsLoading = false;
   }
 
-  // —— （任务单 016）：MCP 插件分区 ——
+  // —— MCP 插件分区
   let mcpServers = [];
   let wasmPlugins = []; // WASM 工具插件清单（loadMcp 灌；此前漏声明，能力菜单一开就 ReferenceError）
   // git 运行时状态（插件分区顶部卡片）：系统装的 / 内置包解压的 / 不可用
@@ -7016,6 +7035,33 @@
   function notifyExtsWorkspace(path) {
     for (const e of enabledExts) {
       postToNameBoth(e.name, { type: 'pawch:event', event: 'workspace', path: path || '' });
+    }
+  }
+  /// 刷新/重载时把「正在跑的会话」的内存消息打个快照：整页导航会丢内存态，
+  /// 服务端此刻通常只落了用户消息（助手内容还在流里），不兜这一层用户会以为内容丢了。
+  /// 只存当前标签页（sessionStorage），只认 10 分钟内、同一会话、且服务端仍 running。
+  const LIVE_STASH_KEY = 'pawchLiveStash';
+  function stashLiveState() {
+    try {
+      const key = curKey();
+      if (!streams[key]) return; // 没有在跑的流，不需要兜
+      const msgs = sessionMsgs[key];
+      if (!msgs || !msgs.length) return;
+      const raw = JSON.stringify({ sid: currentSessionId || '', ts: Date.now(), msgs });
+      if (raw.length > 2_000_000) return; // 超配额就放弃（会话太大，宁可不兜）
+      sessionStorage.setItem(LIVE_STASH_KEY, raw);
+    } catch {}
+  }
+  function readLiveStash(id) {
+    try {
+      const raw = sessionStorage.getItem(LIVE_STASH_KEY);
+      if (!raw) return null;
+      const d = JSON.parse(raw);
+      if (!d || d.sid !== id || !Array.isArray(d.msgs) || !d.msgs.length) return null;
+      if (Date.now() - (d.ts || 0) > 10 * 60 * 1000) return null;
+      return d.msgs;
+    } catch {
+      return null;
     }
   }
   /// 切换当前会话的唯一入口：赋值 + 广播。

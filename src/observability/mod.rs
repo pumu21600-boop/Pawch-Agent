@@ -1,4 +1,4 @@
-//! JSONL 日志地基 —— 任务单 001 / 任务 A
+//! JSONL 日志地基
 //!
 //! 约定：后续所有代码统一走本模块落日志，业务数据禁止直接 println。
 //! 每条记录固定 4 个字段：ts / session_id / event_type / payload。

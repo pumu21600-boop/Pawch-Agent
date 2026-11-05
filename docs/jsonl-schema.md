@@ -1,4 +1,4 @@
-# JSONL 日志 Schema（任务单 001 / 任务 A）
+# JSONL 日志 Schema
 
 ## 1. 文件位置
 
@@ -125,7 +125,7 @@
 | `chat.steered` | 同会话运行中再发消息 → 进队列（027） | `session`、`mode`（`queue`=排队等本轮结束 / `immediate`=立即并进本轮）、`pending`（积压条数） |
 | ~~`chat.rejected`~~ | 已废弃（2026-11-03：引导/立即发送支持带附件，同会话运行中不再因附件拒收） | — |
 
-### 4.x 新增 kind（任务单 027，只增）
+### 4.x 新增 kind（只增）
 
 | `kind` | 说明 | 关键字段 |
 | --- | --- | --- |
@@ -155,7 +155,7 @@
 | `plugin.draft_promoted` | draft 一键转正落盘 | `plugin`、`paths` |
 | `plugin.draft_discarded` | draft 丢弃 | `plugin` |
 
-### 4.x 新增 kind（任务单 030，只增）
+### 4.x 新增 kind（只增）
 
 | `kind` | 说明 | 关键字段 |
 | --- | --- | --- |

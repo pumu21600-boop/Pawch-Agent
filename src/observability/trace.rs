@@ -1,4 +1,4 @@
-//! （任务单 014）：trace 时间线的只读解析。
+//! trace 时间线的只读解析。
 //!
 //! 数据源是 logs/agent.jsonl（固定 4 字段：ts / session_id / event_type / payload，
 //! schema 见 docs/jsonl-schema.md——本模块**只读**，写端 schema 一律不碰）。

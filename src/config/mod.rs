@@ -1,4 +1,4 @@
-//! 配置加载 —— config.toml + 环境变量覆盖（任务单 001 / 任务 B）
+//! 配置加载 —— config.toml + 环境变量覆盖
 //!
 //! 硬约束一：base_url 从 config.toml 读，可用环境变量 DEEPSEEK_BASE_URL 覆盖（商汤中转）。
 //! 硬约束二：API key 不在这里，只走环境变量 DEEPSEEK_API_KEY。
@@ -206,7 +206,7 @@ pub struct PathsConfig {
     pub data_dir: String,
 }
 
-/// 成本红线参数（任务单 030）。
+/// 成本红线参数。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CostConfig {
     /// 全局花费上限（美元，硬闸）：台账累计花费达到即拒绝新的模型请求；0 = 不限（默认）。
@@ -272,7 +272,7 @@ impl Default for SubagentConfig {
     }
 }
 
-/// 记忆系统参数（任务单 009）。
+/// 记忆系统参数。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryConfig {
     /// 总开关：false 时 events.log / index / AGENTS.md 注入 / 滚动摘要全停
@@ -306,7 +306,7 @@ impl Default for MemoryConfig {
     }
 }
 
-/// 恢复与续命参数（任务单 007）。
+/// 恢复与续命参数。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecoveryConfig {
     /// shadow repo checkpoint 总开关（danger≥1 工具执行前拍快照）
@@ -324,7 +324,7 @@ impl Default for RecoveryConfig {
     }
 }
 
-/// 核心循环参数（任务单 003 / 005）。
+/// 核心循环参数。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
     /// 单次任务模型决策步数上限（0 = 不限：大项目 100+ 次工具
@@ -347,7 +347,7 @@ pub struct AgentConfig {
     pub unsandboxed_approval: bool,
 }
 
-/// 执行沙箱参数（任务单 004，shell 工具也走这套限额）。
+/// 执行沙箱参数（shell 工具也走这套限额）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxConfig {
     /// 墙钟超时（ms）：到点整树击杀
@@ -373,7 +373,7 @@ fn default_sandbox_mode() -> String {
     "restricted".into()
 }
 
-/// 钩子配置（任务单 027）—— 用户不改源码即可在固定挂点插入自定义动作。
+/// 钩子配置—— 用户不改源码即可在固定挂点插入自定义动作。
 /// 承载形式：本地命令（stdin 收 JSON 事件、stdout 回 JSON 决定）；空串 = 未配置。
 /// 语义四条（定案 7）：4 挂点 / before_tool 仅否决权 / 超时放行 / JSONL 审计。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -402,7 +402,7 @@ fn default_hook_timeout_ms() -> u64 {
     5000
 }
 
-/// 上下文工程参数（任务单 006）。
+/// 上下文工程参数。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextConfig {
     /// 全 messages 的 token 预算（估算值），超出触发裁剪；给回复留足余量

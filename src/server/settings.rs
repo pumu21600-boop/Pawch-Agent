@@ -10,7 +10,7 @@ pub struct ModelsRequest {
     pub api_key: String,
 }
 
-/// 设置更新请求。B1 清除语义（任务单 012 固化，前后端任何一方改动必须对照本条）：
+/// 设置更新请求。B1 清除语义（固化，前后端任何一方改动必须对照本条）：
 ///
 /// - `0` = 清除长度类（context_length / max_output_tokens）
 /// - 负数 = 清除采样类（temperature / top_p）
@@ -335,7 +335,7 @@ pub(super) async fn list_models(
 ) -> (StatusCode, Json<Value>) {
     let s = state.settings.read().unwrap_or_else(|e| e.into_inner()).clone();
     let base_url = if req.base_url.trim().is_empty() { s.effective_base_url() } else { req.base_url.trim().to_string() };
-    // B2 key 回落链（任务单 012 固化）：请求显式 key > 激活配置 DPAPI key > DEEPSEEK_API_KEY 环境变量。
+    // B2 key 回落链（固化）：请求显式 key > 激活配置 DPAPI key > DEEPSEEK_API_KEY 环境变量。
     // key 永不出日志、永不出 JSONL。
     let api_key = if !req.api_key.trim().is_empty() {
         req.api_key.trim().to_string()
@@ -647,7 +647,7 @@ mod tests {
 
     #[test]
     fn thinking_style_manual_override_end_to_end() {
-        // A1（任务单 012）验收路径：custom 中转渠道手动指定 zai 形态 → 商汤式网关 on/off 生效
+        // A1验收路径：custom 中转渠道手动指定 zai 形态 → 商汤式网关 on/off 生效
         let _ = gateway::providers::init(
             &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("providers.json"),
         );
@@ -776,7 +776,7 @@ mod tests {
 
     #[test]
     fn capabilities_tools_gate_wires_to_params() {
-        // A3（任务单 012）：勾掉「工具调用」→ ChatParams.tools_enabled=false → 请求体无 tools
+        // A3：勾掉「工具调用」→ ChatParams.tools_enabled=false → 请求体无 tools
         let mut s = test_settings();
         let req = SettingsUpdate {
             capabilities: Some(crate::config::settings::ModelCapabilities {

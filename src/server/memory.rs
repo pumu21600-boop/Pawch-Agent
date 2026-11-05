@@ -353,4 +353,4 @@ pub(super) async fn search_memory(State(state): State<AppState>, Json(req): Json
     }))
 }
 
-// —— （任务单 016）：MCP 插件 ——
+// —— MCP 插件

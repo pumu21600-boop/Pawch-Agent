@@ -1,4 +1,4 @@
-//! 沙箱内存探针用的原生内存 hog —— 任务单 004
+//! 沙箱内存探针用的原生内存 hog
 //!
 //! 用法：sandbox_hog.exe <MB>  按 64MB 块 VirtualAlloc(MEM_COMMIT) 分配指定内存，
 //! 全部分完打印 HOG-ALLOC-OK 退出 0；中途分配失败打印 HOG-OOM-AT <已分配MB> 退出 1。

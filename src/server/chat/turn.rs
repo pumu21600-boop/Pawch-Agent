@@ -14,7 +14,7 @@ pub(crate) fn build_chat_params(
     p.top_p = c.top_p;
     p.thinking = c.thinking.clone();
     p.base_url = Some(c.effective_base_url());
-    // A3：能力标记「工具调用」闭环（任务单 012）
+    // A3：能力标记「工具调用」闭环
     p.tools_enabled = c.capabilities.tools;
     // 图片解析能力（2026-11-02 截图投递统一）：tool 结果里的截图按它决定「直接给
     // 模型看」还是「先走视觉角色转文字」——判模型能力，不判渠道/协议
@@ -27,7 +27,7 @@ pub(crate) fn build_chat_params(
 }
 
 /// 思考参数形态覆盖——中转/自定义渠道端点探测认不出时显式指定（设置面板控件）。
-/// B4 思考形态解析顺序（任务单 012 固化）：`Config.thinking_style` 显式覆盖 >
+/// B4 思考形态解析顺序（固化）：`Config.thinking_style` 显式覆盖 >
 /// 端点探测（compat.rs：官方域名→native 供应商规范 / 本地→local / 其余→openai 兜底）>
 /// providers.json 预设 `thinking_format` 兜底（预设值在 compat::resolve 内作为探测输入，
 /// 当前仅豆包 zai/混元 qwen 带值且与探测结果一致）。
@@ -58,7 +58,7 @@ pub(crate) fn split_role_value(name: &str) -> (&str, Option<&str>) {
 }
 
 /// /把配置名（或配置 id）解析成一条可用渠道。解析失败（名字不存在/地址为空）返回 None。
-/// B3 角色解析顺序（任务单 012 固化）：settings.roles.<role> > config.toml [roles] > 回落主渠道；
+/// B3 角色解析顺序（固化）：settings.roles.<role> > config.toml [roles] > 回落主渠道；
 /// 角色值按「配置名或配置 id」解析（本函数），解析失败回落主渠道并 Notice。
 ///
 /// 2026-11-01：还认「配置::模型」形式——功能桥接的下拉现在按每个渠道的多模型清单
@@ -79,7 +79,7 @@ pub(crate) fn find_channel(s: &Settings, name: &str) -> Option<gateway::Channel>
     let model = model_override.unwrap_or_else(|| c.effective_model());
     let preset = gateway::providers::find(&c.provider_id);
     let params = build_chat_params(c, preset);
-    // B2 key 回落链（任务单 012）：DPAPI key > DEEPSEEK_API_KEY 环境变量。
+    // B2 key 回落链：DPAPI key > DEEPSEEK_API_KEY 环境变量。
     // 角色/降级渠道与主渠道同一把尺子——没单独存 key 的配置靠环境变量兜底
     // （补：此前只有主渠道走这条链，budget/summary/title 渠道会「未设置 key」）
     let key = resolve_key(s, c);
@@ -353,7 +353,7 @@ pub(crate) fn assemble_turn_channels(
     } else {
         active_cfg.effective_model()
     };
-    // B2 key 回落链（任务单 012 固化）：请求显式 key > 激活配置 DPAPI key > DEEPSEEK_API_KEY 环境变量
+    // B2 key 回落链（固化）：请求显式 key > 激活配置 DPAPI key > DEEPSEEK_API_KEY 环境变量
     let api_key = if !req_api_key.is_empty() {
         req_api_key.to_string()
     } else {
@@ -443,7 +443,7 @@ pub(crate) fn assemble_turn_channels(
 /// 检查模型是否具备指定模态的输入能力：只认用户手动勾选的能力标记，
 /// 不再按模型名智能推导（聚合渠道上名字与真实能力对不上）。
 /// 此前 accept_modality 的按名推导兜底已删：专家配置解析失败时按「未勾选」处理，
-/// A5（任务单 012）：媒体附件落在 <workspace>/.attachments/，若工作区是 git 仓库且
+/// A5：媒体附件落在 <workspace>/.attachments/，若工作区是 git 仓库且
 /// .gitignore 未含该目录，自动追加一行 `.attachments/`（只追加，绝不重写用户文件），
 /// 防止用户 `git add .` 把二进制附件提交进历史。
 pub(crate) fn ensure_attachments_ignored(ws: &std::path::Path) {
