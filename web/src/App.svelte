@@ -51,6 +51,7 @@
   import ExtTab from './lib/ExtTab.svelte';
   import ScheduleTab from './lib/ScheduleTab.svelte';
   import DataTab from './lib/DataTab.svelte';
+  import TerminalPanel from './lib/TerminalPanel.svelte';
   import { fmtBytes, relTime, fmtTok, norm, configLabel, gitStatusLabel, normPath, relShort, contentText, webNormalizeUrl, riskLabelFor } from './lib/format.js';
   import { parseCssColor, parsedToHex, rgbToHex, rgbAlpha, hexWithAlpha, gradientFirstColor, rebuildGradient, resolveCssVars, findBgSource, structuralSelector, pathOf, findByPath, makeUid, ELEMENT_ALIASES, escalateCss, microCss } from './lib/dom.js';
 
@@ -826,7 +827,7 @@
     // 完全访问 = 脱沙箱本机直跑，首次切档前确认一次（记在本机 localStorage，之后不再打扰）
     if (m === 'full-access' && localStorage.getItem('fullAccessAcked') !== '1') {
       const ok = await confirmAsk(
-        '完全访问会让命令以你的完整用户权限直接运行（不再受沙箱限制，能读写整台电脑、联网）。\n\n危险操作仍会出审批卡；要连审批一起跳过，得在 config.toml 把 unsandboxed_approval 改成 false。\n\n确定切换到完全访问？'
+        '完全访问会让命令以你的完整用户权限直接运行（不再受沙箱限制，能读写整台电脑、联网）。\n\n确定切换到完全访问？'
       );
       if (!ok) return;
       localStorage.setItem('fullAccessAcked', '1');
@@ -1388,7 +1389,6 @@
   let termLines = []; // { cmd, out, ok }
   let termInput = '';
   let termRunning = false;
-  let termOutEl;
   // 右侧面板开合：**打开软件默认关着**（面板吃屏幕）——
   // 会话内刷新保持（sessionStorage 跟标签页同生命），重开软件从关着开始。
   // 旧 localStorage 键清掉：那套是"找不到内置浏览器"时期的默认开+持久化，
@@ -2428,8 +2428,6 @@
     termRunning = true;
     termLines = [...termLines, { cmd, out: '', ok: true }];
     termInput = '';
-    await tick();
-    if (termOutEl) termOutEl.scrollTop = termOutEl.scrollHeight;
     try {
       const r = await fetch('/api/shell', {
         method: 'POST',
@@ -2443,8 +2441,6 @@
       termLines = termLines.map((l, i) => (i === termLines.length - 1 ? { ...l, out: `请求失败: ${e.message || e}`, ok: false } : l));
     }
     termRunning = false;
-    await tick();
-    if (termOutEl) termOutEl.scrollTop = termOutEl.scrollHeight;
   }
 
   // 当前任务基线 = 消息流里最近一次 checkpoint
@@ -8244,49 +8240,18 @@
       </div>
     </footer>
     </div>
-    {#if terminalOpen}
-      <div class="term-panel" class:resizing={termResizing} style="height:{termH}px">
-        <div class="term-resize" title="拖拽调整高度" on:pointerdown={startTermResize}></div>
-        <div class="term-head">
-          <span class="term-title">终端</span>
-          <span class="term-hint">工作区内 · 沙箱执行</span>
-          <span class="flex-sp"></span>
-          <button class="term-clear" on:click={() => (termLines = [])}>清空</button>
-          <button class="term-close" title="关闭终端" on:click={() => (terminalOpen = false)}>×</button>
-        </div>
-        <div class="term-out" bind:this={termOutEl}>
-          {#if !termLines.length}
-            <div class="term-line dim">输入命令回车执行（如 dir、git status）。命令在你的工作区内、受限沙箱中运行。</div>
-          {/if}
-          {#each termLines as l}
-            <div class="term-block" class:err={!l.ok}>
-              <div class="term-line"><span class="term-prompt">❯</span>{l.cmd}</div>
-              {#if l.out}<pre class="term-text">{l.out}</pre>{/if}
-            </div>
-          {/each}
-          {#if termRunning}
-            <div class="term-line dim">执行中…</div>
-          {/if}
-        </div>
-        <div class="term-in">
-          <span class="term-prompt">❯</span>
-          <input
-            bind:value={termInput}
-            placeholder="输入命令，Enter 运行"
-            disabled={termRunning}
-            spellcheck="false"
-            on:keydown={(e) => {
-              if (e.isComposing || e.keyCode === 229) return;
-              if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                const cmd = termInput.trim();
-                if (cmd && !termRunning) runTerm(cmd);
-              }
-            }}
-          />
-        </div>
-      </div>
-    {/if}
+    <TerminalPanel
+      open={terminalOpen}
+      lines={termLines}
+      running={termRunning}
+      height={termH}
+      resizing={termResizing}
+      bind:value={termInput}
+      on:resizestart={(e) => startTermResize(e.detail)}
+      on:run={(e) => runTerm(e.detail)}
+      on:clear={() => (termLines = [])}
+      on:close={() => (terminalOpen = false)}
+    />
   </main>
 
   {#if rvMenu}
@@ -9374,9 +9339,6 @@
     background: color-mix(in srgb, var(--g1) 66%, transparent);
     border-color: color-mix(in srgb, var(--g3) 50%, transparent);
   }
-  :global(body.has-wallpaper) .term-panel {
-    background: color-mix(in srgb, #141210 82%, transparent);
-  }
   :global(body.has-wallpaper) .new-chat {
     background: color-mix(in srgb, var(--g1) 66%, transparent);
   }
@@ -10210,111 +10172,6 @@
     color: var(--brand-text);
     border-color: var(--g3);
     background: var(--g2);
-  }
-  /* —— 终端面板：占据对话区底部，把聊天内容顶起 —— */
-  .term-panel {
-    flex: none;
-    position: relative;
-    display: flex;
-    flex-direction: column;
-    background: #141210;
-    color: #d9d5cd;
-    border-top: 1px solid var(--g3);
-    font-family: Consolas, 'Cascadia Mono', monospace;
-    font-size: 12.5px;
-  }
-  .term-resize {
-    position: absolute;
-    top: -3px;
-    left: 0;
-    right: 0;
-    height: 7px;
-    cursor: row-resize;
-    z-index: 6;
-    touch-action: none;
-  }
-  .term-panel.resizing {
-    border-top-color: var(--g5);
-  }
-  .term-head {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 6px 12px;
-    background: rgba(255, 255, 255, 0.04);
-    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-    color: #8a8478;
-  }
-  .term-title {
-    font-weight: 650;
-    color: #d9d5cd;
-  }
-  .term-hint {
-    font-size: 11px;
-    color: #6e695f;
-  }
-  .term-clear,
-  .term-close {
-    background: transparent;
-    border: none;
-    color: #8a8478;
-    cursor: pointer;
-    font-size: 12px;
-    padding: 2px 6px;
-    border-radius: 5px;
-  }
-  .term-clear:hover,
-  .term-close:hover {
-    background: rgba(255, 255, 255, 0.08);
-    color: #f3f1ec;
-  }
-  .term-close {
-    font-size: 16px;
-    line-height: 1;
-  }
-  .term-out {
-    flex: 1;
-    min-height: 0;
-    overflow-y: auto;
-    padding: 8px 12px;
-  }
-  .term-line {
-    white-space: pre-wrap;
-    word-break: break-all;
-    color: #d9d5cd;
-  }
-  .term-line.dim {
-    color: #6e695f;
-  }
-  .term-block.err .term-text {
-    color: #ff9b9b;
-  }
-  .term-prompt {
-    color: #8fe3ae;
-    margin-right: 8px;
-  }
-  .term-text {
-    margin: 2px 0 6px;
-    padding-left: 18px;
-    white-space: pre-wrap;
-    word-break: break-all;
-    color: #b8b3a9;
-    font-family: inherit;
-  }
-  .term-in {
-    display: flex;
-    align-items: center;
-    padding: 6px 12px;
-    border-top: 1px solid rgba(255, 255, 255, 0.08);
-  }
-  .term-in input {
-    flex: 1;
-    background: transparent;
-    border: none;
-    outline: none;
-    color: #d9d5cd;
-    font-family: inherit;
-    font-size: 12.5px;
   }
   /* —— 右侧栏：产物 / 预览 —— */
   .right-panel {

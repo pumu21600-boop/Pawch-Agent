@@ -53,6 +53,11 @@ jobs:
           if (-not $line) { $line = '[sandbox-probe] UNKNOWN：报告测试未输出结论，请检查测试是否被编译/运行' }
           "## 沙箱探针`n`n``" + $line.Trim() + "```n" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
 
+      # D14：真起一个隔离实例（随机端口 + 临时数据目录 + mock 渠道），验
+      # 令牌 401/200、页面 cookie、流式回答、会话落盘、重启恢复五条契约。
+      - name: 端到端冒烟（隔离实例 + mock 渠道）
+        run: node scripts/e2e_smoke.mjs
+
   frontend:
     name: 前端（单测 + 构建）
     runs-on: windows-latest
