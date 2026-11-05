@@ -1017,39 +1017,44 @@ mod tests {
     #[tokio::test]
     async fn edit_file_unique_replace_and_failure_hints() {
         init_logger();
-        let dir = workspace_root().join(".p16-test-edit");
+        // 全局工作区会被别的用例（http_tests 切工作区）并发改掉：本条自己钉住临时根，
+        // 不用全局 workspace_root()，否则并行跑时文件会建到别人目录里（2026-11-05 实测偶发红）。
+        let root = std::env::temp_dir().join(format!("pawch-edit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).ok();
+        let dir = root.join(".p16-test-edit");
+        let cfg = ExecConfig { workspace: root.clone(), ..cfg() };
         std::fs::create_dir_all(&dir).ok();
         std::fs::write(dir.join("a.txt"), "alpha_one\nbeta_two\ngamma_three\n").ok();
 
         // 唯一替换：内容正确落盘，结果带处数与行号
-        let r = execute(&cfg(), "edit_file", r#"{"path":".p16-test-edit/a.txt","old_string":"beta_two","new_string":"BETA_TWO"}"#).await.unwrap();
+        let r = execute(&cfg, "edit_file", r#"{"path":".p16-test-edit/a.txt","old_string":"beta_two","new_string":"BETA_TWO"}"#).await.unwrap();
         assert!(r.contains("1 处替换") && r.contains("第 2 行"), "{r}");
         assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "alpha_one\nBETA_TWO\ngamma_three\n");
 
         // 未命中：拒绝并带定位提示（首行「gamma_three」在文件第 3 行）
-        let e = execute(&cfg(), "edit_file", r#"{"path":".p16-test-edit/a.txt","old_string":"gamma_three\nnope_tail","new_string":"x"}"#).await.unwrap_err();
+        let e = execute(&cfg, "edit_file", r#"{"path":".p16-test-edit/a.txt","old_string":"gamma_three\nnope_tail","new_string":"x"}"#).await.unwrap_err();
         assert!(e.contains("未命中") && e.contains("第 3 行附近"), "{e}");
 
         // 不唯一：要求加长上下文；replace_all 放行
         std::fs::write(dir.join("b.txt"), "dup\ndup\n").ok();
-        let e = execute(&cfg(), "edit_file", r#"{"path":".p16-test-edit/b.txt","old_string":"dup","new_string":"D"}"#).await.unwrap_err();
+        let e = execute(&cfg, "edit_file", r#"{"path":".p16-test-edit/b.txt","old_string":"dup","new_string":"D"}"#).await.unwrap_err();
         assert!(e.contains("不唯一") && e.contains("2 次"), "{e}");
-        let r = execute(&cfg(), "edit_file", r#"{"path":".p16-test-edit/b.txt","old_string":"dup","new_string":"D","replace_all":true}"#).await.unwrap();
+        let r = execute(&cfg, "edit_file", r#"{"path":".p16-test-edit/b.txt","old_string":"dup","new_string":"D","replace_all":true}"#).await.unwrap();
         assert!(r.contains("2 处替换"), "{r}");
         assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "D\nD\n");
 
         // 空 old_string / 新旧相同：直接拒绝（不做猜测）
-        let e = execute(&cfg(), "edit_file", r#"{"path":".p16-test-edit/a.txt","old_string":"","new_string":"x"}"#).await.unwrap_err();
+        let e = execute(&cfg, "edit_file", r#"{"path":".p16-test-edit/a.txt","old_string":"","new_string":"x"}"#).await.unwrap_err();
         assert!(e.contains("为空"), "{e}");
-        let e = execute(&cfg(), "edit_file", r#"{"path":".p16-test-edit/a.txt","old_string":"alpha","new_string":"alpha"}"#).await.unwrap_err();
+        let e = execute(&cfg, "edit_file", r#"{"path":".p16-test-edit/a.txt","old_string":"alpha","new_string":"alpha"}"#).await.unwrap_err();
         assert!(e.contains("无需修改"), "{e}");
 
         // 越界与目录：拒绝（不存在的外界路径先被「路径不存在」拦下；真实存在的外部文件走「拒绝」分支）
-        let e = execute(&cfg(), "edit_file", r#"{"path":"../outside.txt","old_string":"a","new_string":"b"}"#).await.unwrap_err();
+        let e = execute(&cfg, "edit_file", r#"{"path":"../outside.txt","old_string":"a","new_string":"b"}"#).await.unwrap_err();
         assert!(e.contains("路径不存在") || e.contains("拒绝"), "{e}");
-        let e = execute(&cfg(), "edit_file", r#"{"path":"C:\\Windows\\win.ini","old_string":"a","new_string":"b"}"#).await.unwrap_err();
+        let e = execute(&cfg, "edit_file", r#"{"path":"C:\\Windows\\win.ini","old_string":"a","new_string":"b"}"#).await.unwrap_err();
         assert!(e.contains("拒绝"), "{e}");
-        let e = execute(&cfg(), "edit_file", r#"{"path":".p16-test-edit","old_string":"a","new_string":"b"}"#).await.unwrap_err();
+        let e = execute(&cfg, "edit_file", r#"{"path":".p16-test-edit","old_string":"a","new_string":"b"}"#).await.unwrap_err();
         assert!(e.contains("目录"), "{e}");
 
         std::fs::remove_dir_all(&dir).ok();

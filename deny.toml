@@ -7,8 +7,16 @@
 version = 2
 # 被 yank 的版本要看见，但不因此让门禁红：间接依赖被 yank 会随上游自己漂移。
 yanked = "warn"
-# 豁免要写理由与到期版本；当前无豁免项。
-ignore = []
+# 豁免必须写理由；能升级就升级，不拿豁免当垃圾桶。
+ignore = [
+    # —— 维护性告警（无已知漏洞）——
+    { id = "RUSTSEC-2025-0057", reason = "fxhash 停止维护：传递依赖、无漏洞、无安全升级路径（wasmtime/cranelift 链，上游替换后自动消失）" },
+    { id = "RUSTSEC-2024-0436", reason = "paste 停止维护：传递依赖、无漏洞、无安全升级路径" },
+    # —— Linux-only 依赖：rfd → ashpd → zbus 只在 Linux 编译，Windows 版不含这段代码 ——
+    { id = "RUSTSEC-2026-0370", reason = "zvariant 公告：rfd/ashpd 的 Linux 门户路径，Windows 构建不编译" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names 公告：rfd/ashpd 的 Linux 门户路径，Windows 构建不编译" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive 公告：rfd/ashpd 的 Linux 门户路径，Windows 构建不编译" },
+]
 
 [licenses]
 version = 2
