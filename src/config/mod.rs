@@ -341,8 +341,9 @@ pub struct AgentConfig {
     #[serde(default)]
     pub allow_unsandboxed: bool,
     /// 本机直跑档下，执行类(danger 2)是否仍要审批（false=全自动）。
-    /// 默认 true：脱沙箱只放宽隔离面，不顺手把审批一起关掉；旧配置缺该字段同样按 true 处理。
-    #[serde(default = "default_true")]
+    /// 默认 false：完全访问就是全免审（2026-11-05 用户定案；审计建议的「保留审批」
+    /// 被推翻——完全访问档再弹卡与档位语义自相矛盾）。旧配置缺字段同样按 false 处理。
+    #[serde(default)]
     pub unsandboxed_approval: bool,
 }
 
@@ -496,9 +497,6 @@ fn default_tool_result_max_chars() -> usize {
 fn default_approval() -> String {
     "auto".to_string()
 }
-fn default_true() -> bool {
-    true
-}
 fn default_sandbox_timeout_ms() -> u32 {
     10_000
 }
@@ -547,7 +545,7 @@ impl Default for AgentConfig {
             tool_result_max_chars: default_tool_result_max_chars(),
             default_approval: default_approval(),
             allow_unsandboxed: false,
-            unsandboxed_approval: true,
+            unsandboxed_approval: false,
         }
     }
 }

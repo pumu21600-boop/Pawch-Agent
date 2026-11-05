@@ -23,6 +23,6 @@ Pawch Agent 是在你本机运行的桌面 Agent：服务只绑定 `127.0.0.1`�
 
 - **审批是防误操作，不防主动攻击**：审批档位与高危命令黑名单拦的是「没想清楚就动手」，脚本文件间接调用、环境变量拼接等方式仍可能绕过。不要用 Pawch Agent 处理你不信任的输入。
 - **默认沙箱不隔离网络**：`restricted` 档只隔离进程树与权限面（Job Objects + 受限 token + 环境白名单），沙箱内的命令仍可联网、可读当前用户可读的文件并外传。需要断网请用 `appcontainer` 实验档。
-- **完全访问档**：脱沙箱、以你的完整用户权限运行；默认仍对危险操作出审批卡（`[agent] unsandboxed_approval = true`），把它改成 `false` 等于放弃审批。
+- **完全访问档**：脱沙箱、以你的完整用户权限运行，**默认全免审**（`[agent] unsandboxed_approval = false`）——切到这个档就等于接受风险，只读档/自动档的审批保护不再生效；想保留执行审批把 `unsandboxed_approval` 改成 `true`。
 - **API Key**：按配置用 Windows DPAPI 加密保存在本机，日志不含明文；但本机上以你的账户运行的其他程序可调用 DPAPI 解密，这是 Windows 的信任模型，不是本项目的隔离面。
 - **第三方插件与 MCP server**：插件面板跑在 `sandbox="allow-scripts"` 的 iframe 里、只能走 postMessage 白名单桥；但 WASM 工具插件与 MCP server 是你主动启用的代码，请只启用你信任的来源。

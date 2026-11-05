@@ -389,10 +389,19 @@ mod tests {
         let a = gate("sess-a", "auto");
         assert!(a.file_tools_unconfined(), "auto 档文件工具可越出工作区");
         assert!(a.sandbox_enabled(), "auto 档 shell 仍在沙箱内");
-        // full-access 档：文件全放行 + 本机直跑
+        // full-access 档：文件全放行 + 本机直跑 + 全免审
         let f = gate("sess-f", "full-access");
         assert!(f.file_tools_unconfined());
         assert!(!f.sandbox_enabled());
+        // 2026-11-05 用户定案：完全访问=全免审，危险操作也不弹（审计建议的「保留审批」已推翻）
+        assert!(
+            !f.needs_approval_for("shell", r#"{"command":"del /f x"}"#),
+            "完全访问档不得再对危险操作弹审批"
+        );
+        assert!(
+            a.needs_approval_for("shell", r#"{"command":"del /f x"}"#),
+            "auto 档的危险操作仍要批（对照组）"
+        );
         // read-only 档：文件工具锁工作区，写/执行逐次问
         let r = gate("sess-r", "read-only");
         assert!(!r.file_tools_unconfined());
