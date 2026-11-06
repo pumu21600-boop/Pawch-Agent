@@ -148,7 +148,7 @@ pub(crate) async fn turn_system_prompt(state: &AppState, primary: &gateway::Chan
     //
     // 2026-10-05 再补一句「改名 = 改建显示名」：用户说「把工作区/项目的名字改成 X」时，模型
     // 因为没有现成入口，去 dir 桌面、翻 .agent、读应用源码找接口，白花十几步（真机
-    // 实锤）。入口本来就在 settings 工具里，这里点名，别让模型再当侦探。
+    // 实测）。入口本来就在 settings 工具里，这里点名，别让模型再当侦探。
     let extras = crate::tools::workspace_extra_roots();
     let extras_hint = if extras.is_empty() {
         String::new()
@@ -173,7 +173,7 @@ pub(crate) async fn turn_system_prompt(state: &AppState, primary: &gateway::Chan
     );
     let skills_index = crate::skills::index_prompt();
     let ui_index = crate::plugin::ui::index_prompt();
-    // 2026-10-27 身份定案（用户彻查令）：这里**不再注入任何渠道/模型/产品身份**。
+    // 2026-10-27 身份定稿（彻查）：这里**不再注入任何渠道/模型/产品身份**。
     // 真机矩阵实证：只给「用中文简洁回答」+ 19 个工具时，step 端点会随机答
     // Step/Kimi/Claude/Kiro（模型把 agent 工具集当成别家系统提示的指纹，属于
     // pattern completion，不是它的自我认知）；而 system.md 里一句「按自己的训练
@@ -291,7 +291,7 @@ pub(crate) fn strip_brief_from_first_user(messages: &mut [Value]) {
 }
 
 /// 自我管理与探索纪律（与 core/rules 的红线/闸门同一套语义）：
-/// 真机实锤过翻车——用户关着「中枢」插件让改审批档位，agent 不知道这属于自身修改、
+/// 真机实测过翻车——用户关着「中枢」插件让改审批档位，agent 不知道这属于自身修改、
 /// 更不知道审批档位根本没有它的通道，于是 dir/findstr 翻十六步撞上限被砍。这块就堵
 /// 这个：先认领请求类型，再查闸/认红线，没有合法通道就直接说，不许自己造路绕。
 fn selfop_policy(state: &AppState) -> String {

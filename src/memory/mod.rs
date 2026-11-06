@@ -1,6 +1,6 @@
 //! 记忆系统 v1 —— 总架构 §9 /
 //!
-//! 双全局根（2026-10-09 回滚 v0.32.32 搬根后定案，各管各的文件）：
+//! 双全局根（2026-10-09 回滚 v0.32.32 搬根后定稿，各管各的文件）：
 //!
 //! - 用户约定根 `~/.agent/`（按 Windows 用户，永久生效）：只有用户手写的全局约定
 //!   AGENTS.md，agent 绝不写它；
@@ -75,7 +75,7 @@ pub fn migrate_renamed_root_at(new_dir: &Path, old_dir: &Path) -> Vec<String> {
         let name = e.file_name().to_string_lossy().to_string();
         // 工作区才有的产物不搬：开发形态 workspace=安装目录时，影子仓库/截图会落在
         // <安装目录>/.agent 下——它属于那个工作区，不属于全局数据目录
-        // （2026-11-02 实锤：合并数据目录后把 1.7MB 影子仓库复制进了 ~/.pawch-agent）。
+        // （2026-11-02 实测：合并数据目录后把 1.7MB 影子仓库复制进了 ~/.pawch-agent）。
         if matches!(name.as_str(), "shadow" | "screenshots") {
             continue;
         }

@@ -154,7 +154,7 @@
   let sessionMsgs = {}; // key（会话 id 或 '@new'）→ 消息数组
   let streams = {}; // key → { asstId, controller } 正在跑的那条流
   // 服务端在跑、但本页没有流的会话（别的窗口/页面重载后）：侧栏也给转圈，
-  // 不然「原对话看着已结束，其实后台还在跑」，人就不知道该不该引导（2026-11-05 实锤）。
+  // 不然「原对话看着已结束，其实后台还在跑」，人就不知道该不该引导（2026-11-05 实测）。
   let serverRunning = {};
   // 侧栏会话行转圈的数据源：本页流 ∪ 服务端在跑列表（模板直接读这个 Set 才有依赖）
   $: runningIds = new Set([...Object.keys(streams), ...Object.keys(serverRunning)]);
@@ -421,7 +421,7 @@
     }
   }
 
-  // —— 拖拽文件进聊天区（2026-11-01 用户要「支持把文件拖拽进入 pawch」）——
+  // —— 拖拽文件进聊天区（2026-11-01：支持把文件拖拽进入 pawch）——
   // 壳里 Tauri 默认 dragDropEnabled=true，会把 Windows 的拖放在原生层吃掉，前端
   // HTML5 的 drop 永远不触发（tauri-utils 文档原话：Windows 上要用前端拖放必须关掉）
   // → desktop/tauri.conf.json 已置 false。投放区从输入框扩到整个聊天列，拖动时给提示。
@@ -693,7 +693,7 @@
     const b = ctxUsage.breakdown || { messages: 0, tools: 0, system: 0, other: 0, tools_schema: 0 };
     const sum = Math.max(1, b.messages + b.tools + b.system + b.other + (b.tools_schema || 0));
     // 构成比（各行 / 上下文总量）：回答「上下文里装的是什么」。
-    // 不要按圆环百分比分摊——窗口大时 ctxPct 舍入成 0，五行会一起变 0.0%（实锤）
+    // 不要按圆环百分比分摊——窗口大时 ctxPct 舍入成 0，五行会一起变 0.0%（实测）
     const row = (label, v, color) => ({ label, v, color, pct: ((v / sum) * 100).toFixed(1) + '%' });
     return [
       row('消息', b.messages, 'var(--tint-blue-fg)'),
@@ -1014,7 +1014,7 @@
     workspace = s.workspace || '';
     workspaceFolders = (s.workspace_folders && s.workspace_folders[workspace]) || [];
     // 工作区换了：面板插件（插件制作器的工作区下拉、项目文件树）只在 init 时读一次
-    // workspace.info，不通知就一直显示旧项目的路径和文件（2026-10-27 E2E 实锤：
+    // workspace.info，不通知就一直显示旧项目的路径和文件（2026-10-27 E2E 实测：
     // 切回原工作区后制作器下拉仍标旧项目为「当前」）。切会话有 session 事件，工作区同理。
     if (
       prevWorkspace &&
@@ -1178,7 +1178,7 @@
     return savedModels.includes(m);
   }
 
-  // 模型勾选的保存串行队列（2026-10-26 实锤「批量选择后已选还是旧的」根因）：
+  // 模型勾选的保存串行队列（2026-10-26 实测「批量选择后已选还是旧的」根因）：
   // 弹窗里每个勾选框 on:change 立即发一个 PUT（全量 models 列表），快速连点时
   // 多个 PUT 并发在途——先落地的旧响应经 applyState 把本地勾选态盖回旧值，
   // 之后的点击又按回退后的列表算全量清单，落盘的就残缺（日志实证：11 连发只剩 1 个）。
@@ -1399,7 +1399,7 @@
     abilityMenuOpen = true;
   }
   // 「/」菜单分组（用户 2026-10-02 第三/四轮）：技能=自己建的非插件技能；
-  // 插件=**全部已启用插件**（第四轮实锤「只列了那几个，全都要呀」）。
+  // 插件=**全部已启用插件**（第四轮实测「只列了那几个，全都要呀」）。
   // 点任意一行都往输入框插一个 /引用（带技能的插技能名，纯面板插件插插件标题；
   // 2026-10-02 真机实测「很多插件点了不插入输入框」后统一）——面板归右侧栏「+」菜单。
   $: ownSkills = (skillsData || []).filter((sk) => sk.source !== 'plugin' && sk.enabled !== false);
@@ -1446,7 +1446,7 @@
   // 页签列表与面板开合同一生命周期：**会话级**（sessionStorage）——刷新本页保留，重开
   // 软件从零开始（用户 2026-10-30 复述 10-10 的决定：打开侧栏不该自己冒出任何面板）。
   // 曾经存 localStorage：面板关着、页签列表却在重启后原样恢复，用户点开侧栏时
-  // 「上次开着的那个面板」就成了默认值（实锤：重启后点开侧栏直接是「用量价格」）。
+  // 「上次开着的那个面板」就成了默认值（实测：重启后点开侧栏直接是「用量价格」）。
   // 旧 localStorage 键一次性清掉，避免旧记录继续误导。
   try {
     localStorage.removeItem('rpTabs');
@@ -1904,7 +1904,7 @@
   }
   // 工具结果里的截图：browser 截图会把 `![页面截图](/api/workspace/raw?path=...)`
   // 写在结果最前面。过程块（思考+工具）收尾后默认收起，图不能留在里面——
-  // 提到气泡层面常显，用户才真的「看得到」（2026-11-05 实锤「截完一直不发给我，
+  // 提到气泡层面常显，用户才真的「看得到」（2026-11-05 实测「截完一直不发给我，
   // 一直说保存在浏览器面板」）。只认工作区图片，别的链接不放。
   function shotsFromParts(parts) {
     const out = [];
@@ -2001,7 +2001,7 @@
           body: JSON.stringify({ on: false }),
         });
         // 等服务端把 webview 挪回面板原位再切回原生视图：先切会先露出空白占位、
-        // 页面随后才出现，看起来就是闪一下（2026-11-06 用户实锤「关面板闪三下」）。
+        // 页面随后才出现，看起来就是闪一下（2026-11-06 实测「关面板闪三下」）。
         // 帧流在这几十毫秒里继续刷新，切换是无缝的。
         await new Promise((r) => setTimeout(r, 60));
       } catch (e) {
@@ -2017,7 +2017,7 @@
   function shellSuppressSync() {
     // 需要「让位」的 DOM 浮层有三类：弹窗（.modal-backdrop）、标签栏「＋」的添加菜单
     // （.rp-add-menu）、记忆库星云（.galaxy）。都能盖住网页菜单——壳里 child webview
-    // 是原生窗口、永远浮在 DOM 之上（2026-11-05 用户截图：浏览器开着时压在记忆库上层）。
+    // 是原生窗口、永远浮在 DOM 之上（2026-11-05 截图：浏览器开着时压在记忆库上层）。
     // 处理同弹窗：webview 移出屏幕保活 + 面板走帧流，浮层就能完整显示。
     const has = !!document.querySelector('.modal-backdrop, .rp-add-menu, .galaxy');
     if (has && !shellModalLive) shellModalOn();
@@ -2096,7 +2096,7 @@
   // 面板「正在展示网页」的布尔态（只用原始值，避免对象标识每 2s 轮询都变导致重复触发）。
   // 后端在面板隐藏时会作废上次矩形（防收起再弹时旧矩形闪现），所以这个态每次
   // false→true（侧边栏重开/空白页加载出来/切回网页页签）都必须重发一次矩形，
-  // 去重键先清——不然壳永远等不到矩形，网页不显示（用户实测实锤）。
+  // 去重键先清——不然壳永远等不到矩形，网页不显示（实测）。
   $: webShowing = rpTab === 'web' && rightPanelOpen && !!webActiveId && webShowShot;
   $: if (webShowing && webBodyW) {
     webViewportKey = '';
@@ -2250,7 +2250,7 @@
 
   // 帧自动刷新（screencast 内存直出，零 CDP 往返）：
   // - 壳模式弹窗态：webview 移出屏幕保活、面板改看帧流——50ms 一帧（约 20fps）跟手，
-  //   600ms 会明显「一顿一顿」（2026-11-06 用户实锤「打开设置面板动态画面就卡」）；
+  //   600ms 会明显「一顿一顿」（2026-11-06 实测「打开设置面板动态画面就卡」）；
   // - 无头兜底：面板本来就只有帧流，保持 600ms 省 CPU（不是主路径）。
   // 原生托管（壳里真页面、没有弹窗）不看帧——帧流停掉省编码开销。
   let webFrameTimer = null;
@@ -2585,7 +2585,7 @@
   }
 
   /// 产物基线：本会话消息流里的检查点 → 本会话自己的检查点（mine）。
-  /// **不再兜底「全局最新」**（2026-10-02 实锤）：别的会话的任务起点当基线，本会话
+  /// **不再兜底「全局最新」**（2026-10-02 实测）：别的会话的任务起点当基线，本会话
   /// 早于该起点的改动（如上一轮会话造的 test.pdf）全被算成「基线里已有的」——
   /// 产物面板假空。会话确实没有检查点（早于 2026-10-02 非 git 工作区修复前跑的）
   /// 就明说没有基线，别拿别人的起点充数。
@@ -2600,7 +2600,7 @@
       const q = currentSessionId ? `?session=${encodeURIComponent(currentSessionId)}` : '';
       const r = await fetch(`/api/checkpoints${q}`).then((r) => r.json());
       // 产物面板（sessionFirst）取会话**最早**的检查点=会话起点：「这个会话产出过什么」
-      // 按整条会话算。危险工具的执行前快照会把 mine 刷爆（2026-10-31 实锤：16 个全是
+      // 按整条会话算。危险工具的执行前快照会把 mine 刷爆（2026-10-31 实测：16 个全是
       // shell/edit 快照），最新一条只是最后一个任务的切片——用它当基线，会话早先的
       // 产物全部隐身（真机实测「切回产生 index.html 的会话看不到产物」）。
       if (opts.sessionFirst) {
@@ -2620,7 +2620,7 @@
   // 产物面板 = 「这个会话改到过哪些文件」：只读后端按会话记的产物账本。
   // 不再拿工作区全局 diff / 会话起点基线做差——会话活得久，别的会话后来写进
   // 同一工作区的文件会全算到它头上（2026-11-06 校园网会话里冒出便利店 index.html
-  // 与整目录截图，实锤）。旧会话没有账本时只回退到消息里明确 write_file/edit_file
+  // 与整目录截图，实测）。旧会话没有账本时只回退到消息里明确 write_file/edit_file
   // 的路径，绝不回退到全局 diff。
   async function loadArtifacts() {
     rpLoading = true;
@@ -2979,7 +2979,7 @@
     commitErr = '';
   }
   // Svelte4 坑：模板里调函数不建立函数体内变量的依赖——计数必须用 $: 派生，
-  // 直接调 commitSelCount() 的话勾选变了按钮文字不重算（真机实锤）
+  // 直接调 commitSelCount() 的话勾选变了按钮文字不重算（真机实测）
   $: commitSelN = rvSource === 'work' ? rvFiles.filter((f) => commitSel[f.path]).length : 0;
   async function doCommit() {
     if (commitBusy) return;
@@ -3207,7 +3207,7 @@
     e.preventDefault();
     // 兜底一提前：目标元素自己有语义类名（md 表格行/单元格、代码块内部行……）就永远
     // 选它自己——旧顺序是 3 层内的登记容器先抢（点表格 td 被外层 .rp-body 拿走），
-    // 报修一个登记一个永远修不完（2026-11-03 用户「估计还有其他的，我不知道原因」实锤）
+    // 报修一个登记一个永远修不完（2026-11-03 用户「估计还有其他的，我不知道原因」实测）
     const auto0 = autoClassTarget(target);
     if (auto0) {
       openMicroPanel(e.clientX, e.clientY, auto0.name, auto0.sel, auto0.el);
@@ -3279,7 +3279,7 @@
     'group-head', 'wp-pick', 'css-injector', 'micro-readonly', 'content', 'user', 'assistant',
     'boxed', 'left', 'right', 'center', 'small', 'large', 'selected', 'checked', 'risk-0', 'risk-1', 'risk-2',
     // md-* 里只有微调无意义的排除（横线/图片自己有面板兜底），其余都是合法可调目标——
-    // 上一轮全量豁免 md-*，长按行内代码 .md-code 被迫回退到 .md-p（2026-11-03 用户二轮实锤）
+    // 上一轮全量豁免 md-*，长按行内代码 .md-code 被迫回退到 .md-p（2026-11-03 用户二轮实测）
     'md-hr', 'md-img',
   ]);
   function autoClassTarget(el) {
@@ -3287,7 +3287,7 @@
     // 上两层爬上去会把「点 A 选 B」的老毛病换个姿势带回来。没类名就交给登记表/结构兜底。
     // svelte-xxxx 必须一起滤掉：它带连字符，会被「优先带连字符的类」选中，
     // 选择器就变成整个组件的作用域类（长按按钮选中 svelte-1a2xagz，调了等于没调，
-    // 2026-11-03 用户「设置里的按钮还是不行」实锤）。
+    // 2026-11-03 用户「设置里的按钮还是不行」实测）。
     // 状态类（primary/active 等）不当锚点，但保留作限定：选择器写成 .btn.primary——
     // 「同类全部」才不会把渐变底泼到 ghost/danger 兄弟身上（2026-11-04 默认改同类全部后的配套收口）
     const raw = typeof el.className === 'string' ? el.className : '';
@@ -4813,7 +4813,7 @@
       }
     } catch (e) {
       sessions = [];
-      // 启动路径失败必须可见：否则侧栏空着、看起来像历史全丢（2026-10-27 实锤）
+      // 启动路径失败必须可见：否则侧栏空着、看起来像历史全丢（2026-10-27 实测）
       if (autoPick) startupError = `[启动失败] 读取会话列表失败：${e.message || e}`;
     }
   }
@@ -5043,7 +5043,7 @@
   // 侧栏右缘拖拽调宽：按住手柄移动鼠标，松手持久化（240–720）。
   // 指针事件 + setPointerCapture：捕获后所有 pointermove/pointerup/pointercancel
   // 都路由到手柄元素——光标挪到 iframe 上、窗口外、别的元素上都不会丢事件。
-  // 早两版用 window 级 mousemove/mouseup 监听，真机（Tauri WebView2）实锤两类
+  // 早两版用 window 级 mousemove/mouseup 监听，真机（Tauri WebView2）实测两类
   // 症状：拖到某处像被卡住要来回蹭、松手后侧栏还跟着没按住的鼠标跑（mouseup 丢了）。
   // 宽度在手柄里**直接**应用：Chromium 对 mousemove/pointermove 按帧合并（规范动作），
   // 125Hz+ 鼠标也是一帧一次写入；不做 rAF 中转——rAF 在壳里可能被节流，中转一下
@@ -5124,7 +5124,7 @@
   // 当前工作区**变化**时独占展开它的分组（切项目/外部改工作区）：手风琴语义下
   // 一次只展开一个组，新工作区上线、其余工作区的对话列表一并收起。
   // 只在 workspace 真的变了时展开——早先的版本是「当前工作区不在展开集里就补上」，
-  // 用户手风琴点开别的组时会把它立刻加回来，两个组同时展开（实锤过）。
+  // 用户手风琴点开别的组时会把它立刻加回来，两个组同时展开（实测过）。
   let lastExpandedWs = workspace;
   $: if (workspace && workspace !== lastExpandedWs) {
     lastExpandedWs = workspace;
@@ -5200,7 +5200,7 @@
     }
     const pushGroup = (path, name, active, items) => {
       // 项目行也带一个转圈：正在跑的会话可能属于别的项目（侧栏只展开当前项目），
-      // 不标在项目上就完全看不见它还在跑（2026-11-05 实锤「切走就以为结束了」）
+      // 不标在项目上就完全看不见它还在跑（2026-11-05 实测「切走就以为结束了」）
       rows.push({ type: 'proj', path, name, active, count: items.length, running: items.some((s) => runningIds.has(s.id)) });
       const expanded = !!searchQ || !!expandedFlags[path];
       if (!expanded) return;
@@ -5399,7 +5399,7 @@
   // /api/sessions/open 把工作区切回去，看起来像已删工作区被复原。绝不跨工作区。
   async function settleCurrentSessionAfterListChange() {
     // 当前会话还在列表里就不动；没了才切到同工作区最近一条，没有再开新会话。
-    // 2026-10-27 实锤过跨工作区乱切：绝不拿全局列表找「下一条」。
+    // 2026-10-27 实测过跨工作区乱切：绝不拿全局列表找「下一条」。
     if (!currentSessionId) return;
     const cur = sessions.find((x) => x.id === currentSessionId);
     if (cur) return;
@@ -5563,7 +5563,7 @@
 
   // 同一轮连续 assistant 合并 / 分段规则见 lib/chat.js 的 mergeAssistantRun：
   // 流式路径一轮一个气泡，落盘一步一条 assistant；展示层合并，落盘结构不动
-  // （2026-10-30 实锤过「重启后工具调用被拆成 N 个气泡」）。规则有单测兜底。
+  // （2026-10-30 实测过「重启后工具调用被拆成 N 个气泡」）。规则有单测兜底。
 
   // 审批决定：本地乐观标记 + 通知后端（后端也会回 approval_decided，幂等）。
   // remember=true → 本会话内「同类操作」不再询问（A3）；2026-11-03 起高危档也允许记忆。
@@ -5981,7 +5981,7 @@
   // —— 服务端 → 前端 UI 事件流（2026-10-03：agent 的 ui 工具 / settings 工具推送）——
   // open_panel/close_panel：开/关侧栏面板标签（侧栏状态在前端，后端只能靠事件驱动）；
   // settings_changed：agent 改了设置，插件页/侧栏即时重拉清单——不然 agent 改完用户
-  // 看到的还是旧状态（真机实锤：agent 停用用量插件落盘成功，插件页还显示开着）。
+  // 看到的还是旧状态（真机实测：agent 停用用量插件落盘成功，插件页还显示开着）。
   function rpOpenExtByName(name) {
     if (!RP_EXT_PANELS.has(name)) return;
     const e = enabledExts.find((x) => x.name === name);
@@ -6556,7 +6556,7 @@
         if (params.roles && typeof params.roles === 'object') {
           // 白名单必须与 RolesSettings 的字段一一对应（summary/title/vision/video/audio/
           // embedding/budget/subagent）——漏一个键，插件每存一次就静默抹掉那条路由
-          // （真机验收时漏了多模态三个，用户 settings.json 里的 vision 被冲掉，实锤）。
+          // （真机验收时漏了多模态三个，用户 settings.json 里的 vision 被冲掉，实测）。
           // PUT /api/settings 对 roles 是全量替换，所以这里先把现有 roles 合进来再发。
           const allow = ['summary', 'title', 'vision', 'video', 'audio', 'embedding', 'budget', 'subagent'];
           const next = { ...roles };
@@ -6836,7 +6836,7 @@
   // 插件面板只收 RP_EXT_PANELS 三件套（时间线/项目文件/用量，旧 toolbar 视同面板并入），
   // 其余插件不再进侧栏——+ 菜单与选择页都不出（六个够了）。
   // 停用插件的标签渲染时隐藏；插件清单没到手（extList 空）时不判 ext 标签失效——
-  // 那只是「还没加载」，不是「被停用」；否则默认激活的时间线标签会被提前顶成「产物」（真机冒烟实锤）。
+  // 那只是「还没加载」，不是「被停用」；否则默认激活的时间线标签会被提前顶成「产物」（真机冒烟实测）。
   // 「网页」是宿主内置面板，但能力归「浏览器」插件管（插件开关=能力总闸，
   // 关掉浏览器 = agent 调不动 + 面板入口也没了）。同一套 extList 空载豁免也适用于它。
   $: browserOn = extList.length === 0 || enabledExts.some((e) => e.name === 'browser');
@@ -6952,7 +6952,7 @@
     extCurrent = e;
     extMsg = '';
     extOpen = true;
-    // 2026-10-25 E2E 补测实锤：从设置弹窗里点「打开」，面板开在弹窗背后、看起来像没反应
+    // 2026-10-25 E2E 补测实测：从设置弹窗里点「打开」，面板开在弹窗背后、看起来像没反应
     // （iframe 已加载只是被盖住）——面板分支和 popup 分支一样让设置弹窗让位
     settingsOpen = false;
     // 与右侧产物面板互斥，避免三个面板挤在一起
@@ -7087,7 +7087,7 @@
         return;
       }
       extMsg = `已删除插件「${e.title || e.name}」（目录 ${r.dir || ''}）`;
-      // 2026-10-25 E2E 补测实锤：删完插件它的面板标签还挂着，点开是死页——一并回收。
+      // 2026-10-25 E2E 补测实测：删完插件它的面板标签还挂着，点开是死页——一并回收。
       // 两个面：右侧 rpTab（时间线这类进侧栏的）+ 插件面板本体（extOpen 正展示着它的话）
       closeRpTab('ext:' + e.name);
       if (extCurrent && extCurrent.name === e.name) extOpen = false;
@@ -7440,7 +7440,7 @@
   {#if wallpaperKind === 'video'}
     <!-- 视频背景：静音自动循环，定位与遮罩口径同图片壁纸。
          浅色主题淡出到 1/4：壁纸图多是按深色底挑的，浅色下全强度会压碎可读性
-         （2026-11-04 浅色走查定案：浅色以可读为先，壁纸隐约透一点即可） -->
+         （2026-11-04 浅色走查定稿：浅色以可读为先，壁纸隐约透一点即可） -->
     <video class="wallpaper wallpaper-video" src={wallpaper} autoplay muted loop playsinline style="opacity:{(wallpaperOpacity / 100) * (theme === 'light' ? 0.25 : 1)}"></video>
   {:else}
     <div class="wallpaper" style="background-image:url('{wallpaper}'); opacity:{(wallpaperOpacity / 100) * (theme === 'light' ? 0.25 : 1)}"></div>
@@ -7740,7 +7740,7 @@
     <div class="chat-main">
       <div class="chat-body" bind:this={chatBody} on:scroll={onChatScroll}>
       {#if startupError}
-        <!-- 启动失败必须可见：服务未就绪时不许只留一个空对话（2026-10-27 实锤） -->
+        <!-- 启动失败必须可见：服务未就绪时不许只留一个空对话（2026-10-27 实测） -->
         <div class="msg error-row startup-error">
           <div class="error-bubble">{startupError}</div>
           <button class="btn ghost" on:click={() => location.reload()}>重试</button>
@@ -7952,7 +7952,7 @@
                           {:else if it.type === 'tool'}
                             {@const tm = toolMeta(it.name, it.args)}
                             <!-- 直接读 toolFold（Svelte 只对模板里直接引用的变量建依赖；
-                                 包进函数读不到变更——2026-10-26 真机实锤过同款坑） -->
+                                 包进函数读不到变更——2026-10-26 真机实测过同款坑） -->
                             {@const tOpen = toolFold[`${m.id}:${it.toolIndex}`] === true}
                             <div class="tool-item">
                               <button
@@ -8310,7 +8310,7 @@
                 </div>
               {/if}
               {#if abilityMenuOpen}
-                <!-- 用户 2026-10-02 第五轮实锤：①三类平铺，插件全列、不许展开；
+                <!-- 用户 2026-10-02 第五轮实测：①三类平铺，插件全列、不许展开；
                      ②引用前缀统一用「/」（技能/MCP/插件都 /，不再用 $） -->
                 <div class="bar-dropdown">
                   <div class="bar-group">技能</div>
@@ -10805,7 +10805,7 @@
     justify-content: center;
   }
   /* 帧流模式不能让滚动条参与布局：图高 = 宽 × 帧高宽比，1px 溢出就会长出滚动条，
-     宽度随即少 15px、页面整体缩一圈（2026-11-06 实锤「打开弹窗网页往里缩一点」）。 */
+     宽度随即少 15px、页面整体缩一圈（2026-11-06 实测「打开弹窗网页往里缩一点」）。 */
   .web-body.has-shot {
     overflow: hidden;
   }
@@ -11477,7 +11477,7 @@
   /* 屏幕外的消息块跳过布局与绘制——重排时只有可见的那几条参与。拖拽调宽 / 窗口
      resize / 面板开关都不再整树重排，初次加载同样受益（以前 7778 条全排）。
      「块」而不是「条」：content-visibility 的每个盒都被浏览器内部
-     IntersectionObserver 跟踪，7778 个盒 = 每帧重算交叉 18ms+（CDP trace 实锤），
+     IntersectionObserver 跟踪，7778 个盒 = 每帧重算交叉 18ms+（CDP trace 实测），
      收拢成 20 条一块后 IO 开销降一个数量级。块的估位高度由模板按块内条数内联
      （contain-intrinsic-size: auto <条数×140>px，沿用单条 140px 估位口径）。
      口径与「#each messageChunks」一致：cv-chunk 是 chat-body 直接子级 */
@@ -11598,7 +11598,7 @@
     box-sizing: border-box;
   }
   .msg.user {
-    justify-content: flex-end; /* 只去气泡，位置还在右边（用户 2026-10-02 纠正） */
+    justify-content: flex-end; /* 只去气泡，位置还在右边（2026-10-02 修正） */
   }
   /* 排队中的消息（027）：气泡里带「立即发送」按钮——并进正在跑的那一轮，引导它的回答 */
   .queued-row {
@@ -11738,7 +11738,7 @@
   }
   /* ⚠️ markdown 是 {@html} 运行时生成的，元素上没有 Svelte 作用域类：
      所有 md-* 选择器必须用 :global()，否则会被编译器当「未使用选择器」整段裁掉
-     （2026-10-30 实锤：md 样式在构建产物里一条都没有，代码块/表格一直吃浏览器默认样式）。 */
+     （2026-10-30 实测：md 样式在构建产物里一条都没有，代码块/表格一直吃浏览器默认样式）。 */
   .content > :first-child {
     margin-top: 0;
   }
@@ -12286,7 +12286,7 @@
   }
   .think-jump {
     position: absolute;
-    /* 让出 .think-text 自身滚动条的宽度（~12px），不然回到底部按钮压在滑条上（2026-10-31 实锤） */
+    /* 让出 .think-text 自身滚动条的宽度（~12px），不然回到底部按钮压在滑条上（2026-10-31 实测） */
     right: 18px;
     bottom: 12px;
     display: grid;

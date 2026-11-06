@@ -230,7 +230,7 @@ export function messageParts(m) {
 /// 同一轮连续 assistant 并成一个气泡。落盘一步一条是事实源，展示层合并。
 /// 合并规则：content/thinking 拼接、tools 依序合并、parts 依序拼接并重排 toolIndex、
 /// thinkMs 累加；workMs/stats 取收尾那条；ts/id 留第一条。
-/// 引导消息（steered 用户消息）对合并**透明**（2026-10-31 实锤：引导在会话文件里
+/// 引导消息（steered 用户消息）对合并**透明**（2026-10-31 实测：引导在会话文件里
 /// 是真 user——模型上下文需要它，落盘不动；但展示层不能让它把同一轮拆成两半）。
 /// 折叠成 {type:'steer'} part 插进两段 parts 的**边界**——标记就显示在引导发生的
 /// 位置（不该挪到轮顶）。后面没等到 assistant 的原样保留。
@@ -508,7 +508,7 @@ export function processSummary(items, workMs = 0) {
 }
 
 // —— 工具行 ——
-// 2026-11-04 用户拍板：label 直接用英文调用名（中文标签有歧义：操作界面/操作电脑、
+// 2026-11-04 定稿：label 直接用英文调用名（中文标签有歧义：操作界面/操作电脑、
 // 读取文件/读取大文件），TOOL_RULES 只负责选图标；subject 仍是对象（路径/命令/URL），
 // 原始参数 JSON 只进展开详情，不糊在行上。
 const TOOL_RULES = [

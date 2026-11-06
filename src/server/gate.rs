@@ -393,7 +393,7 @@ mod tests {
         let f = gate("sess-f", "full-access");
         assert!(f.file_tools_unconfined());
         assert!(!f.sandbox_enabled());
-        // 2026-11-05 用户定案：完全访问=全免审，危险操作也不弹（审计建议的「保留审批」已推翻）
+        // 2026-11-05 定稿：完全访问=全免审，危险操作也不弹（审计建议的「保留审批」已取消）
         assert!(
             !f.needs_approval_for("shell", r#"{"command":"del /f x"}"#),
             "完全访问档不得再对危险操作弹审批"
@@ -409,7 +409,7 @@ mod tests {
         assert!(!r.needs_approval_for("read_file", r#"{"path":"a.txt"}"#));
     }
 
-    /// 2026-10-03 并三档轮定案口径：只有「撤销检查点」任何档位必问；其余破坏操作按档位
+    /// 2026-10-03 并三档轮定稿口径：只有「撤销检查点」任何档位必问；其余破坏操作按档位
     /// 走（full-access 放行、auto 问）；普通键与只读不受影响。
     #[test]
     fn red_line_hold_scoped_to_undo_checkpoint() {

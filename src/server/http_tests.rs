@@ -286,7 +286,7 @@ async fn manual_checkpoint_endpoint_contract() {
         assert_eq!(v3["checkpoint"]["id"], v2["checkpoint"]["id"], "无变更应回指最近检查点: {v3}");
         assert!(v3["note"].as_str().map(|s| !s.is_empty()).unwrap_or(false), "无变更要给人话: {v3}");
 
-        // first = 该会话最早的检查点（产物面板基线语义，2026-10-31 实锤：危险工具快照
+        // first = 该会话最早的检查点（产物面板基线语义，2026-10-31 实测：危险工具快照
         // 会把列表刷爆，产物面板拿「最新」当基线=会话早先的产物全部隐身）
         std::fs::write(ws.join("a.txt"), "v2\n").expect("改文件");
         let (_s4, v4) = post(&app(&root), "/api/checkpoints?session=s-manual").await;

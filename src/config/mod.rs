@@ -19,7 +19,7 @@ pub mod settings_schema;
 /// 都落在 exe 同级。`cargo run` 与 `target\release\pawch-agent.exe` 直接跑时同级没有这些
 /// 目录，行为与从前（CARGO_MANIFEST_DIR）完全一致，开发流程不受影响。
 /// 2026-10-24 修：开发形态原来直接落编译期 CARGO_MANIFEST_DIR 绝对路径——仓库文件夹
-/// 一改名/挪窝（agent-copy → pawch-agent 实锤）烙的路径就死，服务起不来且无日志。
+/// 一改名/挪窝（agent-copy → pawch-agent 实测）烙的路径就死，服务起不来且无日志。
 /// 现在先按 exe 位置推仓库根（exe 在 `<repo>/target/<profile>/` 布局），推得出且像
 /// 仓库（有 config.toml）才用；测试 exe（target/debug/deps 多一层）与陌生布局仍回落
 /// 编译期目录，测试断言不变。
@@ -341,8 +341,8 @@ pub struct AgentConfig {
     #[serde(default)]
     pub allow_unsandboxed: bool,
     /// 本机直跑档下，执行类(danger 2)是否仍要审批（false=全自动）。
-    /// 默认 false：完全访问就是全免审（2026-11-05 用户定案；审计建议的「保留审批」
-    /// 被推翻——完全访问档再弹卡与档位语义自相矛盾）。旧配置缺字段同样按 false 处理。
+    /// 默认 false：完全访问就是全免审（2026-11-05 定稿；审计建议的「保留审批」
+    /// 已取消——完全访问档再弹卡与档位语义自相矛盾）。旧配置缺字段同样按 false 处理。
     #[serde(default)]
     pub unsandboxed_approval: bool,
 }
@@ -375,7 +375,7 @@ fn default_sandbox_mode() -> String {
 
 /// 钩子配置—— 用户不改源码即可在固定挂点插入自定义动作。
 /// 承载形式：本地命令（stdin 收 JSON 事件、stdout 回 JSON 决定）；空串 = 未配置。
-/// 语义四条（定案 7）：4 挂点 / before_tool 仅否决权 / 超时放行 / JSONL 审计。
+/// 语义四条（定稿 7）：4 挂点 / before_tool 仅否决权 / 超时放行 / JSONL 审计。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct HooksConfig {
     /// 工具执行前：stdout `{"decision":"deny","reason":"…"}` = 拦下并回喂模型；其余 = 放行
@@ -587,7 +587,7 @@ pub fn set_config_key_at(path: &std::path::Path, key: &str, value: &serde_json::
     let mut doc = text
         .parse::<toml_edit::DocumentMut>()
         .map_err(|e| format!("config.toml 不是合法 TOML: {e}"))?;
-    // 类型对齐（真机实锤：模型常把数字发成字符串，"0" 写进整数键会让重启时 TOML
+    // 类型对齐（真机实测：模型常把数字发成字符串，"0" 写进整数键会让重启时 TOML
     // 反序列化失败、服务起不来）——键已存在时按既有值的 TOML 类型强制转换，
     // 转不动（如把 "abc" 塞给整数键）直接报错拒绝写，不让坏类型落盘。
     let value = coerce_to_existing(&doc, key, value)?;
@@ -645,7 +645,7 @@ pub fn set_config_key_at(path: &std::path::Path, key: &str, value: &serde_json::
 }
 
 /// 按 config.toml 里既有键的 TOML 类型把新值对齐（键不存在时原样返回）。
-/// 实锤动机：模型发 `"0"` 给整数键 max_steps，写出的 `max_steps = "0"` 会让重启时
+/// 实测动机：模型发 `"0"` 给整数键 max_steps，写出的 `max_steps = "0"` 会让重启时
 /// TOML 反序列化失败、服务起不来——字符串数字/布尔在写前翻回目标标量类型，
 /// 实在对不上就报错拒写。
 fn coerce_to_existing(
@@ -685,7 +685,7 @@ fn coerce_to_existing(
                 // 2026-10-08 修：下面几类原先落 `_ => Ok(clone)` 原样落盘——
                 // ① 浮点写整数键：TOML 写成 `max_steps = 100.0`，serde 的 u32 字段
                 //    遇 visit_f64 直接 invalid type → config::load 失败 → **服务重启
-                //    起不来**，且写时零告警（str→int 有专门防护并注释「真机实锤」，
+                //    起不来**，且写时零告警（str→int 有专门防护并注释「真机实测」，
                 //    浮点/布尔/数组是同款漏洞的漏网口子）
                 // ② 布尔写数值键：同理炸启动
                 // ③ 数组元素类型不校验：一维数组里塞错类型元素，同样起不来
@@ -779,7 +779,7 @@ mod set_config_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("config.toml");
         std::fs::write(&p, "[agent]\n# 步数上限注释要保住\nmax_steps = 0\n").unwrap();
-        // 模型发字符串 "200" 给整数键 → 应对齐为整数落盘（真机实锤的坑）
+        // 模型发字符串 "200" 给整数键 → 应对齐为整数落盘（真机实测的坑）
         set_config_key_at(&p, "agent.max_steps", &serde_json::json!("200")).unwrap();
         let text = std::fs::read_to_string(&p).unwrap();
         assert!(text.contains("max_steps = 200"), "应写为整数: {text}");

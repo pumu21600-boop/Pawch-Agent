@@ -93,7 +93,7 @@ fn ask(title: &str, text: impl Into<String>) -> bool {
 }
 
 /// 文件名是 Uninstall.exe（不分大小写）→ 双击（无参数）默认进卸载模式，
-/// 否则会掉进安装模式去找 payload（2026-11-03 用户实测踩坑）。
+/// 否则会掉进安装模式去找 payload（2026-11-03 实测踩坑）。
 fn looks_like_uninstaller(exe: &Path) -> bool {
     exe.file_name()
         .map(|n| n.to_string_lossy().eq_ignore_ascii_case("uninstall.exe"))
@@ -265,7 +265,7 @@ $cancel.Add_Click({
 $r = $form.ShowDialog()
 if ($r -eq 'OK' -and $script:res1 -and $script:res2) {
     # 必须写不带 BOM 的 UTF-8：带 BOM 时第一行开头是 U+FEFF，Rust 侧会被当成
-    # 路径首字符 → create_dir_all 报 os error 123（2026-11-03 用户实测踩到）。
+    # 路径首字符 → create_dir_all 报 os error 123（2026-11-03 实测踩到）。
     $enc = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($OutFile, $script:res1 + "`n" + $script:res2, $enc)
     exit 0
@@ -496,7 +496,7 @@ fn purge(args: &Args) {
     std::thread::sleep(std::time::Duration::from_millis(1500));
     // 关键：purge 进程从 Uninstall.exe 派生，会继承"安装目录"作为工作目录；
     // Windows 不允许删除进程的当前目录（os error 32），会把目录删成空壳。
-    // 先把 cwd 挪到 %TEMP%，再删安装目录（2026-11-04 用户实测复现）。
+    // 先把 cwd 挪到 %TEMP%，再删安装目录（2026-11-04 实测复现）。
     let _ = std::env::set_current_dir(std::env::temp_dir());
     let install_dir = args
         .install_dir

@@ -191,7 +191,7 @@ export const ELEMENT_ALIASES = [
   { sel: '.md-codelang', name: '代码块语言标签' },
   { sel: '.md-copy', name: '代码块复制按钮' },
   /* markdown 表格（md.js 直出）：整表/表头单元格/数据单元格各自可选——
-     长按单元格直接选中它本身，不再被外层内容区抢走（2026-11-03 用户截图实锤） */
+     长按单元格直接选中它本身，不再被外层内容区抢走（2026-11-03 截图实测） */
   { sel: '.md-table', name: 'markdown 表格' },
   { sel: '.md-th', name: '表头单元格' },
   { sel: '.md-td', name: '表格单元格' },
@@ -346,7 +346,7 @@ export function specificityOf(sel) {
 // —— 背景来源定位（DevTools 思路，2026-11-04）：不读最终算出来的值反推，而是找到
 // 层叠胜出的那条背景声明原文——渐变/纯色/color-mix/var() 从此都是"改原文"一个套路。
 // 返回 { kind:'image'|'color', text, sel } 或 null，text 已按元素把 var() 解析成实值。
-// ⚠️ WebView2/Chromium「待替换值」坑（2026-11-04 真机实锤）：声明含 var() 时长手属性
+// ⚠️ WebView2/Chromium「待替换值」坑（2026-11-04 真机实测）：声明含 var() 时长手属性
 // 读出来是空串（camelCase 与 getPropertyValue 都一样），只有简写
 // getPropertyValue('background') 给原文——所以先试长手、空了再退简写，
 // 拿到原文解析 var 后再按内容归类（渐变/图片→image，实色→color）

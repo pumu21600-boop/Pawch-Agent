@@ -178,7 +178,7 @@ impl Ledger {
     }
 
     /// 读全部记录（坏行跳过；报表口径）。**含轮转归档 `.1`**——否则重启后
-    /// 历史花费不计，`spend_cap_usd` 硬闸被向下重置（2026-11-02 审计实锤）。
+    /// 历史花费不计，`spend_cap_usd` 硬闸被向下重置（2026-11-02 审计实测）。
     fn read_all(&self) -> Vec<UsageRecord> {
         let archive = PathBuf::from(format!("{}.1", self.path.display()));
         let mut out = Vec::new();
@@ -656,7 +656,7 @@ mod tests {
         set_cap(0.0);
     }
 
-    /// 小额上限不许显示成 $0.00（2026-10-20 实锤：上限设 0.000001 时提示
+    /// 小额上限不许显示成 $0.00（2026-10-20 实测：上限设 0.000001 时提示
     /// 「已达到上限 $0.00」，看着像算错了）。
     #[test]
     fn cap_message_keeps_small_amounts_readable() {

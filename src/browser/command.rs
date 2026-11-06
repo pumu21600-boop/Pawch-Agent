@@ -72,7 +72,7 @@ pub(crate) fn check_url(url: &str) -> Result<(), BrowserError> {
     }
     if url.starts_with("file://") {
         // 只放行**工作区内**的本地文件（preview_file 的产物）：file://+snapshot 曾被
-        // 点名是绕过 read_file 工作区禁锢读任意本地文件的路（2026-10-08 实锤），
+        // 点名是绕过 read_file 工作区禁锢读任意本地文件的路（2026-10-08 实测），
         // 工作区外的照旧拒——读文件有 read_file 的审批口径，浏览器不例外
         let ws = crate::tools::workspace_root().to_path_buf();
         if file_url_in_workspace(url, &ws).is_ok() {
@@ -726,12 +726,12 @@ pub(crate) async fn dispatch(cmd: BrowserCommand, max_chars: usize) -> Result<St
                 .map_err(|e| BrowserError::new(ErrorCode::ExecutionError, format!("截图 base64 解码失败: {e}")))?;
             *tab.frame.lock().await = Some(Frame { data: bytes.clone() });
             let st = page_state(&tab).await?;
-            // 静默截图（2026-11-05 用户要的「自检用，别打扰对话」）：图照样内联给模型，
+            // 静默截图（2026-11-05：「自检用，别打扰对话」）：图照样内联给模型，
             // 但不落盘、结果里也不写图片链接——前端只认链接，对话里就不会出现。
             let silent = silent == Some(true);
             // 「聊天界面显示图片」：截图同时落一份到工作区，
             // 返回里带 markdown 图片语法——前端工具卡默认收起，看不到结果里的字，
-            // 所以前端会把这段图片直接在对话里摊开（2026-11-05 用户实锤「截完
+            // 所以前端会把这段图片直接在对话里摊开（2026-11-05 实测「截完
             // 一直不发给我，一直说保存在浏览器面板」）。截图行必须放最前：
             // tool_result 的预览只截前 300 字，放后面会被截掉、前端就取不到图。
             let shot_line = if silent {
@@ -753,7 +753,7 @@ pub(crate) async fn dispatch(cmd: BrowserCommand, max_chars: usize) -> Result<St
             };
             // 「刷新到网页面板」只对无头模式成立：壳模式的面板是活页面（真 webview），
             // 截图帧根本不进面板——旧文案让模型对用户说「已保存在浏览器面板」，
-            // 用户却只看到实时页面（2026-11-05 实锤）。
+            // 用户却只看到实时页面（2026-11-05 实测）。
             let panel_note = if silent {
                 if inline.is_empty() {
                     // 静默图没有落盘路径兜底：不内联 = 模型什么都看不到，必须明说
@@ -935,7 +935,7 @@ pub(crate) fn exec_err(e: String) -> BrowserError {
     }
 }
 
-/// 截图落盘到工作区（2026-10-31：用户要「聊天界面显示图片」）。
+/// 截图落盘到工作区（2026-10-31：聊天界面显示图片）。
 /// 存到 `<workspace>/.agent/screenshots/` 下，返回可直接塞进 markdown 的**相对路径**
 /// （形如 `/api/workspace/raw?path=...`，前端 md() 的图片白名单认这个前缀）。
 /// 只用时间戳命名：同一秒重复截图会覆盖上一张，不堆垃圾文件。
@@ -1030,7 +1030,7 @@ async fn error_target_url(tab: &WebTab) -> Option<String> {
 }
 
 /// 本地地址判定（错误文案分流用）：127.0.0.1/localhost/[::1]/file://。
-/// 这些地址不走代理，失败也不该跑代理诊断——2026-10-31 真机实锤：agent 起的
+/// 这些地址不走代理，失败也不该跑代理诊断——2026-10-31 真机实测：agent 起的
 /// 本地端口没服务在听，报「系统代理开关关闭」把它带去查代理，白烧十几轮。
 pub(crate) fn is_local_url(url: &str) -> bool {
     let u = url.trim();
@@ -1110,7 +1110,7 @@ pub(crate) async fn chrome_error_note_wait(tab: &WebTab, max_ms: u64) -> Option<
 /// 别让模型照旧文案去 close_browser 折腾一轮。
 pub(crate) fn chrome_error_text(url: &str, diag: &ProxyDiagnosis) -> String {
     // 本地地址连不上 = 端口没服务在听，跟代理无关——别把模型带去查代理
-    //（2026-10-31 真机实锤：本地端口拒连被报成「系统代理开关关闭」，agent 白烧十几轮）
+    //（2026-10-31 真机实测：本地端口拒连被报成「系统代理开关关闭」，agent 白烧十几轮）
     if is_local_url(url) {
         return format!(
             "访问失败：本地地址（{url}）连不上——这个端口本机没有服务在监听（连接被拒），就到这一步为止。\
@@ -1130,7 +1130,7 @@ pub(crate) fn chrome_error_text(url: &str, diag: &ProxyDiagnosis) -> String {
 }
 
 /// 当前页 URL（优先 location.href——chrome 错误页的导航历史仍记原目标 URL，
-/// 只有页面自己报的 href 才是 chrome-error://，2026-09-27 实锤漏检；
+/// 只有页面自己报的 href 才是 chrome-error://，2026-09-27 实测漏检；
 /// 求值不可用时退回导航历史）。失败返回 None，不阻塞主流程。
 pub(crate) async fn current_page_url(tab: &WebTab) -> Option<String> {
     if tab.dialog.lock().await.is_none()
@@ -1153,7 +1153,7 @@ pub(crate) async fn current_page_url(tab: &WebTab) -> Option<String> {
     entries.get(idx)?.get("url")?.as_str().map(String::from)
 }
 
-/// 系统代理探测结果（chrome-error / CDP 超时的落点诊断用）。真机实锤（2026-09-27）：
+/// 系统代理探测结果（chrome-error / CDP 超时的落点诊断用）。真机实测（2026-09-27）：
 /// 代理客户端在跑但「系统代理」开关关闭时，浏览器跟随系统=直连，被墙站点必超时
 /// （curl 显式走代理却秒通）——这个组合值得点名，用户一拨开关就好。
 pub(crate) enum ProxyDiagnosis {
@@ -1161,7 +1161,7 @@ pub(crate) enum ProxyDiagnosis {
     Silent,
     /// 开关开着但仍不通：查分流规则
     EnabledButBlocked,
-    /// 实锤误配：客户端活着、开关关闭——重试无解，必须用户拨开关
+    /// 实测误配：客户端活着、开关关闭——重试无解，必须用户拨开关
     ClientAliveSwitchOff(String),
 }
 

@@ -245,7 +245,7 @@ fn now_ms() -> u64 {
 /// 取消时给还没执行的 tool_call 回填结果。
 ///
 /// 协议要求 assistant(tool_calls) 之后必须逐条跟 tool 消息；取消点在结果回填之前时
-/// 直接落盘会留下悬空 tool_calls，下一轮请求被严格端点 400（2026-11-02 审计实锤）。
+/// 直接落盘会留下悬空 tool_calls，下一轮请求被严格端点 400（2026-11-02 审计实测）。
 fn backfill_cancelled_tools(msgs: &mut Vec<Value>, calls: &[ToolCall], executed: &[bool]) {
     for (i, call) in calls.iter().enumerate() {
         if executed.get(i).copied().unwrap_or(false) {
@@ -337,7 +337,7 @@ async fn run_chain(
             notices.push(note);
         }
         used = Some((*ch).clone());
-        // 同渠道重试必须是「真的再发一次」：2026-11-01 实锤原先这里没有循环，
+        // 同渠道重试必须是「真的再发一次」：2026-11-01 实测原先这里没有循环，
         // 重试分支的 continue 直接跳到下一个渠道（单渠道=完全不重试），用户只看到
         // 一句「正在原渠道自动重试…」然后失败。现在每次尝试独立进这个循环。
         loop {
@@ -415,7 +415,7 @@ async fn run_chain(
                 }
                 Ok(ChatOutcome::Cancelled) => return (outcome, notices, used),
                 Err(e) => {
-                    // 流中断原地重试（2026-10-31 用户渠道实锤：连写大文件的长流中途被上游
+                    // 流中断原地重试（2026-10-31 渠道实测：连写大文件的长流中途被上游
                     // 掐断，降级链只有单渠道时直接失败）。读流失败/流超时是「上下文没变、
                     // 从头重发同一请求」的瞬态故障——同渠道自动重试一次：前端半截内容由
                     // StepReset 回滚（换渠道重试的现成机制），用户无感续跑。
@@ -575,7 +575,7 @@ pub async fn run_task(
     let mut downgrade_noticed = false;
     // 任务起点边界事件（trace 时间线切分用；State kind 扩展属合法「只增」）
     // session 一并记上：时间线按工作区过滤要把任务归属回聊天会话——日志顶层 session_id
-    // 是进程级日志会话（进程重启即换），跟工作区无关，归属只能靠这个字段（真机实锤过）
+    // 是进程级日志会话（进程重启即换），跟工作区无关，归属只能靠这个字段（真机实测过）
     observability::event(EventType::State, json!({ "kind": "task.start", "session": gate.session_id() }));
     // 「工作用时」的起点：从任务开始到回复落地的总时长（前端「工作中 N 分 N 秒」的数据源）
     let task_started = std::time::Instant::now();
@@ -605,7 +605,7 @@ pub async fn run_task(
     // 结束时的 diff 就只包含本任务的改动，不会把历史漂移算进来
     let baseline: Option<String> = if rec_cfg.checkpoint_enabled {
         // 用任务钉住的工作区，不是全局单例：后台任务运行期间用户切项目，
-        // 基线/结束 diff/撤销都必须跟着本任务走（2026-11-02 审计实锤）。
+        // 基线/结束 diff/撤销都必须跟着本任务走（2026-11-02 审计实测）。
         let ws = ws.clone();
         let sid = gate.session_id().to_string();
         tokio::task::spawn_blocking(move || -> Option<String> {
@@ -1110,7 +1110,7 @@ pub async fn run_task(
             if cancel.is_set() {
                 observability::event(EventType::State, json!({ "kind": "cancel", "phase": "tool", "step": step }));
                 // 协议完整性：已经落盘的 assistant(tool_calls) 必须逐条有 tool 结果，
-                // 否则这条会话下一轮会被严格校验的端点 400 掉（2026-11-02 审计实锤）。
+                // 否则这条会话下一轮会被严格校验的端点 400 掉（2026-11-02 审计实测）。
                 backfill_cancelled_tools(&mut msgs, &turn.tool_calls, &executed);
                 on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
                 emit_checkpoint_bar(baseline, gate.session_id(), &ws, task_started_wall, &on_event).await;
@@ -1127,7 +1127,7 @@ pub async fn run_task(
             // B2：Plan 档拦截优先于审批流；细粒度审批单点不变
             let plan_reason = gate.plan_block_reason_in(&ws, &call.name, &call.arguments);
             // 钩子（027）：before_tool 只有否决权——deny 则不执行且不进审批流；
-            // 钩子放行 ≠ 免审批，审批门照走（定案 7）。
+            // 钩子放行 ≠ 免审批，审批门照走（定稿 7）。
             let hook_reason = if plan_reason.is_none() {
                 crate::hooks::before_tool(gate.session_id(), &call.name, &call.arguments)
                     .await
@@ -1198,7 +1198,7 @@ pub async fn run_task(
         }
         let subagent_runner = channels.subagents.clone();
         let parent_sid = gate.session_id().to_string();
-        // 并行组也要拍检查点（2026-11-02 审计实锤：并行放开后写类全走这里，原实现
+        // 并行组也要拍检查点（2026-11-02 审计实测：并行放开后写类全走这里，原实现
         // 只在串行分支拍 → 写前影子检查点形同虚设）。串行把每个写/执行类工具的
         // 检查点拍完再并发跑，避免多个 git 检查点同时写同一影子仓库。
         if rec_cfg.checkpoint_enabled {
@@ -1492,7 +1492,7 @@ mod tests {
         assert!(!idx.contains(&4), "读不进这个集合");
     }
 
-    /// 2026-10-30 真机实锤：模型一次吐 50KB 的 write_file，输出打满 max_tokens 被切断，
+    /// 2026-10-30 真机实测：模型一次吐 50KB 的 write_file，输出打满 max_tokens 被切断，
     /// 参数是没闭合的 JSON。体检必须认出「截断」并给分块指引，而不是 serde 天书。
     #[test]
     fn tool_args_guard_detects_truncation_and_guides_chunking() {
@@ -2096,7 +2096,7 @@ mod tests {
         assert_eq!(snapshot_msgs(&plain)[0]["content"], json!("文本"));
     }
 
-    /// 2026-11-01 回归（真机实锤）：流中断后的「同渠道自动重试」必须真的再发一次。
+    /// 2026-11-01 回归（真机实测）：流中断后的「同渠道自动重试」必须真的再发一次。
     /// 旧实现在渠道 for 循环里 `continue`——等于直接跳到下一个渠道，单渠道时什么都
     /// 不重试，用户只看到一句「正在原渠道自动重试…」然后失败。
     #[tokio::test]

@@ -469,7 +469,7 @@ mod tests {
         let state = isolated_state(&dir, false);
         let sm = &state.session;
         let a = sm.new_id();
-        sm.save(&a, &[serde_json::json!({"role":"user","content":"插件删除能力要不要做？上次说等拍板"})], Some("任务目标：插件删除缺口")).unwrap();
+        sm.save(&a, &[serde_json::json!({"role":"user","content":"插件删除能力要不要做？上次说等确认"})], Some("任务目标：插件删除缺口")).unwrap();
         let b = sm.new_id();
         sm.save(&b, &[serde_json::json!({"role":"user","content":"星云背景换个紫色配色"})], None).unwrap();
 
@@ -477,7 +477,7 @@ mod tests {
         let (hits, meta) = crate::server::memory::search_hits(&state, "插件删除", 10).await;
         assert!(!hits.is_empty(), "应命中插件删除会话: {meta}");
         assert_eq!(hits[0].id, a);
-        assert_eq!(hits[0].title, "插件删除能力要不要做？上次说等拍板", "标题取首条用户消息: {:?}", hits[0]);
+        assert_eq!(hits[0].title, "插件删除能力要不要做？上次说等确认", "标题取首条用户消息: {:?}", hits[0]);
         assert!(!hits[0].workspace.is_empty(), "要能说清哪个工作区");
         assert_eq!(meta["total"], 2, "同步后索引应含两条会话");
 

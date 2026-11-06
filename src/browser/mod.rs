@@ -432,7 +432,7 @@ mod tests {
     }
 
     /// 本地地址连不上 = 端口没服务在听，文案不得提代理、不得跑代理诊断
-    /// （2026-10-31 真机实锤：本地端口拒连被报成「系统代理开关关闭」，
+    /// （2026-10-31 真机实测：本地端口拒连被报成「系统代理开关关闭」，
     /// agent 被带去查代理/起服务，白烧十几轮）。
     #[test]
     fn local_url_errors_skip_proxy_diagnosis() {
@@ -470,7 +470,7 @@ mod tests {
     }
 
     /// HTTP 错误页（4xx/5xx）与网络不通必须分开说：API 端点被浏览器 GET 打出 404 是常态，
-    /// 旧文案一律「站点连不上」还附代理诊断，把用户往「坏了」上误导（2026-10-08 实锤：
+    /// 旧文案一律「站点连不上」还附代理诊断，把用户往「坏了」上误导（2026-10-08 实测：
     /// 面板手动开 api.stepfun.com/step_plan/ 得 404，被当成网络故障）。
     #[test]
     fn http_error_page_is_not_a_network_failure() {
@@ -539,7 +539,7 @@ mod tests {
         format!("ws://127.0.0.1:{port}/devtools/page/MOCK")
     }
 
-    /// 错误页 URL 取源（2026-09-27 实锤漏检）：chrome 错误页的导航历史仍记**原目标 URL**，
+    /// 错误页 URL 取源（2026-09-27 实测漏检）：chrome 错误页的导航历史仍记**原目标 URL**，
     /// 只有页面自己报的 location.href 才是 chrome-error://——旧实现只看导航历史，
     /// `chrome_error_note` 永远探不到错误页，navigate 把错误页快照当成功（ok:true）返回。
     #[tokio::test]

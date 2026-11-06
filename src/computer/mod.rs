@@ -470,7 +470,7 @@ fn parse_region(v: &Value, vx: i32, vy: i32, w: u32, h: u32) -> Result<(i32, i32
 }
 
 /// 点击回执的取景尺寸（屏幕像素）。**2 倍放大**回给模型：开关/圆点这类小控件
-/// 在 1:1 下只有十几像素，模型量不准（2026-11-02 二次实锤：连着三次点偏 70px）。
+/// 在 1:1 下只有十几像素，模型量不准（2026-11-02 二次实测：连着三次点偏 70px）。
 /// 取景 480×270 屏幕像素 → 图上 960×540，放大后仍在 1440 内联上限以内。
 const RECEIPT_W: u32 = 480;
 const RECEIPT_H: u32 = 270;
@@ -690,7 +690,7 @@ mod real_input_tests {
         assert!(png.len() > 10_000, "截图应有实际内容（{} 字节）", png.len());
         // 5) 收拾：关窗不保存（alt+f4 → 对话框按 N）；句柄 kill 兜底。
         // 发键前先确认前台仍是我们拉起的记事本——否则 alt+f4 会打到桌面/别的窗口
-        // （桌面上无焦点窗口时 Windows 会弹「关闭 Windows」确认框，2026-10-21 实锤）。
+        // （桌面上无焦点窗口时 Windows 会弹「关闭 Windows」确认框，2026-10-21 实测）。
         let still_ours = window::foreground_title()
             .is_some_and(|t| t.contains("记事本") || t.contains("Notepad"));
         if still_ours {

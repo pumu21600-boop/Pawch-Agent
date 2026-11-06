@@ -220,7 +220,7 @@ pub(crate) async fn shell_create_target(session: &BrowserSession) -> Result<(Str
     );
     // 初始矩形：有面板同步过的矩形就用；没有（面板收起过/从未同步）建到**屏幕外**——
     // 壳的 add_child 是先可见再按 visible=false 隐藏，建在 (0,0) 或失效矩形上会闪一个
-    // 莫名窗口（用户实测实锤）；屏幕外建、保持隐藏，等真正的 rect+visible 指令再归位。
+    // 莫名窗口（实测）；屏幕外建、保持隐藏，等真正的 rect+visible 指令再归位。
     let (x, y, w, h) = session
         .last_rect
         .lock()
@@ -825,7 +825,7 @@ pub(crate) async fn sync_shell_visibility(session: &Arc<BrowserSession>, tabs: &
 /// shell 模式下一个标签页该占的矩形：**以面板最近一次上报的矩形为准**（x/y/w/h 四元
 /// 一起来自同一次 panel_viewport，天然自洽）。以前 w/h 取 tab.viewport——那是按标签页
 /// 记的，面板在别的标签页上被拖宽/拖窄后，切回来的这个标签还留着旧尺寸，webview 会先
-/// 按旧宽高闪一帧再被新矩形套进去（用户截图里的"卡位/宽窄不对"）。last_rect 没有时
+/// 按旧宽高闪一帧再被新矩形套进去（截图里的"卡位/宽窄不对"）。last_rect 没有时
 /// （从未同步过）才回落 tab.viewport，再没有用默认值。
 pub(crate) async fn shell_rect_for(session: &Arc<BrowserSession>, tab: &WebTab) -> (f64, f64, f64, f64) {
     let last = *session.last_rect.lock().unwrap_or_else(|e| e.into_inner());

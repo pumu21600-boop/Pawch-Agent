@@ -3,7 +3,7 @@
 //! 「假设一定会崩，把能恢复做成默认」：
 //! - checkpoint：把工作区文件提交进影子仓库 `<workspace>/.agent/shadow`
 //!   （独立 git dir，work-tree 指向 workspace）。git 工作区只跟踪真仓库 `git ls-files`
-//!   的文件；非 git 工作区整目录扫描兜底（2026-10-02 产物面板实锤后加），均套排除规则，
+//!   的文件；非 git 工作区整目录扫描兜底（2026-10-02 产物面板实测后加），均套排除规则，
 //!   防 IO 爆炸；失败只记日志，绝不阻断工具执行。
 //! - restore：影子仓库 `reset --hard` 回指定检查点（含删除其后新建的已跟踪文件）；
 //!   shell 副作用不可回滚，靠沙箱兜底。
@@ -160,7 +160,7 @@ fn ensure_shadow(bin: &Path, ws: &Path) -> anyhow::Result<PathBuf> {
 /// 影子仓库要跟踪的文件清单。真仓库是 git 仓库时沿用它的 ls-files（老语义：
 /// untracked 文件不属于影子仓库，restore 不动它）；工作区**不是 git 仓库**时
 /// git ls-files 无从谈起，退化为目录扫描（排除目录 + 体积上限）——产物/检查点
-/// 的真机实锤：普通文件夹（Desktop\th 这类）不是 git 仓库，检查点永远拍不出来，
+/// 的真机实测：普通文件夹（Desktop\th 这类）不是 git 仓库，检查点永远拍不出来，
 /// 「产物」面板就没有基线可看。两种来源都套同一套排除与体积规则。
 fn tracked_files(bin: &Path, ws: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let probe = git(bin, None, ws, &["rev-parse", "--is-inside-work-tree"]);
@@ -255,7 +255,7 @@ pub fn checkpoint(ws: &Path, reason: &str, session_id: &str) -> anyhow::Result<O
     let files = tracked_files(&bin, ws)?;
     if files.is_empty() {
         // 空工作区起步的会话：第一拍留一个**空树提交**当任务起点——之后产出的一切
-        // 都能以它为基线如实显示为新增（2026-10-31 实锤：测 工作区空起步，任务起点
+        // 都能以它为基线如实显示为新增（2026-10-31 实测：测 工作区空起步，任务起点
         // 被当成「无变更」跳过，产物面板只能拿半路的工具快照当基线，会话产物全部
         // 隐身）。已有提交之后的空拍维持 None（无变更不造空提交）。
         let has_head = git(&bin, Some(&gitdir), ws, &["rev-parse", "--verify", "HEAD"])
@@ -387,7 +387,7 @@ pub fn list(ws: &Path, limit: usize) -> anyhow::Result<Vec<Checkpoint>> {
 
 /// 工作区 git 概览：是否仓库、当前分支、HEAD、脏文件数、上游领先/落后、未提交文件清单。
 /// `is_repo=false` 时分两种，前端要区别说话（缺 git 时报「没检测到 git」+ 安装指引，
-/// 不是静默隐藏——2026-10-06 定案）：`git_missing=true` 是机器上没装 git（撤销/
+/// 不是静默隐藏——2026-10-06 定稿）：`git_missing=true` 是机器上没装 git（撤销/
 /// 检查点/改动/审查全都不可用），`git_missing=false` 是装了 git 但当前工作区不是仓库。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct GitStatus {
@@ -610,7 +610,7 @@ pub fn diff_text(
     let mut args = vec!["diff".to_string(), baseline.trim().to_string()];
     if let Some(p) = path {
         // 只做形态校验，**不 resolve 到磁盘**——已删除的文件（技能迁移/agent 删的）
-        // 工作树里已不存在，但 diff 照样要能出「删除」段（真机实锤：os error 3）。
+        // 工作树里已不存在，但 diff 照样要能出「删除」段（真机实测：os error 3）。
         // 禁止绝对路径/盘符/.. 穿越。
         let p = p.trim();
         if p.is_empty() || Path::new(p).is_absolute() || p.contains(':') || p.split(['/', '\\']).any(|s| s == "..") {
@@ -698,7 +698,7 @@ fn numstat_path(p: &str) -> String {
 
 /// 工作树相对基线 commit 的改动文件清单（`diff --numstat` + `--name-status` 合并）。
 /// **追加未跟踪文件**（`ls-files --others`）：任务里新建的文件不入 git diff
-/// （基线检查点之后 add 过才可见），产物面板「本任务还没有产物」的第二个实锤根因——
+/// （基线检查点之后 add 过才可见），产物面板「本任务还没有产物」的第二个实测根因——
 /// agent 造出的新文件必须原样出现在清单里。排除目录/大文件与检查点同一套规则。
 pub fn changed_files(
     ws: &Path,
@@ -1189,7 +1189,7 @@ mod tests {
 
     #[test]
     fn plain_directory_workspace_gets_checkpoints_and_artifacts() {
-        // 产物面板实锤（2026-10-02）：用户工作区 Desktop\th 不是 git 仓库，
+        // 产物面板实测（2026-10-02）：用户工作区 Desktop\th 不是 git 仓库，
         // ls-files 无从谈起 → 检查点永远拍不出来 → 产物永远空。非 git 工作区
         // 现在走目录扫描兜底；agent 新建（未跟踪）文件也必须进 changed_files。
         if !git_have() {
@@ -1473,7 +1473,7 @@ mod tests {
     }
 
     /// 空工作区起步的会话：第一拍留空树提交当任务起点；之后产出的一切相对它都是新增
-    /// （2026-10-31 实锤：测 工作区空起步，任务起点被当「无变更」跳过，产物面板只能
+    /// （2026-10-31 实测：测 工作区空起步，任务起点被当「无变更」跳过，产物面板只能
     /// 拿半路工具快照当基线，index.html 等会话产物全部隐身）。
     #[test]
     fn checkpoint_empty_start_records_baseline() {

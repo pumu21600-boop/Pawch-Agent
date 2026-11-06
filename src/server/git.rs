@@ -50,7 +50,7 @@ pub(super) async fn list_changes(
 /// 与 /api/changes 的区别：后者是**工作区全局**改动（git 面板/未提交改动用），
 /// 本接口只认「这个会话的某一轮任务真正改到过」的文件。产物面板必须走这条，
 /// 绝不能再拿全局 diff 充数——会话活得久，别的会话写的东西会全算到它头上
-/// （2026-11-06 校园网会话里冒出便利店 index.html/截图，实锤）。
+/// （2026-11-06 校园网会话里冒出便利店 index.html/截图，实测）。
 /// tracked=false 表示旧会话还没有归属记录（前端回退到消息里的 write/edit 路径）。
 pub(super) async fn list_artifacts(
     Query(params): Query<std::collections::HashMap<String, String>>,
@@ -230,7 +230,7 @@ pub(super) async fn create_checkpoint(
 /// GET /api/checkpoints[?session=<id>] —— 影子仓库检查点列表（新→旧，展示最多 20 个）。
 /// 带 session 时额外返回 `mine`（该会话自己的检查点，改动条基线取它）与 `first`
 /// （该会话**最早**的检查点=会话起点）。产物面板必须用 `first`：危险工具的执行前
-/// 快照会把检查点列表刷爆（2026-10-31 实锤：一个会话 16 个全是 shell/edit 快照，
+/// 快照会把检查点列表刷爆（2026-10-31 实测：一个会话 16 个全是 shell/edit 快照，
 /// 任务起点被挤出 20 窗口，产物面板拿「最新快照」当基线=会话早先的产物全部隐身）。
 pub(super) async fn list_checkpoints(
     State(state): State<AppState>,

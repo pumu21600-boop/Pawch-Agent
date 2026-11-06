@@ -549,7 +549,7 @@ Content-Length: 2
         assert_eq!(b2["messages"].as_array().unwrap().len(), 2);
     }
 
-    /// 拟真渠道的两种「僵住」形态（2026-10-20 实锤 bug 1/2 的靶子）：
+    /// 拟真渠道的两种「僵住」形态（2026-10-20 实测 bug 1/2 的靶子）：
     /// - `HeadersOnly`：回了响应头但一个分片都不吐（渠道静默）；
     /// - `NeverRespond`：连响应头都不回（渠道僵死）。
     ///

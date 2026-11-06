@@ -190,7 +190,7 @@ pub(crate) fn apply_patch(s: &mut Settings, p: &SettingsPatch) -> Result<Vec<Str
         changed.push("mcp_servers".into());
     }
 
-    // 4) 插件 / 技能停用名单（整表替换；校验与联动见下方各函数——真机实锤过模型
+    // 4) 插件 / 技能停用名单（整表替换；校验与联动见下方各函数——真机实测过模型
     //    写中文标题「用量」导致停了个寂寞，这里 id 为准、标题自动映射、垃圾名字报错）
     if let Some(list) = &p.disabled_plugins {
         apply_disabled_plugins(s, list)?;
@@ -284,7 +284,7 @@ pub(crate) async fn run(args: &str) -> Result<String, String> {
             crate::config::set_config_key(key, &value)
         }
         "get" => {
-            // 2026-11-01 实锤：模型发过 {"action":"get","patch":{...}} 想「读+顺手写」，
+            // 2026-11-01 实测：模型发过 {"action":"get","patch":{...}} 想「读+顺手写」，
             // get 分支根本不吃 patch → 静默什么都没改，模型却以为改成功了（用户的开关
             // 被它折腾半天还是原值）。这里直接报错指路，别让写操作静默蒸发。
             if matches!(v.get("patch"), Some(p) if !p.is_null()) {
@@ -314,7 +314,7 @@ pub(crate) async fn run(args: &str) -> Result<String, String> {
             *handle.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
             crate::server::settings::sync_runtime(&s);
             // 让打开中的界面即时跟上：插件页/侧栏重拉清单（不然 agent 改完，用户看到的
-            // 还是旧状态——真机实锤的坑）
+            // 还是旧状态——真机实测的坑）
             crate::server::ui_events::emit(json!({ "kind": "settings_changed", "keys": changed }));
             crate::observability::event(
                 crate::observability::EventType::State,
@@ -367,7 +367,7 @@ async fn config_op(v: &Value) -> Result<String, String> {
     match v.get("op").and_then(|x| x.as_str()).unwrap_or("") {
         "new" => {
             // 不抢激活位：新配置不带 key（本工具拒绝碰 key），激活了等于把全服务
-            // 打进「API key 未设置」——真机 E2E 实锤。建好放在旁边，key 请用户到设置页
+            // 打进「API key 未设置」——真机 E2E 实测。建好放在旁边，key 请用户到设置页
             // 补，补完再 active_config_id 切换（切换是红线键，会弹卡）。
             let prev_active = s.active_config_id.clone();
             let id = s.new_config();
@@ -498,7 +498,7 @@ fn key_hint_of(key: Option<String>) -> String {
 }
 
 /// 插件停用名单（整表替换）的校验与联动：
-/// - 名字以插件 id（目录名）为准；模型常拿中文标题来（实锤：「用量」），能对上标题的
+/// - 名字以插件 id（目录名）为准；模型常拿中文标题来（实测：「用量」），能对上标题的
 ///   自动映射成 id；对不上的直接报错并列出全部可用 id——宁可报错不静默落个废名单；
 /// - 启用状态发生翻转的插件若 manifest 声明了 feature（插件开关 = 功能总开关，
 ///   2026-10-02 权限放开轮的联动语义），同步写 settings.features——与 UI 的

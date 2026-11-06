@@ -6,7 +6,7 @@ use super::*;
 /// 同一时机写**会话产物账本**（`artifacts` 模块）：从基线到结束快照的改动里，
 /// 只保留 mtime 落在本轮任务时间窗内的路径。不能把「基线到当前状态」整个当产物——
 /// 会话起点可能是一天前的旧快照，期间别的会话写进来的文件会被算成这个会话的
-/// （2026-11-06 校园网会话里冒出便利店 index.html/截图，实锤）。
+/// （2026-11-06 校园网会话里冒出便利店 index.html/截图，实测）。
 pub(crate) async fn emit_checkpoint_bar(
     baseline: Option<String>,
     session_id: &str,

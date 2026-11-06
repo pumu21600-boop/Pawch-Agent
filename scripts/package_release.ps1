@@ -19,7 +19,7 @@
 #   -Slim           - leaves that zip out (smaller download). On machines with no system
 #                     git those features are unavailable and the UI says so with install
 #                     instructions (no silent degradation).
-# 2026-11-04 用户拍板:git 一律不捆绑,-Slim 行为成为唯一行为(-Slim 开关保留兼容但不再有区别)。
+# 2026-11-04 final: git is never bundled; -Slim is the only behavior (-Slim kept for compat, no difference).
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File scripts\package_release.ps1
@@ -105,7 +105,7 @@ foreach ($dir in @("prompts", "plugins", "ui-ext", "skills")) {
     elseif ($dir -eq "skills") { Warn "missing skills/ - release build will ship without built-in skills" }
 }
 
-# git 一律不捆绑（2026-11-04 用户拍板）：安装包体积减半（38MB MinGit），
+# git 一律不捆绑（2026-11-04 final）：安装包体积减半（38MB MinGit），
 # 机器上有系统 git 就照常提供检查点/撤销/变更列表；没有时 UI 明说缺什么。
 if (Test-Path (Join-Path $out "tools")) { Remove-Item (Join-Path $out "tools") -Recurse -Force }
 Info "git not bundled (user decision 2026-11-04): system git used when present"

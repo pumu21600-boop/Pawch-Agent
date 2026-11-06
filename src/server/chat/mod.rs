@@ -246,7 +246,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
     // 例外：带附件的追加暂不支持（媒体流水线在轮首一次性构建），明确拒绝而不是悄悄丢附件。
     // M2：这里的 history 在「接管」分支里会被换成会话快照 + 队列消息，故为可变绑定。
     let mut history = history;
-    // 历史的事实源是**会话文件**，不是请求里的 messages（2026-10-05 真机实锤）。
+    // 历史的事实源是**会话文件**，不是请求里的 messages（2026-10-05 真机实测）。
     // 前端只带气泡正文（role+content）：工具调用/思考/用时是挂在气泡上的界面字段，
     // 序列化时不进请求。若照单全收请求的 messages 当本轮上下文，之后每次 Snapshot
     // 落盘都按它整卷重写会话文件——每起一轮就把上一轮的工具卡/思考/用时抹掉，
@@ -453,7 +453,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
     tokio::spawn(async move {
         // 取消登记在 handler 入口已占位。守卫必须在**任务体第一行**就接管——放在
         // 任务体内部的话，之前任何一处 panic 都会带着仍然登记着的会话一起 unwind，
-        // 留下「永远在跑」的僵尸（2026-10-30 真机 panic 自检实锤）。
+        // 留下「永远在跑」的僵尸（2026-10-30 真机 panic 自检实测）。
         let initial_run = CancelRun::from_flag(cancel_registry.clone(), &guard_session, run_flag);
         run_turn_guarded(
             &guard_session,
@@ -505,7 +505,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
             send(json!({ "notice": n }));
         }
 
-        // 纯身份问题快路（2026-10-27 用户彻查令）：带 19 个工具的主循环会被
+        // 纯身份问题快路（2026-10-27 彻查）：带 19 个工具的主循环会被
         // agent 工具集带偏（真机矩阵：step 随机答 Step/Kimi/Claude/Kiro），而
         // 同一渠道的裸请求 5/5 答 Step。这里用干净上下文探测直接答，不经过工具；
         // 结果缓存 1 小时，并把自述写进后续系统提示的【自我认知】。
@@ -909,7 +909,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
             // 5) 历史投影（projectMessages）：直接替换用户消息内容，媒体字节不传给会话模型。
             // 文档附件与媒体转接共用同一份投影；注意这段必须在 forward 分支**外**——
             // 原来嵌在分支里，纯文档消息（无转接附件）的收件通知从来没进过模型上下文
-            // （2026-10-06 真机实锤：模型收不到附件路径，靠 dir 翻目录才找到文件）。
+            // （2026-10-06 真机实测：模型收不到附件路径，靠 dir 翻目录才找到文件）。
             apply_projections_to_last_user(&mut history, &projections);
         }
         // 渠道已在任务开头组装（身份快路与主循环共用），这里不再重复组装；

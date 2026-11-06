@@ -95,7 +95,7 @@ pub fn apply_outgoing_transforms(messages: &mut Value, model_id: &str, compat: &
             obj.remove("interrupted");
         }
     }
-    // 模型把 <tool_call> 协议当正文吐出来的泄漏（2026-11-01 step-5-preview 死循环实锤）：
+    // 模型把 <tool_call> 协议当正文吐出来的泄漏（2026-11-01 step-5-preview 死循环实测）：
     // 界面由 md.js 收成「原始工具调用文本」折叠块给人看，但回放给端点时必须剥掉——
     // 否则模型每轮都看见自己泄漏的协议文本，只会继续自我强化地吐。未闭合到文末的
     // 半截一并丢（泄漏的协议文本没有信息量）。落盘与界面回放保留原文不动。
@@ -247,7 +247,7 @@ mod tests {
 
     #[test]
     fn strips_toolcall_protocol_text_from_assistant_content() {
-        // 2026-11-01 step-5-preview 死循环实锤：模型把 tool_call 协议当正文吐，
+        // 2026-11-01 step-5-preview 死循环实测：模型把 tool_call 协议当正文吐，
         // 回放给端点会自我强化——发送前剥掉，落盘/界面保留原文（md.js 折叠展示）
         let mut msgs = json!([
             {"role":"assistant","content":"好的，我来查看\n<tool_call>{\"method\":\"evaluate\",\"expression\":\"x\"}</tool_call>"},

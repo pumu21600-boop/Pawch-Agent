@@ -4,7 +4,7 @@
 //! **权限一律清空**（最低权限，连 notify 都没有），工具可编译进 WASM 引擎供当前使用。
 //! 用户一键「转正」后落盘持久化、来源改 `user`。
 //!
-//! 与定案的差异（如实记录）：定案说「仅当前会话生效」；v1 的生命周期是「到重启」——
+//! 与定稿的差异（如实记录）：定稿说「仅当前会话生效」；v1 的生命周期是「到重启」——
 //! 多会话同见。会话级隔离要给清单/面板/总线全链路加 session 过滤，在还没有真实生产者
 //! （模型生成插件的工具链属 ）之前是纯成本，故先做重启粒度，语义留口。
 //!
@@ -55,7 +55,7 @@ pub(crate) fn safe_name(name: &str) -> bool {
 
 /// draft 内文件键必须是**纯相对路径**：只允许 Normal 组件，拒绝盘符/根/父级/分隔符/冒号。
 ///
-/// 2026-11-02 审计实锤：原校验只查 `..`、反斜杠和打头 `/`，`C:/Users/.../x.bat` 这种
+/// 2026-11-02 审计实测：原校验只查 `..`、反斜杠和打头 `/`，`C:/Users/.../x.bat` 这种
 /// 盘符绝对路径全部放行；`promote()` 的 `dir.join(rel)` 在 Windows 上遇到绝对路径会
 /// 整体替换基目录 → 任意文件写（且 install 判 Normal，默认档静默执行）。
 fn safe_file_key(rel: &str) -> bool {
@@ -114,7 +114,7 @@ pub fn submit(name: &str, manifest: &Value, files: &BTreeMap<String, String>) ->
         }
         bin.insert(rel.clone(), content.as_bytes().to_vec());
     }
-    // 规范化：来源强制 model_generated，权限一律清空（最低权限，定案 3/隔离边界）
+    // 规范化：来源强制 model_generated，权限一律清空（最低权限，定稿 3/隔离边界）
     let mut mf = manifest.clone();
     mf["source"] = json!(crate::plugin::contract::ORIGIN_MODEL);
     mf["permissions"] = json!([]);

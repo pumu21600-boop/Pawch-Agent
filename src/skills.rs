@@ -29,7 +29,7 @@ pub struct Skill {
 
 /// 技能根目录：(路径, 来源)。项目级在前，同名时项目覆盖全局。
 /// 「全局」= **应用数据目录**下的 `skills/`（2026-11-02 起可变数据统一进数据目录）——
-/// 2026-10-02 纠正：「应该保存到我们这个 agent 的 skill 目录，不是整个电脑的」。
+/// 2026-10-02 修正：「应该保存到我们这个 agent 的 skill 目录，不是整个电脑的」。
 /// 安装目录自己的 `skills/` 继续作为**内置**根参与扫描（随包分发的技能不复制）。
 pub fn global_skills_root() -> PathBuf {
     crate::config::data_root().join("skills")
@@ -330,7 +330,7 @@ pub fn save(name: &str, description: &str, content: &str) -> Result<String, Stri
     } else {
         format!("---\nname: {}\ndescription: {}\n---\n\n{}", name, desc, body)
     };
-    // 2026-10-02（第四轮实锤）：技能落**agent 应用目录** skills/（app_root，
+    // 2026-10-02（第四轮实测）：技能落**agent 应用目录** skills/（app_root，
     // 与 plugins/prompts 同级；「不是整个电脑的」）。项目级旧副本写完全局后顺手搬走
     // ——否则 list() 的项目级覆盖规则会让它继续顶着全局版，chip 还显示项目级。
     // 2026-10-08 修：搬是**整体并入**（连 references/scripts 资产一起），不是
@@ -391,7 +391,7 @@ fn sync_desc(full: &str, desc: &str) -> String {
     if desc.is_empty() {
         return full.to_string();
     }
-    // 修（2026-10-02 实锤 git-commit/SKILL.md 被写出两行 description）：原实现
+    // 修（2026-10-02 实测 git-commit/SKILL.md 被写出两行 description）：原实现
     // 「name 行后立即补 desc」与「原 description 行替换」会同时生效 → 重复行。
     // 改为 name 行后只记标记，**frontmatter 收尾（第二个 ---）时**若还从未写过
     // description 才补——既有则替换、缺失则补收尾，两不撞。
@@ -483,7 +483,7 @@ pub fn index_prompt() -> String {
     let dis = disabled();
     // 2026-10-03（「这些不是技能，是插件」）：技能索引只列自建技能（项目/全局）。
     // 插件自带的技能不是磁盘上的技能目录，混在这里会诱导模型去文件系统找它们的
-    // SKILL.md（真机实锤：模型 dir 翻遍用户目录空转）。它们已在
+    // SKILL.md（真机实测：模型 dir 翻遍用户目录空转）。它们已在
     // 「可用插件」一节按插件标注（自带技能：…），read_skill 照样按名读得到。
     let skills = list()
         .into_iter()
@@ -688,7 +688,7 @@ mod tests {
         assert!(!fm2.contains("old"));
         // 多行描述已在 save 前压成单行（save 侧职责），这里确认 sync 不再引入换行
         assert!(!fm2.contains("description: 新\n"));
-        // 2026-10-02 实锤回归（git-commit/SKILL.md 被写坏成两行 description）：
+        // 2026-10-02 实测回归（git-commit/SKILL.md 被写坏成两行 description）：
         // name 在前、description 在后的标准 frontmatter 保存，不许出现两行 description
         let occ = fm2.matches("description:").count();
         assert_eq!(occ, 1, "只允许一行 description: {fm2}");
@@ -704,7 +704,7 @@ mod tests {
     }
 
     /// 2026-10-03（「这些不是技能，是插件」）：技能索引只列自建技能。
-    /// 插件自带技能混进索引会诱导模型去文件系统找它们的 SKILL.md（真机实锤）。
+    /// 插件自带技能混进索引会诱导模型去文件系统找它们的 SKILL.md（真机实测）。
     #[test]
     fn index_prompt_excludes_plugin_skills() {
         let all: Vec<Skill> = list().into_iter().filter(|s| s.enabled).collect();

@@ -75,7 +75,7 @@ $dest = Join-Path $root "dist-installer\Pawch Agent Setup"
 if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
 New-Item -ItemType Directory -Path $dest -Force | Out-Null
 
-# Embed payload into setup.exe (single-file distribution, 2026-11-04 用户拍板):
+# Embed payload into setup.exe (single-file distribution, 2026-11-04 final):
 # append zip bytes + u64 LE length + "PAWCH1" trailer; the installer reads its
 # own tail. --payload <zip> and legacy side-by-side payload.zip still honored.
 $setupOut = Join-Path $dest "Pawch Agent Setup.exe"

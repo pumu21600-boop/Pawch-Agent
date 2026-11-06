@@ -523,7 +523,7 @@ fn risk_settings(args: &Value) -> (RiskLevel, String) {
         // 切换工作区：Dangerous，按档位弹卡（full-access 放行——档位即用户意愿）
         "workspace" => (RiskLevel::Dangerous, "切换工作区（改自己的文件边界）".into()),
         // 工作区别名：只改侧栏显示名，不碰目录与文件边界，可逆 → Normal 按档位走。
-        // 与 action=workspace 分开判——「改名」在用户语义里就是显示层的事（真机实锤：
+        // 与 action=workspace 分开判——「改名」在用户语义里就是显示层的事（真机实测：
         // 用户说「把工作区名改成测试」要的是侧栏那一行字，不是把目录挪走）。
         "alias" => (RiskLevel::Normal, "设置工作区别名（侧栏显示名，不动目录）".into()),
         _ => (RiskLevel::Dangerous, "settings 工具缺少合法 action".into()),
@@ -649,7 +649,7 @@ fn risk_git(cmd_args: &str, ws: &Path) -> (RiskLevel, String) {
     }
     // 未知全局选项（`--glob-pathspecs` / `--icase-pathspecs` / `--no-xxx` 等新老开关）
     // 会被 git_subcommand 当成子命令——不能落进 `_ => norm()` 静默放行，否则
-    // `git --glob-pathspecs push` 绕过「push 逐次确认」（2026-11-02 审计实锤）。
+    // `git --glob-pathspecs push` 绕过「push 逐次确认」（2026-11-02 审计实测）。
     // 判级侧不猜：认不出的选项按高危处理。
     if sub.starts_with('-') {
         return say(RiskLevel::Dangerous, "Git 全局选项无法识别，无法可靠判级");
@@ -849,7 +849,7 @@ fn risk_simple_command(cmd: &str, ws: &Path) -> (RiskLevel, String) {
     }
     let lower = trimmed.to_lowercase();
     // argv0 单独切：带引号的程序路径里可以有空格（`"C:\Program Files\...\git.exe" push`），
-    // 先按空白切会把参数切错位 → git 子命令识别失败（2026-11-02 审计实锤的绕过）。
+    // 先按空白切会把参数切错位 → git 子命令识别失败（2026-11-02 审计实测的绕过）。
     let (argv0, rest_str) = split_argv0(trimmed);
     let prog = program_name(argv0);
     let rest: Vec<&str> = rest_str.split_whitespace().collect();

@@ -75,7 +75,7 @@ fn value_tokens(v: &Value) -> u64 {
         Value::Array(a) => a.iter().map(value_tokens).sum(),
         // 2026-10-08 修：键名也要计——tool_calls 的 {"id"/"type"/"function"/"name"}
         // 这些结构键原先全漏，一次 write_file 调用少算 15-20 tokens，随步数线性
-        // 累积，把裁剪时机系统性推晚（模块注释自己实锤过同类偏差：估算 1866 vs 实际 4750）。
+        // 累积，把裁剪时机系统性推晚（模块注释自己记录过同类偏差：估算 1866 vs 实际 4750）。
         Value::Object(o) => o.iter().map(|(k, v)| estimate_tokens(k) + value_tokens(v)).sum(),
         Value::Null => 0,
         other => estimate_tokens(&other.to_string()),
@@ -242,7 +242,7 @@ pub struct CompactStats {
 /// 历史裁剪。messages[0] 视为 system 永不裁。
 /// 策略：① 归档旧工具结果（保留最近 N 个）② 仍超则按轮折叠旧消息。
 /// `tools_schema_tokens`：随每次请求发送的工具定义（渠道计入 prompt），不与消息
-/// 一起裁但占预算——不算它，裁剪时机被系统性推迟（实锤：估算 1866 vs 实际 4750）。
+/// 一起裁但占预算——不算它，裁剪时机被系统性推迟（实测：估算 1866 vs 实际 4750）。
 /// `count_reasoning`：回放型渠道（DeepSeek/zai 契约、白名单模型）思考每轮重发，
 /// 预算要看见；剥离渠道传 false。
 pub fn compact_messages(
@@ -338,7 +338,7 @@ pub fn compact_messages(
 
         // 最后一组也要能折：单轮长任务（不开新 user 消息，100+ 步工具调用）所有
         // 消息都在最后一组，原实现永远不折 → 上下文无界增长直到撑爆模型窗口
-        // （2026-11-02 审计实锤）。保留最近 KEEP_TAIL 条与最近工具结果保护起点，
+        // （2026-11-02 审计实测）。保留最近 KEEP_TAIL 条与最近工具结果保护起点，
         // 只折该组的前缀；切点不能落在 tool 消息上，避免 assistant(tool_calls)
         // 与 tool 结果被拆散。
         const KEEP_TAIL: usize = 6;
@@ -559,7 +559,7 @@ mod tests {
 
     #[test]
     fn fold_keeps_exactly_one_system_message() {
-        // 实锤回归（折叠后 system 被复制一份）：kept 曾把 0 号消息也收进去，而它又单独
+        // 实测复现（折叠后 system 被复制一份）：kept 曾把 0 号消息也收进去，而它又单独
         // 前置了一次 → 输出 [system, 占位, system, …]。后果：请求多发一份 system、
         // tokens_after/圆环重复计入、重复那份还会随快照落进会话文件。
         let mut messages = vec![json!({ "role": "system", "content": "SYS" })];

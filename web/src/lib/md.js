@@ -214,7 +214,7 @@ export function md(src) {
     if (lines.length < 2 || !/^\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/.test(lines[1])) return block;
     const cells = (l) => l.replace(/^\|/, '').replace(/\|$/, '').split('|').map((c) => c.trim());
     // td/th 发稳定类：微调拾取对无类名元素只出结构选择器（改布局就漂），有类才能
-    // 「长按单元格→选中表格单元格」直接调（2026-11-03 用户截图断网表格实锤）
+    // 「长按单元格→选中表格单元格」直接调（2026-11-03 截图断网表格实测）
     const head = cells(lines[0]).map((c) => `<th class="md-th">${c}</th>`).join('');
     const rows = lines.slice(2).filter((l) => /\|/.test(l))
       .map((l) => `<tr>${cells(l).map((c) => `<td class="md-td">${c}</td>`).join('')}</tr>`).join('');

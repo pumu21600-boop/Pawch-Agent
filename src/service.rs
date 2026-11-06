@@ -116,7 +116,7 @@ fn parse_process_paths(text: &str, me: u32) -> Vec<(u32, String)> {
 
 /// 与自己同目录的服务进程（stop 专用）。
 ///
-/// 2026-11-03 实锤修复：原来 `pawch-agent.exe stop` 按镜像名全局杀——开发仓库
+/// 2026-11-03 实测修复：原来 `pawch-agent.exe stop` 按镜像名全局杀——开发仓库
 /// target/release 里的测试/自测一旦 stop，把用户正式安装（如 D:\Pawch Agent）的
 /// 服务连带杀掉（凌晨迁移自测事故的放大器）。现在只杀 exe 路径同目录的进程；
 /// CIM 查询失败或路径全空时回退镜像名行为（停不干净比误杀可取）。
@@ -598,7 +598,7 @@ mod tests {
         assert!(handle(&argv, "127.0.0.1", 1), "status 应接管并立刻返回");
     }
 
-    /// stop 只杀同目录：CIM 输出解析 + 目录过滤（2026-11-03 全局杀误伤实锤的回归测试）。
+    /// stop 只杀同目录：CIM 输出解析 + 目录过滤（2026-11-03 全局杀误伤实测的回归测试）。
     #[test]
     fn parse_process_paths_and_same_dir_filter() {
         let text = "101|C:\\App\\pawch-agent.exe\n102|C:\\App\\pawch-agent.exe\n103|D:\\Pawch Agent\\pawch-agent.exe\n104|\nbadline\n";

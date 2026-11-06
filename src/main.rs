@@ -34,7 +34,7 @@ use std::{
     sync::Arc,
 };
 
-/// 进程级 DPI 感知（2026-11-01 实锤 bug）：服务没声明 DPI 感知时，GetSystemMetrics 返回
+/// 进程级 DPI 感知（2026-11-01 实测 bug）：服务没声明 DPI 感知时，GetSystemMetrics 返回
 /// 的是**虚拟化尺寸**（2560×1440 的屏在 150% 缩放下只报 1707×960），而 GDI 的 BitBlt 拷贝
 /// 的是**物理像素**——截图于是只截到屏幕左上角那一块（真机实测：右侧内置浏览器只露一条）。
 /// 鼠标坐标同理会被当成逻辑坐标处处偏移。设成 Per-Monitor V2 后两边统一为物理像素。
@@ -195,7 +195,7 @@ async fn main() -> anyhow::Result<()> {
     // 025：运行中追加消息队列（同会话再发消息 → 并入当前这一轮，不拒收）
     let steer = Arc::new(core::steer::SteerQueue::new());
     // 系统约定：用户编辑版落数据目录（安装目录可能只读）；读不到就用安装目录的
-    // 内置默认，保存时写数据目录（2026-11-02 数据目录定案配套）。
+    // 内置默认，保存时写数据目录（2026-11-02 数据目录定稿配套）。
     let builtin_prompt_path = manifest.join("prompts").join("system.md");
     let prompt_path = data_root.join("prompts").join("system.md");
     let system_prompt = std::fs::read_to_string(&prompt_path)

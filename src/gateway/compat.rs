@@ -385,7 +385,7 @@ mod tests {
     #[test]
     fn provider_preset_beats_url_domain() {
         // 供应商预设 = 思考参数方言的选择器，URL 域名不抢权重。
-        // 实锤场景：stepfun 预设 + dashscope URL（换预设不动 base_url）原被判成
+        // 实测场景：stepfun 预设 + dashscope URL（换预设不动 base_url）原被判成
         // qwen 形态 → 档位消失；现在预设说了算 → openai 形态（低/中/高）
         let c = resolve(Some("stepfun"), Some("https://dashscope.aliyuncs.com/compatible-mode/v1"), "deepseek-v4.1-flash-1017", None);
         assert_eq!(c.thinking_format, ThinkingFormat::Openai, "stepfun 预设不因 aliyuncs 域名判成 qwen");

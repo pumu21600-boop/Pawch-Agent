@@ -29,7 +29,7 @@ pub struct TaskTrace {
     /// 任务归属的**聊天会话** id：优先 task.start 的 `session`（新日志），
     /// 回落任务内第一条 `session.saved` 的 `session`（旧日志）。空 = 推不出归属。
     /// 注意日志顶层 `session_id` 是**进程级**日志会话（进程重启即换），与工作区无关——
-    /// 归属必须走这里，别再拿顶层字段（真机实锤过：按顶层过滤 = 时间线全空）。
+    /// 归属必须走这里，别再拿顶层字段（真机实测过：按顶层过滤 = 时间线全空）。
     pub session: String,
     /// 起点事件缺失（task.start 被日志轮转吃掉），本任务的开头是**近似**的：
     /// start_ts 是兜底边界那条事件的时刻，不是任务真正的开始。时间线据此提示用户。
@@ -60,7 +60,7 @@ pub fn read_tasks_scoped(
 }
 
 /// 多文件版本：日志会按体积轮转成 `<file>.1`（最新）… `<file>.N`（最旧），
-/// **task.start 落在被轮转走的归档里、工具事件落在当前文件里**是真机实锤的常态
+/// **task.start 落在被轮转走的归档里、工具事件落在当前文件里**是真机实测的常态
 /// （20MB 上限，一轮长对话就能跨文件）。单文件读法会把跨文件任务撕成
 /// 「归档里一个完整任务 + 当前文件里一群没头没尾的孤儿事件（全部丢弃）」，
 /// 时间线看起来就是「怎么都刷不出来」。调用方按**时间正序**（最旧文件在前）
@@ -130,7 +130,7 @@ where
                 .to_string();
             // 降级任务的收尾（2026-11-01 改）：原先用 session.saved 当轮边界，可它
             // **每一步工具调用后都会落一条**（真机实测：一个任务里连续七条），于是一个
-            // 起点被轮转吃掉的回合被切成七八个「起点缺失」碎片（用户截图实锤）。
+            // 起点被轮转吃掉的回合被切成七八个「起点缺失」碎片（截图实测）。
             // 现在只认真轮边界 loop.finish / cancel（上面 is_task_end，带 session 归属
             // 核对）——旧日志没有 loop.finish 时，孤儿活动会并成一个降级任务，比一堆
             // 碎片诚实得多。
@@ -273,7 +273,7 @@ mod tests {
     #[test]
     fn scoped_read_keeps_only_allowed_sessions() {
         // 任务归属走 payload.session（task.start 新字段 / 任务内 session.saved 旧日志）；
-        // 顶层 session_id（进程级日志会话）不参与过滤——按它过滤 = 时间线全空（真机实锤）
+        // 顶层 session_id（进程级日志会话）不参与过滤——按它过滤 = 时间线全空（真机实测）
         let lines = vec![
             rec_s("2026-09-04T00:00:00Z", "state", serde_json::json!({"kind":"task.start","session":"sa"}), "proc-1"),
             rec_s("2026-09-04T00:00:01Z", "thought", serde_json::json!({"text":"a"}), "proc-1"),
@@ -347,7 +347,7 @@ mod tests {
 
     #[test]
     fn task_spanning_rotated_files_stays_whole() {
-        // 真机实锤（2026-10-02）：task.start 写进归档 <file>.1，工具事件写在当前文件——
+        // 真机实测（2026-10-02）：task.start 写进归档 <file>.1，工具事件写在当前文件——
         // 只读当前文件时这些事件成了孤儿被丢弃，时间线「怎么都刷不出来」。
         let (_g, old) = write_tmp(
             "span-old",

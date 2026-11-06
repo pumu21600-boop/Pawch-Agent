@@ -8,7 +8,7 @@
 //! 为什么走 PowerShell 而不是直接 COM：windows-sys 只给 IUIAutomation 的
 //! `*mut c_void` 别名、没有 vtable——手搓 vtable 错一个槽位就是崩进程。
 //! 改用 .NET 自带的 UIAutomationClient：脚本纯 ASCII（PS 5.1 按 OEM 代码页读
-//! 无 BOM 文件，写中文会把注释吞掉，2026-11-01 实锤），中文靠 -EncodedCommand
+//! 无 BOM 文件，写中文会把注释吞掉，2026-11-01 实测），中文靠 -EncodedCommand
 //! （UTF-16LE base64）传进去，结果落 UTF-8 文件再读，绕开控制台代码页。
 
 use std::path::Path;

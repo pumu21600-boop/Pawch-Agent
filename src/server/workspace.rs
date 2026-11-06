@@ -625,7 +625,7 @@ pub(super) async fn pick_workspace() -> (StatusCode, Json<Value>) {
 
 /// POST /api/workspace/remove —— 从侧边栏项目列表移除，并把这个工作区名下的会话一起删掉。
 /// 目录本身不动（移除项目 ≠ 删文件夹）。会话必须跟着走：只移出列表的话，会话文件还在，
-/// 侧栏会掉进「未分组」堆着一堆孤儿对话，看着像删了个寂寞（2026-11-05 用户口径：
+/// 侧栏会掉进「未分组」堆着一堆孤儿对话，看着像删了个寂寞（2026-11-05 口径：
 /// 删工作区，那些会话就应该彻底消失）。
 pub(super) async fn remove_workspace(
     State(state): State<AppState>,
@@ -696,7 +696,7 @@ pub(crate) fn set_workspace_alias(state: &AppState, path: &str, name: &str) -> R
     crate::plugin::wasm::set_disabled(&s.disabled_plugins);
     crate::mcp::sync_configs(&s.mcp_servers); // MCP 配置变更即同步管理器（幂等）
     // 开着的界面即时跟上：侧栏项目名读 settings.workspace_aliases，不推这条事件，
-    // agent/命令行改完落盘成功、界面还叫旧名，用户只能重启才看见（2026-10-05 真机实锤）。
+    // agent/命令行改完落盘成功、界面还叫旧名，用户只能重启才看见（2026-10-05 真机实测）。
     crate::server::ui_events::emit(json!({ "kind": "settings_changed", "keys": ["workspace_aliases"] }));
     observability::event(
         EventType::State,
@@ -745,7 +745,7 @@ mod tests {
     }
 
     /// 别名键必须规范化：模型/接口随手写的正斜杠、大小写、尾分隔符都得落到同一条键上，
-    /// 否则「改了却不显示」（侧栏按 settings 里的规范化字符串精确匹配）——真机实锤过。
+    /// 否则「改了却不显示」（侧栏按 settings 里的规范化字符串精确匹配）——真机实测过。
     #[test]
     fn alias_path_variants_land_on_one_key() {
         let d = tmp("variants");

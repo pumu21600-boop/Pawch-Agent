@@ -59,7 +59,7 @@
     clearTimeout(schedReloadTimer);
   });
   let schedCronPending = false;
-  // 三档（2026-10-05 真机实测纠正：sandbox 档 10-03 就取消了，这里一直挂着四档旧表；
+  // 三档（2026-10-05 真机实测：sandbox 档 10-03 就取消了，这里一直挂着四档旧表；
   // 与输入框上方的全局档位菜单同一套口径，跟随全局语义）
   const SCHED_MODES = [
     { value: 'read-only', label: '只读（写/执行逐次询问）' },
@@ -84,7 +84,7 @@
   }
   // 2026-10-08 修：options={fn()} 在模板里不建依赖（Svelte4 只跟踪表达式直接引用
   // 的变量，函数体里读的 schedConfigs/workspace/recentWorkspaces 换了不重算）——
-  // 真机实锤：列表还在加载时开编辑器，供应商下拉永远只有「跟随当前激活配置」一项。
+  // 真机实测：列表还在加载时开编辑器，供应商下拉永远只有「跟随当前激活配置」一项。
   // 改走响应式声明：$: 语句跟踪函数体依赖，源数据一换选项就重算。
   $: configOpts = configOptions();
   $: wsOpts = wsOptions();
@@ -96,7 +96,7 @@
     return opts;
   }
   // configId 由模板直接传参：Svelte4 只跟踪表达式里直接引用的变量，包进函数体
-  // 读 schedEditor.config_id 不建依赖（toolFold 同款坑，真机实锤过），选供应商时
+  // 读 schedEditor.config_id 不建依赖（toolFold 同款坑，真机实测过），选供应商时
   // 模型下拉不会重算——2026-10-05 真机实测「选了 bai 要出 bai 的三个模型」。
   function modelOptions(configId) {
     const cfg = schedConfigs.find((c) => c.id === (configId || ''));

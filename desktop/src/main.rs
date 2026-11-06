@@ -280,7 +280,7 @@ fn slog(msg: &str) {
 }
 
 /// tauri/wry 内部错误（如 CreateWebview 失败）默认走 log::error! 且无 logger=直接蒸发；
-/// 接进 slog（2026-10-24 排查 child webview 静默失败时实锤：add_child 的 Ok 只代表
+/// 接进 slog（2026-10-24 排查 child webview 静默失败时实测：add_child 的 Ok 只代表
 /// 「已投递」，真失败在事件循环里只 log 一声，不装 logger 永远看不见）。
 struct SlogLogger;
 impl log::Log for SlogLogger {
@@ -785,7 +785,7 @@ fn main() {
     std::env::set_var("PAWCH_AGENT_DATA_DIR", &data_dir);
 
     // tauri/wry 内部错误接进 slog（事件循环里 CreateWebview 失败只 log::error!，无 logger 会蒸发
-    // ——2026-10-24 内置浏览器 P0 排查实锤了这个盲区，错误码从此有尸检材料）
+    // ——2026-10-24 内置浏览器 P0 排查确认了这个盲区，错误码从此有尸检材料）
     install_logger();
     // 单实例：两个壳会抢 9223，第二个直接退出（listener 需保活）
     let _guard = instance_guard();

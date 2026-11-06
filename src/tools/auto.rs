@@ -264,7 +264,7 @@ pub(crate) async fn run(args: &str) -> Result<String, String> {
             let css = v.get("css").and_then(|x| x.as_str()).unwrap_or("");
             let append = v.get("append").and_then(|x| x.as_bool()).unwrap_or(false);
             let clear = v.get("clear").and_then(|x| x.as_bool()).unwrap_or(false);
-            // 空 css 一律拒（真机实锤：模型只传 method 不传 css，工具不能把「什么都没说」
+            // 空 css 一律拒（真机实测：模型只传 method 不传 css，工具不能把「什么都没说」
             // 当覆盖成功照单全收——那是又一种假完成）。要清空走显式 clear=true。
             if !clear && css.trim().is_empty() {
                 return Err("缺少 css（要注入的 CSS 内容；要清空手写规则请显式传 clear=true）".into());

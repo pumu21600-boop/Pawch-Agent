@@ -243,7 +243,7 @@
 
     /// 外部改动重载与启动 load 必须走**同一把尺子**：同一份 JSON，两边解析出的状态
     /// 逐字节相同。否则「重启后是一种状态、热加载后是另一种」，比不热加载更难查
-    /// （2026-10-05 真机实锤：agent 直接改 settings.json，界面不刷新）。
+    /// （2026-10-05 真机实测：agent 直接改 settings.json，界面不刷新）。
     #[test]
     fn settings_from_text_matches_load_migration_semantics() {
         // 老版形态：无 configs 数组，全靠顶层字段 + 旧字段名（2026-10-08：旧信任键

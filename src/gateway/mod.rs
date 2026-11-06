@@ -299,7 +299,7 @@ fn is_loopback_base_url(base_url: &str) -> bool {
     it.next() == Some("127") && it.clone().count() == 3 && it.all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// 网络错误的完整因果链（2026-11-01 实锤修）：reqwest 0.12 的 Display 即使带 `{:#}`
+/// 网络错误的完整因果链（2026-11-01 实测修）：reqwest 0.12 的 Display 即使带 `{:#}`
 /// 也只打「error decoding response body」这类泛化文案（源码 error.rs 里 Display 从不
 /// 打印 source，只补一个 url），底层真正原因——连接被重置 / 提前 EOF / HTTP2 流错误——
 /// 只能沿 `source()` 手动往下走。长流中断的排查全靠这一行，别改回 `{e:#}`。
@@ -1330,7 +1330,7 @@ impl Gateway {
                 }
                 // 200 流里夹带的错误（中转/队列服务的 finish_reason=error + error 对象）：
                 // 旧逻辑当普通分片吞掉，最终空回答、界面转圈后没动静。这里直接上抛，
-                // 由 server 层落成 [错误] 气泡，用户能看到真实原因（2026-10-27 真机实锤）。
+                // 由 server 层落成 [错误] 气泡，用户能看到真实原因（2026-10-27 真机实测）。
                 if let Some(msg) = openai::sse_error_message(&chunk) {
                     record_usage(
                         ctx,

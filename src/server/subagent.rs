@@ -420,7 +420,7 @@ impl SubagentDispatcher {
             Dispatch { parent: parent.to_string(), child: child.clone(), registry: self.state.cancel.clone() },
         );
 
-        // 模型解析（草案第 5 节 + 2026-10-25 定案）：派发级 model 覆盖 >
+        // 模型解析（草案第 5 节 + 2026-10-25 定稿）：派发级 model 覆盖 >
         // subagent_mode 三档（parent=父任务当前轮的三元组，空则激活配置兜底；
         // custom=roles.subagent 席位 B3 链；ask 已在前面的闸口引导重派，走到这里
         // 必然带显式 model）
@@ -614,7 +614,7 @@ mod tests {
     use super::*;
 
     /// 沾共享静态（running/history/tokens/depth 都是进程级）的测试全部串行——
-    /// 并行会互相清场/插队，断言时灵时不灵（本轮实锤：容量测试被并行测试的
+    /// 并行会互相清场/插队，断言时灵时不灵（本轮实测：容量测试被并行测试的
     /// clear() 打出一个偏差）。范式同 plugin::REGISTRY_TEST_LOCK。
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn lock() -> std::sync::MutexGuard<'static, ()> {
