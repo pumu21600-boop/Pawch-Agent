@@ -1,6 +1,6 @@
 [package]
 name = "pawch-agent"
-version = "0.32.44"
+version = "1.1.1"
 edition = "2024"
 license = "MIT"
 description = "Pawch Agent —— 跑在 Windows 上的自主办事 Agent（Rust + Svelte，本地优先，SSE 流式）"

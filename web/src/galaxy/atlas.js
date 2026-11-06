@@ -35,88 +35,133 @@ export function mulberry32(a) {
   };
 }
 
-/** 小星座用「2~3 个局部星群 + 抖动」散开（再交给 MST 连线，自然分叉）；
- *  大星座改用等密度星云盘。早先是单条随机游走链，MST 只会顺着链连，
- *  整团看起来就是一根折线（2026-11-05 用户实感「全是一条一条的线」）。 */
+/** 均匀最佳候选采样 + 最小间距松弛：每颗星试 14 个候选、挑离已有点最远的一个，
+ *  再跑几轮斥力把贴脸的点推开——稀疏时不秃、多会话时不成糊团。 */
 function clusterPoints(count, span, seed) {
   const rnd = mulberry32(seed);
   if (count <= 1) return [{ x: 0, y: 0 }];
+  const rx = span * 0.5;
+  const ry = span * 0.5 * 0.85;
   const pts = [];
-  if (count > 28) {
-    for (let i = 0; i < count; i++) {
-      const t = (i + 0.5) / count;
-      const r = (span / 2) * Math.sqrt(t) * (0.72 + rnd() * 0.36);
-      const a = i * 2.399963229728653 + (rnd() - 0.5) * 0.6;
-      pts.push({ x: Math.cos(a) * r, y: Math.sin(a) * r * 0.82 });
-    }
-    return pts;
-  }
-  // 2~3 个局部星群：每群至少一颗，其余随机落群；群内再抖开。
-  // 锚点半径压小、群内半径放大 → 群与群之间的「桥线」短，团内更像一簇星，
-  // 不会出现一根长直线横穿半个星座。
-  const groups = count <= 3 ? 1 : count <= 9 ? 2 + (rnd() < 0.4 ? 1 : 0) : 3;
-  const anchors = [];
-  for (let g = 0; g < groups; g++) {
-    const a = (g / groups) * TAU + (rnd() - 0.5) * 0.9;
-    const rr = span * (0.13 + rnd() * 0.07);
-    anchors.push({ x: Math.cos(a) * rr, y: Math.sin(a) * rr * 0.8 });
-  }
   for (let i = 0; i < count; i++) {
-    const g = i < groups ? i : Math.floor(rnd() * groups);
-    const a = rnd() * TAU;
-    const rr = span * 0.105 * Math.sqrt(rnd());
-    pts.push({
-      x: anchors[g].x + Math.cos(a) * rr,
-      y: anchors[g].y + Math.sin(a) * rr * 0.82,
-    });
+    let best = null;
+    let bestD = -1;
+    for (let k = 0; k < 14; k++) {
+      const a = rnd() * TAU;
+      const rr = Math.sqrt(rnd());
+      const c = { x: Math.cos(a) * rr * rx, y: Math.sin(a) * rr * ry };
+      let dmin = Infinity;
+      for (const p of pts) {
+        const d = (p.x - c.x) ** 2 + (p.y - c.y) ** 2;
+        if (d < dmin) dmin = d;
+      }
+      if (dmin > bestD) {
+        bestD = dmin;
+        best = c;
+      }
+    }
+    pts.push(best);
   }
-  let minX = Infinity;
-  let maxX = -Infinity;
-  let minY = Infinity;
-  let maxY = -Infinity;
-  for (const p of pts) {
-    minX = Math.min(minX, p.x);
-    maxX = Math.max(maxX, p.x);
-    minY = Math.min(minY, p.y);
-    maxY = Math.max(maxY, p.y);
-  }
-  const k = span / Math.max(1, maxX - minX, maxY - minY);
-  const cx = (minX + maxX) / 2;
-  const cy = (minY + maxY) / 2;
-  for (const p of pts) {
-    p.x = (p.x - cx) * k;
-    p.y = (p.y - cy) * k;
+  const minD = Math.min(28, (span * 0.8) / Math.sqrt(count));
+  for (let it = 0; it < 14; it++) {
+    let moved = false;
+    for (let i = 0; i < pts.length; i++) {
+      for (let j = i + 1; j < pts.length; j++) {
+        let dx = pts[j].x - pts[i].x;
+        let dy = pts[j].y - pts[i].y;
+        let d = Math.hypot(dx, dy);
+        if (d < 1e-6) {
+          dx = 0.6;
+          dy = 0.8;
+          d = 1;
+        }
+        if (d < minD) {
+          const push = (minD - d) / 2;
+          const ux = dx / d;
+          const uy = dy / d;
+          pts[i].x -= ux * push;
+          pts[i].y -= uy * push;
+          pts[j].x += ux * push;
+          pts[j].y += uy * push;
+          moved = true;
+        }
+      }
+    }
+    for (const p of pts) {
+      const nx = p.x / (rx * 1.12);
+      const ny = p.y / (ry * 1.12);
+      const r2 = nx * nx + ny * ny;
+      if (r2 > 1) {
+        const k = 1 / Math.sqrt(r2);
+        p.x = nx * k * rx * 1.12;
+        p.y = ny * k * ry * 1.12;
+      }
+    }
+    if (!moved) break;
   }
   return pts;
 }
 
-/** 最小生成树：星座连线（只连 n-1 条，不会糊成一团） */
-function mst(points) {
+/** 无环多叉树（取代 MST）：质心最近的星当枢纽，先接最近的 3~5 颗开叉；
+ *  其余星按「离已连星最近 + 偏好多子节点」生长。全树 n-1 条边，必有分叉、绝无闭环。 */
+function buildTree(points) {
   const n = points.length;
   if (n < 2) return [];
-  const used = new Array(n).fill(false);
-  used[0] = true;
-  const tree = [0];
+  let cx = 0;
+  let cy = 0;
+  for (const p of points) {
+    cx += p.x;
+    cy += p.y;
+  }
+  cx /= n;
+  cy /= n;
+  let hub = 0;
+  let hd = Infinity;
+  points.forEach((p, i) => {
+    const d = (p.x - cx) ** 2 + (p.y - cy) ** 2;
+    if (d < hd) {
+      hd = d;
+      hub = i;
+    }
+  });
+  const deg = new Array(n).fill(0);
+  const inT = new Array(n).fill(false);
   const edges = [];
-  while (tree.length < n) {
-    let best = Infinity;
-    let bi = -1;
-    let bj = -1;
-    for (const i of tree) {
-      for (let j = 0; j < n; j++) {
-        if (used[j]) continue;
-        const d = Math.hypot(points[i].x - points[j].x, points[i].y - points[j].y);
-        if (d < best) {
-          best = d;
-          bi = i;
-          bj = j;
-        }
+  inT[hub] = true;
+  const k = n >= 4 ? Math.min(n - 1, Math.max(3, Math.min(5, Math.round(n / 5) + 1))) : n - 1;
+  const order = [];
+  for (let i = 0; i < n; i++) {
+    if (i === hub) continue;
+    const d = (points[i].x - points[hub].x) ** 2 + (points[i].y - points[hub].y) ** 2;
+    order.push({ i, d });
+  }
+  order.sort((a, b) => a.d - b.d);
+  const seeded = Math.min(k, order.length);
+  for (let s = 0; s < seeded; s++) {
+    const j = order[s].i;
+    inT[j] = true;
+    deg[j] = 1;
+    deg[hub] += 1;
+    edges.push([points[hub], points[j]]);
+  }
+  let connected = 1 + seeded;
+  while (connected < n) {
+    let best = null;
+    for (let a = 0; a < n; a++) {
+      if (!inT[a]) continue;
+      for (let b = 0; b < n; b++) {
+        if (inT[b]) continue;
+        const d2 = (points[a].x - points[b].x) ** 2 + (points[a].y - points[b].y) ** 2;
+        const score = d2 / (1 + 0.3 * (deg[a] - 1));
+        if (!best || score < best.score) best = { a, b, score };
       }
     }
-    if (bj < 0) break;
-    used[bj] = true;
-    tree.push(bj);
-    edges.push([points[bi], points[bj]]);
+    if (!best) break;
+    inT[best.b] = true;
+    deg[best.b] = 1;
+    deg[best.a] += 1;
+    edges.push([points[best.a], points[best.b]]);
+    connected += 1;
   }
   return edges;
 }
@@ -238,16 +283,27 @@ export function buildAtlas(items) {
       c.stars.push(star);
       stars.push(star);
     });
-    // 三档连线：总览 / 中等 / 全量。按星等排序后各取前 N 做最小生成树。
+    // 三档连线：总览 / 中等 / 全量。各档独立建「无环多叉树」保持分叉感。
     const ranked = [...c.stars].sort((a, b) => b.importance - a.importance);
     ranked.forEach((s, i) => {
       s.rank = i;
+      // 纵深：前两颗近、过半之前中、其余远（配合渲染层的大小/亮度差）
+      s.tier = i < 2 ? 'near' : i < Math.ceil(c.stars.length * 0.55) ? 'mid' : 'far';
+      // 衍射亮星：每个项目内第一颗四芒、第二颗细四芒（全图最亮升六芒，见下）
+      s.spike = i === 0 ? 2 : i === 1 ? 1 : null;
     });
     c.ranked = ranked;
-    c.topEdges = mst(ranked.slice(0, Math.min(14, ranked.length)));
-    c.midEdges = mst(ranked.slice(0, Math.min(30, ranked.length)));
-    c.edges = mst(c.stars);
+    c.topEdges = buildTree(ranked.slice(0, Math.min(14, ranked.length)));
+    c.midEdges = buildTree(ranked.slice(0, Math.min(30, ranked.length)));
+    c.edges = buildTree(c.stars);
   }
+
+  // 全图最亮的星升成六芒主角（只一颗，避免满屏星芒）
+  let globalTop = null;
+  for (const s of stars) {
+    if (!globalTop || s.importance > globalTop.importance) globalTop = s;
+  }
+  if (globalTop) globalTop.spike = 3;
 
   let minX = 0;
   let maxX = 0;

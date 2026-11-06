@@ -433,6 +433,48 @@
     return a;
   }
 
+  // 羽化星芒：沿 0/90°（六芒再加 45/135°）画细长线性渐变，两端渐隐——不是硬线，
+  // 当年去掉十字星芒是因为和星座连线打架；现在每项目只 1~2 颗、带渐变，读得出层次。
+  function drawSpikes(x, y, r, a, level, tint) {
+    const strong = level === 3;
+    const thin = level === 1;
+    const len = r * (strong ? 10.5 : 9.5) * (thin ? 0.78 : 1);
+    const w = r * (strong ? 0.17 : 0.16) * (thin ? 0.72 : 1);
+    const angs = strong ? [0, Math.PI / 2, Math.PI / 4, -Math.PI / 4] : [0, Math.PI / 2];
+    const al = strong ? 0.9 : thin ? 0.5 : 0.7;
+    for (const ang of angs) {
+      const L = ang === Math.PI / 4 || ang === -Math.PI / 4 ? len * 0.62 : len;
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.rotate(ang);
+      const g = ctx.createLinearGradient(-L, 0, L, 0);
+      g.addColorStop(0, rgba(tint, 0));
+      g.addColorStop(0.38, rgba('#ffedd0', al * 0.5 * a));
+      g.addColorStop(0.5, rgba('#ffffff', al * 0.85 * a));
+      g.addColorStop(0.62, rgba('#ffedd0', al * 0.5 * a));
+      g.addColorStop(1, rgba(tint, 0));
+      ctx.fillStyle = g;
+      ctx.fillRect(-L, -w, L * 2, w * 2);
+      ctx.restore();
+    }
+    if (!thin) {
+      ctx.strokeStyle = rgba('#ffe9c8', (strong ? 0.24 : 0.18) * a);
+      ctx.lineWidth = 0.7;
+      ctx.beginPath();
+      ctx.arc(x, y, r * 2.1, 0, TAU);
+      ctx.stroke();
+    }
+    if (strong) {
+      const gb = ctx.createRadialGradient(x, y, 0, x, y, r * 6);
+      gb.addColorStop(0, rgba('#ffdfb8', 0.1 * a));
+      gb.addColorStop(1, rgba('#ffdfb8', 0));
+      ctx.fillStyle = gb;
+      ctx.beginPath();
+      ctx.arc(x, y, r * 6, 0, TAU);
+      ctx.fill();
+    }
+  }
+
   // —— 绘制 ——
   function drawFrame(now) {
     const t = reduceMotion ? 0 : now / 1000;
@@ -549,28 +591,62 @@
       a *= tw;
       const isHover = hoverId === s.id;
       const isSel = selected?.id === s.id;
-      const r = s.size * (isHover ? 1.45 : 1) * (isSel ? 1.2 : 1);
+      // 纵深三层：近层大而暖、远层细而暗
+      const tierScale = s.tier === 'near' ? 1.18 : s.tier === 'mid' ? 0.95 : 0.72;
+      const tierAlpha = s.tier === 'far' ? 0.64 : 1;
+      a *= tierAlpha;
+      const r = s.size * tierScale * (isHover ? 1.45 : 1) * (isSel ? 1.2 : 1);
       screenPos.set(s.id, { x: p.x, y: p.y, r });
 
-      const sp = sprites.get(s.color);
-      if (sp) {
-        const sz = r * 12;
-        ctx.globalAlpha = Math.min(1, a * 1.05);
-        ctx.drawImage(sp, p.x - sz / 2, p.y - sz / 2, sz, sz);
-        ctx.globalAlpha = 1;
-      }
-      // 2026-11-05：亮星原来画一对横竖「十字星芒」线，看起来像被划了一刀，
-      // 和星座连线混在一起分不清——已去掉。层次交给 sprite 光晕 + 实心核。
-
-      ctx.fillStyle = s.core;
-      ctx.globalAlpha = Math.min(1, a);
+      // 富星点四层：斜置宽晕 → 中晕 → 渐隐花芯 → 白热点
+      ctx.save();
+      ctx.translate(p.x, p.y);
+      ctx.rotate((((s.phase * 37) % 40) - 20) * (Math.PI / 180));
+      const wideR = r * 8.5;
+      const gw = ctx.createRadialGradient(0, 0, 0, 0, 0, wideR);
+      gw.addColorStop(0, rgba(s.color, 0.16 * a));
+      gw.addColorStop(0.35, rgba(s.color, 0.06 * a));
+      gw.addColorStop(1, rgba(s.color, 0));
+      ctx.fillStyle = gw;
       ctx.beginPath();
-      ctx.arc(p.x, p.y, r, 0, TAU);
+      ctx.arc(0, 0, wideR, 0, TAU);
       ctx.fill();
-      if (r > 3.4) {
+      ctx.restore();
+
+      const gm = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, r * 3.1);
+      gm.addColorStop(0, rgba(s.core, 0.42 * a));
+      gm.addColorStop(0.55, rgba(s.core, 0.13 * a));
+      gm.addColorStop(1, rgba(s.core, 0));
+      ctx.fillStyle = gm;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, r * 3.1, 0, TAU);
+      ctx.fill();
+
+      const gc = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, r * 1.35);
+      gc.addColorStop(0, '#ffffff');
+      gc.addColorStop(0.4, s.core);
+      gc.addColorStop(1, rgba(s.core, 0));
+      ctx.fillStyle = gc;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, r * 1.35, 0, TAU);
+      ctx.fill();
+      if (r > 2.4) {
         ctx.fillStyle = `rgba(255,252,246,${0.85 * a})`;
         ctx.beginPath();
         ctx.arc(p.x, p.y, r * 0.42, 0, TAU);
+        ctx.fill();
+      }
+
+      // 衍射星芒：每个项目 1~2 颗 + 全图最亮一颗六芒（羽化渐变，不是硬线）
+      if (s.spike) drawSpikes(p.x, p.y, r, a, s.spike, s.core);
+      // 远层补一点失焦晕
+      if (s.tier === 'far') {
+        const gb = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, r * 1.9);
+        gb.addColorStop(0, rgba(s.core, 0.1 * a));
+        gb.addColorStop(1, rgba(s.core, 0));
+        ctx.fillStyle = gb;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, r * 1.9, 0, TAU);
         ctx.fill();
       }
       ctx.globalAlpha = 1;
