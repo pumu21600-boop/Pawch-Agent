@@ -579,6 +579,9 @@ pub async fn run_task(
     observability::event(EventType::State, json!({ "kind": "task.start", "session": gate.session_id() }));
     // 「工作用时」的起点：从任务开始到回复落地的总时长（前端「工作中 N 分 N 秒」的数据源）
     let task_started = std::time::Instant::now();
+    // 产物归属的时间窗下界（墙上时钟）：收尾时只把 mtime 落在本轮任务内的改动
+    // 记到当前会话账本，防旧基线把别的会话/用户早先写的文件算进来（2026-11-06）
+    let task_started_wall = std::time::SystemTime::now();
     if plan_mode {
         observability::event(
             EventType::State,
@@ -670,7 +673,7 @@ pub async fn run_task(
         if cancel.is_set() {
             observability::event(EventType::State, json!({ "kind": "cancel", "phase": "loop", "step": step }));
             on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
-            emit_checkpoint_bar(baseline, gate.session_id(), &ws, &on_event).await;
+            emit_checkpoint_bar(baseline, gate.session_id(), &ws, task_started_wall, &on_event).await;
             return Ok(LoopOutcome::Cancelled);
         }
         // N1/025 运行中追加消息：下一步决策前并入（模型这一步就能看到），原轮不打断。
@@ -821,7 +824,7 @@ pub async fn run_task(
             // 发改动统计条、补 task.finish——否则这轮新建文件不进影子仓库，
             // 之后撤销会静默留在磁盘上（2026-11-02 审计）。
             on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
-            emit_checkpoint_bar(baseline, gate.session_id(), &ws, &on_event).await;
+            emit_checkpoint_bar(baseline, gate.session_id(), &ws, task_started_wall, &on_event).await;
             mem.record("task.finish", json!({ "reason": "cancelled", "phase": "streaming", "step": step }));
             return Ok(LoopOutcome::Cancelled);
         }
@@ -995,7 +998,7 @@ pub async fn run_task(
                 on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
                 continue;
             }
-            emit_checkpoint_bar(baseline, gate.session_id(), &ws, &on_event).await;
+            emit_checkpoint_bar(baseline, gate.session_id(), &ws, task_started_wall, &on_event).await;
             observability::event(
                 EventType::State,
                 json!({ "kind": "loop.finish", "step": step, "content_chars": turn.content.chars().count(), "session": gate.session_id() }),
@@ -1110,7 +1113,7 @@ pub async fn run_task(
                 // 否则这条会话下一轮会被严格校验的端点 400 掉（2026-11-02 审计实锤）。
                 backfill_cancelled_tools(&mut msgs, &turn.tool_calls, &executed);
                 on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
-                emit_checkpoint_bar(baseline, gate.session_id(), &ws, &on_event).await;
+                emit_checkpoint_bar(baseline, gate.session_id(), &ws, task_started_wall, &on_event).await;
                 mem.record("task.finish", json!({ "reason": "cancelled", "step": step }));
                 return Ok(LoopOutcome::Cancelled);
             }
@@ -1254,7 +1257,7 @@ pub async fn run_task(
                 observability::event(EventType::State, json!({ "kind": "cancel", "phase": "tool", "step": step }));
                 backfill_cancelled_tools(&mut msgs, &turn.tool_calls, &executed);
                 on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
-                emit_checkpoint_bar(baseline, gate.session_id(), &ws, &on_event).await;
+                emit_checkpoint_bar(baseline, gate.session_id(), &ws, task_started_wall, &on_event).await;
                 mem.record("task.finish", json!({ "reason": "cancelled", "step": step }));
                 return Ok(LoopOutcome::Cancelled);
             }
@@ -1380,7 +1383,7 @@ pub async fn run_task(
     // 撞步数上限也是任务结束：补「结束快照」提交 + 改动统计条（2026-10-08 修——
     // 其余四个出口都拍了只这条漏：前端拿不到 Checkpoint 事件 = 没有改动统计/撤销入口；
     // 影子仓库没提交末段新建文件 = 撤销后这些文件静默留在磁盘上）。事件流水补 task.finish。
-    emit_checkpoint_bar(baseline, gate.session_id(), &ws, &on_event).await;
+    emit_checkpoint_bar(baseline, gate.session_id(), &ws, task_started_wall, &on_event).await;
     mem.record("task.finish", json!({ "steps": cfg.max_steps, "reason": "step_limit", "max_steps": cfg.max_steps }));
     observability::event(EventType::Error, json!({ "message": format!("已达步数上限 {}，强制终止", cfg.max_steps) }));
     on_event(AgentEvent::StepLimit(cfg.max_steps));

@@ -1473,6 +1473,8 @@
   let rpFiles = [];
   // 「产物」空态/失败的原因（resolveBaseline 没基线、读取出错）——空也要说人话
   let rpArtifactsNote = '';
+  // 旧会话历史由检查点回溯而来：可能不全，列表上方给一句说明
+  let rpBackfilled = false;
   // —— git 面板（审查+提交合成一个标签）——
   // 范围选择器：task=本任务改动（影子仓库检查点）、
   // work=未提交改动（工作区真仓库相对 HEAD）——同时是提交的暂存区（勾选即入选）
@@ -2615,80 +2617,46 @@
     }
   }
 
+  // 产物面板 = 「这个会话改到过哪些文件」：只读后端按会话记的产物账本。
+  // 不再拿工作区全局 diff / 会话起点基线做差——会话活得久，别的会话后来写进
+  // 同一工作区的文件会全算到它头上（2026-11-06 校园网会话里冒出便利店 index.html
+  // 与整目录截图，实锤）。旧会话没有账本时只回退到消息里明确 write_file/edit_file
+  // 的路径，绝不回退到全局 diff。
   async function loadArtifacts() {
     rpLoading = true;
     rpWarn = '';
     rpStale = false;
     rpStaleErr = '';
-    // 「和 ZCode 一样那套」：产物面板**不再用影子基线**——直接看
-    // 工作区真 git 状态（相对 HEAD）。基线过期这类病在设计上就不存在了：你删/挪什么，
-    // 面板如实显示什么；agent 造的新文件走 --others 追加，同样在清单里。
-    // 非 git 工作区才退化到影子基线（git 都没有，只能靠快照）。
-    let usedBaseline = false;
+    rpBackfilled = false;
+    // 旧会话兜底：对话里明确写过的文件（精确但可能不全——shell/截图产生的改动看不到）
+    const derived = filesTouchedInMessages(messages, workspace);
     try {
-      let r = await fetch('/api/changes?origin=workspace').then((x) => x.json());
-      // 非 git 工作区 / 仓库还没有任何提交（无 HEAD）→ 退回影子基线（会话起点）。
-      // 判据要认 git 的真实报错原文（2026-10-31 实锤：只认「不在 git 仓库」漏掉了
-      // 「git diff --numstat HEAD 失败: ambiguous argument 'HEAD'」，空仓库直接白屏）。
-      const errText = String(r.error || '');
-      if (errText) {
-        // 非 git 工作区兜底：退回影子基线（会话起点）
-        let { id: baseline, note } = await resolveBaseline({ sessionFirst: true });
-        if (!baseline) {
-          // **只在「还没点进任何会话」时**借工作区最早的检查点兜底。
-          // 有会话但会话自己没有检查点时绝不跨会话借——借来的可能是别的会话在
-          // 空文件夹里拍的空树基线，产物面板就会把整个工作区（历史截图、别的项目
-          // 文件）当成"本任务产物"全列出来。2026-11-03 真机实测「改 bug 改着改着
-          // 产物又变成这样」的根因：每轮产生的文件都堆进这个假产物清单。
-          if (!currentSessionId) {
-            try {
-              const all = await fetch('/api/checkpoints').then((x) => x.json());
-              const list = all.checkpoints || [];
-              if (list.length) baseline = list[list.length - 1].id;
-            } catch {
-              /* 拿不到就走下面的空态 */
-            }
-          }
-        }
-        if (!baseline) {
-          // 检查点历史缺失（数据目录迁移/老会话）时用会话里的写入记录兜底：
-          // 产物面板是「这个会话产出过什么」，有写入就该有清单，别让用户看到一片空
-          // （2026-11-03 真机实测「产物列表刷不出之前生成过的」）。
-          const derived = filesTouchedInMessages(messages, workspace);
-          if (derived.length) {
-            rpFiles = derived;
-            rpLoading = false;
-            return;
-          }
-          rpFiles = [];
-          rpArtifactsNote = note || '当前会话还没有任务起点快照——产物从下一次任务开始记录，也可以点「重拍基线」以当前状态为起点。';
-          rpLoading = false;
-          return;
-        }
-        usedBaseline = true;
-        // 非 git 工作区的再一层过滤：只认**会话开始之后**改过的文件。
-        // 空树基线（会话在空工作区开工）会把整个工作区都算成"本会话产物"——历史截图、
-        // 用户自己拷进来的项目文件全在列表里（2026-11-03 真机实测「没产物的对话反倒
-        // 是一坨乱数据」）。agent 写的文件 mtime 都在会话内；早先拷入的文件 mtime 是旧时间。
-        const meta = (sessions || []).find((x) => x.id === currentSessionId);
-        const sinceSec = meta && meta.created_at ? Math.floor(Date.parse(meta.created_at) / 1000) || 0 : 0;
-        const sinceQ = sinceSec ? `&since=${sinceSec}` : '';
-        r = await fetch(`/api/changes?baseline=${encodeURIComponent(baseline)}${sinceQ}`).then((x) => x.json());
+      if (!currentSessionId) {
+        rpFiles = derived;
+        rpArtifactsNote = derived.length ? '' : '新对话还没有产物。agent 改动工作区文件后会列在这里。';
+        rpLoading = false;
+        return;
       }
-      rpFiles = r.files || [];
-      if (usedBaseline) {
-        // 兜底路径（非 git 工作区）不再弹「基线过期」气泡（
-        // 「气泡点了没用/一直留着」）：直接只留**还在工作区里的东西**——
-        // 删除类条目(D) 在「这个会话产出了什么」这个语义下没有意义（文件都没了，
-        // 点开也是空的），静默丢掉即可，不必让用户确认。
-        rpFiles = rpFiles.filter((f) => f.status !== 'D');
+      const r = await fetch(`/api/artifacts?session=${encodeURIComponent(currentSessionId)}`).then((x) => x.json());
+      if (r.error) {
+        rpFiles = derived;
+        rpArtifactsNote = `读取产物记录失败: ${r.error}`;
+        rpLoading = false;
+        return;
       }
-      rpWarn = '';
-      rpStale = false;
-      if (r.error) rpArtifactsNote = `读取失败: ${r.error}`;
+      const seen = new Map();
+      for (const f of r.files || []) seen.set(f.path, f);
+      for (const f of derived) if (!seen.has(f.path)) seen.set(f.path, f);
+      rpFiles = [...seen.values()];
+      rpBackfilled = !!r.backfilled;
+      if (r.tracked) {
+        rpArtifactsNote = r.note || (rpFiles.length ? '' : '本会话还没有改动过工作区里的文件。');
+      } else {
+        rpArtifactsNote = r.note || '这个会话早于产物归属记录：这里只列出对话里明确写过的文件，shell 命令和截图产生的改动从下一轮任务开始记录。';
+      }
     } catch (e) {
-      rpFiles = [];
-      rpArtifactsNote = `读取失败: ${e.message || e}`;
+      rpFiles = derived;
+      rpArtifactsNote = `读取产物记录失败: ${e.message || e}`;
     }
     rpLoading = false;
   }
@@ -2704,6 +2672,7 @@
     rvWarn = '';
     rpFiles = [];
     rpArtifactsNote = '';
+    rpBackfilled = false;
     rpWarn = '';
     manualBaseline = ''; // 重拍的基线只属于当时的会话/工作区，切走即作废
     rpStale = false;
@@ -4344,6 +4313,8 @@
                 refreshDock(); // git 面板数据（基线/分支/脏数）更新
                 // git 面板正开着（且看的是本任务档）：新检查点到了就地重拉，跑完就能看见
                 if (rpTabs.some((t) => t.kind === 'git') && rvSource === 'task') loadReview();
+                // 产物账本在任务收尾才写入：产物标签开着就地重拉
+                if (rpTab === 'artifacts') loadArtifacts();
                 // 回滚锚点（2026-10-27）：任务起点基线记到触发的那条用户消息上，
                 // 之后「回滚」按它恢复工作区文件
                 updMsgs(skey, (a) => {
@@ -4416,6 +4387,9 @@
                 pushMsg(skey, { id: nextId(), role: 'system', content: '已停止' });
               } else if (d.done) {
                 patch(endTurn);
+                // 产物账本在任务收尾写入（零改动也会落空账本，用于区分「已记账、
+                // 本轮没产物」与「旧会话无记录」）；产物标签开着就刷新
+                if (rpTab === 'artifacts') loadArtifacts();
               }
             } catch (e) {
               // 忽略坏行
@@ -8745,8 +8719,11 @@
                 {#if rpLoading}
                   <div class="trace-empty">加载中…</div>
                 {:else if !rpFiles.length}
-                  <div class="rp-empty">{rpArtifactsNote || '本任务还没有产物。'}<br />agent 修改/创建文件后，这里会列出改动清单（相对本次任务起点）。</div>
+                  <div class="rp-empty">{rpArtifactsNote || '本会话还没有产物。agent 改到过的工作区文件会列在这里。'}</div>
                 {:else}
+                  {#if rpBackfilled}
+                    <div class="rp-note">旧会话：按检查点回溯，可能不全</div>
+                  {/if}
                   {#each rpFiles as f (f.path)}
                     <button class="rp-file" class:sel={f.path === rpPreviewPath} title={f.path} on:click={() => openPreviewTab(f.path)}>
                       {f.path}
@@ -11263,6 +11240,13 @@
     font-size: 12.5px;
     line-height: 1.7;
     padding: 0 16px;
+  }
+  .rp-note {
+    color: var(--g5);
+    font-size: 11.5px;
+    padding: 4px 10px 6px;
+    border-bottom: 1px solid var(--g2);
+    margin-bottom: 4px;
   }
   .rp-file {
     text-align: left;

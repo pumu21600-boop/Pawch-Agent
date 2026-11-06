@@ -2,6 +2,7 @@
 //!
 //! 模块骨架对齐总架构 §17。核心循环、沙箱、工具等依次后置。
 
+mod artifacts;
 mod browser;
 mod bootstrap;
 mod computer;

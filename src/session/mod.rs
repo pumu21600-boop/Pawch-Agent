@@ -432,6 +432,10 @@ impl SessionManager {
         if !safe_id(id) {
             anyhow::bail!("非法 session id");
         }
+        // 产物账本跟着会话走：会话文件删了，归属记录也不留（best-effort）
+        if let Some(logs) = self.dir.parent() {
+            crate::artifacts::clear_in(logs, id);
+        }
         match std::fs::remove_file(self.path(id)) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

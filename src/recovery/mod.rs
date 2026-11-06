@@ -775,13 +775,15 @@ pub fn changed_files(
         ws,
         &others_cmd.iter().map(String::as_str).collect::<Vec<_>>(),
     )?;
-    for entry in others.split('\0') {
-        if entry.is_empty() {
-            continue;
-        }
-        let rel = entry.trim_end_matches('/');
-        if rel.is_empty() || out.iter().any(|f| f.path == rel) {
-            continue;
+    let mut seen: std::collections::HashSet<String> = out.iter().map(|f| f.path.clone()).collect();
+    // 折叠成一条的**整个未跟踪目录**要展开：--directory 只回 "screenshots/"，
+    // 早先按目录 metadata 被当成「不是文件」丢掉——git 工作区里 agent 新建的
+    // 截图/产物目录于是从产物面板消失（2026-11-06 会话产物归属轮补）。
+    // 展开时再跑一次同目录的 ls-files（不折叠），.gitignore 规则照常生效。
+    let mut collapsed: Vec<String> = Vec::new();
+    let mut push_file = |rel: &str| {
+        if rel.is_empty() || out.len() >= 20_000 {
+            return;
         }
         let path = PathBuf::from(rel);
         let excluded = path.components().any(|c| {
@@ -789,19 +791,198 @@ pub fn changed_files(
                 && EXCLUDED_DIRS.contains(&c.as_os_str().to_string_lossy().as_ref())
         });
         if excluded {
+            return;
+        }
+        let Ok(meta) = std::fs::metadata(ws.join(&path)) else { return };
+        if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
+            return;
+        }
+        let rel = rel.replace('\\', "/");
+        if seen.insert(rel.clone()) {
+            out.push(ChangedFile { path: rel, status: '?', adds: 0, dels: 0 });
+        }
+    };
+    for entry in others.split('\0') {
+        if entry.is_empty() {
             continue;
         }
-        let Ok(meta) = std::fs::metadata(ws.join(&path)) else { continue };
-        if meta.is_file() && meta.len() <= MAX_FILE_BYTES {
-            out.push(ChangedFile {
-                path: rel.replace('\\', "/"),
-                status: '?',
-                adds: 0,
-                dels: 0,
+        let is_dir_entry = entry.ends_with('/') || entry.ends_with('\\');
+        let rel = entry.trim_end_matches(['/', '\\']);
+        if rel.is_empty() {
+            continue;
+        }
+        if is_dir_entry {
+            let path = PathBuf::from(rel);
+            let excluded = path.components().any(|c| {
+                matches!(c, std::path::Component::Normal(_))
+                    && EXCLUDED_DIRS.contains(&c.as_os_str().to_string_lossy().as_ref())
             });
+            if !excluded {
+                collapsed.push(rel.replace('\\', "/"));
+            }
+            continue;
+        }
+        push_file(rel);
+    }
+    for dir in collapsed {
+        let pattern = format!("{dir}/");
+        let Ok(expanded) = git_ok(
+            &bin,
+            gitdir.as_deref(),
+            ws,
+            &["ls-files", "--others", "-z", "--exclude-standard", "--", &pattern],
+        ) else {
+            continue;
+        };
+        for entry in expanded.split('\0') {
+            if !entry.is_empty() {
+                push_file(entry.trim_end_matches('/'));
+            }
         }
     }
     Ok(out)
+}
+
+/// 旧会话产物回溯：只沿影子仓库里**该会话自己的提交链**算改动。
+///
+/// 检查点都在工具执行前拍，所以相邻两个本会话提交的 diff = 上一个工具/任务产生的
+/// 改动。规则：
+/// - 会话第一个提交不算（它是任务起点/首个工具前的快照，diff 属于之前的会话）；
+/// - 父子链上夹了别的会话（或手动）提交的窗口直接跳过——无法安全归属；
+/// - 只返回**现在仍存在**的文件，删除态没有意义；
+/// - git 工作区的检查点只跟踪真仓库 ls-files，新文件用 mtime 落在
+///   [首个提交, 末个提交] 窗口内的未跟踪文件补回来（截图/产物目录常是未跟踪的）。
+///
+/// 这是给「账本上线前的老会话」补历史用的一次性回溯，结果会写进 artifacts 账本。
+/// 返回 `None` = 当前工作区的影子仓库里没有这个会话的任何提交（会话属于别的工作区，
+/// 或检查点已被清理）；调用方不要据此写空账本，否则会把会话错误绑定到当前工作区。
+pub fn session_changed_paths(ws: &Path, session: &str) -> anyhow::Result<Option<Vec<String>>> {
+    let session = session.trim();
+    if session.is_empty()
+        || session.len() > 64
+        || !session.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        bail!("非法 session id");
+    }
+    let gitdir = shadow_gitdir(ws);
+    if !gitdir.exists() {
+        bail!("影子仓库不存在");
+    }
+    let bin = git_bin()?;
+    let grep = format!("Agent-Session: {session}");
+    let out = git_ok(
+        &bin,
+        Some(&gitdir),
+        ws,
+        &[
+            "log",
+            "--reverse",
+            "--fixed-strings",
+            "--grep",
+            &grep,
+            "--pretty=%H%x1f%P%x1f%ct%x1f%b%x1e",
+        ],
+    )?;
+    struct Commit {
+        id: String,
+        parents: String,
+        ts: i64,
+    }
+    let mut commits: Vec<Commit> = Vec::new();
+    for rec in out.split('\x1e') {
+        let rec = rec.trim_matches('\n');
+        if rec.trim().is_empty() {
+            continue;
+        }
+        let mut it = rec.splitn(4, '\x1f');
+        let Some(id) = it.next().map(str::trim).filter(|s| !s.is_empty()) else { continue };
+        let parents = it.next().unwrap_or("").trim().to_string();
+        let ts: i64 = it.next().unwrap_or("0").trim().parse().unwrap_or(0);
+        let body = it.next().unwrap_or("");
+        // --grep 是全文匹配，这里再精确核对 trailer，防命令文本里恰好带同样字样
+        let sid = body
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("Agent-Session:"))
+            .map(str::trim)
+            .unwrap_or("");
+        if sid != session {
+            continue;
+        }
+        commits.push(Commit { id: id.to_string(), parents, ts });
+    }
+    if commits.is_empty() {
+        return Ok(None);
+    }
+
+    let mut paths: Vec<String> = Vec::new();
+    let push = |p: &str, ws: &Path, out: &mut Vec<String>| {
+        let p = p.replace('\\', "/");
+        let p = p.trim_start_matches("./").to_string();
+        if !crate::artifacts::safe_rel_path(&p) || p.to_lowercase().starts_with(".agent/") {
+            return;
+        }
+        if ws.join(&p).is_file() && !out.iter().any(|x| x == &p) {
+            out.push(p);
+        }
+    };
+    for i in 1..commits.len() {
+        let prev = &commits[i - 1];
+        let cur = &commits[i];
+        // 只认直接父子：中间夹了别的会话提交，这个窗口就不归属本会话
+        if !cur.parents.split_whitespace().any(|p| p == prev.id) {
+            continue;
+        }
+        let Ok(diff) = git_ok(
+            &bin,
+            Some(&gitdir),
+            ws,
+            &["diff", "--name-status", "-z", &prev.id, &cur.id],
+        ) else {
+            continue;
+        };
+        let mut toks = diff.split('\0');
+        while let Some(status) = toks.next() {
+            if status.is_empty() {
+                continue;
+            }
+            let code = status.chars().next().unwrap_or('M');
+            let Some(p1) = toks.next() else { break };
+            if matches!(code, 'R' | 'C') {
+                let Some(p2) = toks.next() else { break };
+                push(p2, ws, &mut paths);
+            } else if code != 'D' {
+                push(p1, ws, &mut paths);
+            }
+        }
+    }
+    // 未跟踪文件补充：git 工作区的检查点不含未跟踪文件，只能按会话提交时间窗补
+    if commits.len() >= 2 {
+        let first_ts = commits.first().map(|c| c.ts).unwrap_or(0);
+        let last = commits.last().expect("len >= 2");
+        let last_ts = last.ts;
+        if first_ts > 0
+            && last_ts >= first_ts
+            && let Ok(files) = changed_files(ws, RepoOrigin::Shadow, &last.id)
+        {
+            for f in files {
+                if f.status != '?' {
+                    continue;
+                }
+                let Ok(meta) = std::fs::metadata(ws.join(&f.path)) else { continue };
+                let Ok(mtime) = meta.modified() else { continue };
+                let secs = mtime
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                // 2 秒容差：提交时间与文件 mtime 的边界误差
+                if secs + 2 >= first_ts && secs <= last_ts + 2 {
+                    push(&f.path, ws, &mut paths);
+                }
+            }
+        }
+    }
+    paths.sort();
+    Ok(Some(paths))
 }
 
 /// 基线树里的**顶层目录**在当前工作区已整体消失，且其文件在 diff 里呈删除态——
@@ -1069,6 +1250,70 @@ mod tests {
         assert!(RepoOrigin::from_query(Some("shadow")).eq(&RepoOrigin::Shadow));
         assert!(RepoOrigin::from_query(Some("work")).eq(&RepoOrigin::Workspace));
         assert!(RepoOrigin::from_query(None).eq(&RepoOrigin::Shadow));
+    }
+
+    #[test]
+    fn untracked_directory_is_expanded_to_files() {
+        // 2026-11-06 产物归属轮：git 工作区里整个未跟踪目录（截图/产物目录）会被
+        // --directory 折叠成 "screenshots/"，早先按目录 metadata 当非文件丢掉，
+        // 产物面板看不到 agent 新建的目录内容。现在要展开成具体文件。
+        if !git_have() {
+            return;
+        }
+        let ws = temp_ws("untracked-dir");
+        let w = ws.path();
+        ws.git(&["init", "--quiet"]);
+        std::fs::write(w.join("base.txt"), "v1\n").unwrap();
+        ws.git(&["add", "base.txt"]);
+        ws.git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--quiet", "-m", "base"]);
+        std::fs::create_dir_all(w.join("screenshots")).unwrap();
+        std::fs::write(w.join("screenshots").join("a.png"), "png").unwrap();
+        std::fs::create_dir_all(w.join("node_modules").join("pkg")).unwrap();
+        std::fs::write(w.join("node_modules").join("pkg").join("x.js"), "x").unwrap();
+
+        let files = changed_files(w, RepoOrigin::Workspace, "HEAD").unwrap();
+        assert!(
+            files.iter().any(|f| f.path == "screenshots/a.png" && f.status == '?'),
+            "未跟踪目录要展开到文件: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|f| f.path.starts_with("node_modules")),
+            "排除目录仍不能进清单: {files:?}"
+        );
+    }
+
+    #[test]
+    fn session_backfill_only_own_commit_chain() {
+        // 2026-11-06 旧会话回溯：只认本会话相邻提交之间的 diff。
+        // 第一个提交是会话开始前的快照，不算；中间夹了别的会话提交的窗口跳过。
+        if !git_have() {
+            return;
+        }
+        let ws = temp_ws("backfill");
+        let w = ws.path();
+        std::fs::write(w.join("before.txt"), "x").unwrap();
+        checkpoint(w, "任务起点", "sess-a").unwrap().expect("A 首拍");
+        std::fs::write(w.join("a2.txt"), "a2").unwrap();
+        checkpoint(w, "write_file", "sess-a").unwrap().expect("A 第二个提交");
+        std::fs::write(w.join("b1.txt"), "b1").unwrap();
+        checkpoint(w, "任务起点", "sess-b").unwrap().expect("B 首拍");
+        std::fs::write(w.join("a3.txt"), "a3").unwrap();
+        checkpoint(w, "write_file", "sess-a").unwrap().expect("A 第三个提交");
+        std::fs::write(w.join("a4.txt"), "a4").unwrap();
+        checkpoint(w, "edit_file", "sess-a").unwrap().expect("A 第四个提交");
+
+        let a = session_changed_paths(w, "sess-a").unwrap().expect("A 有提交");
+        assert!(a.contains(&"a2.txt".to_string()), "{a:?}");
+        assert!(a.contains(&"a4.txt".to_string()), "{a:?}");
+        assert!(!a.contains(&"before.txt".to_string()), "会话开始前的文件不算: {a:?}");
+        assert!(!a.contains(&"b1.txt".to_string()), "别的会话的文件不能算: {a:?}");
+        assert!(!a.contains(&"a3.txt".to_string()), "夹了别会话提交的窗口跳过: {a:?}");
+        let b = session_changed_paths(w, "sess-b").unwrap().expect("B 有提交");
+        assert!(b.is_empty(), "只有第一个提交的会话没有可归属改动: {b:?}");
+        assert!(
+            session_changed_paths(w, "sess-missing").unwrap().is_none(),
+            "影子仓库里没有的会话要返回 None，别写空账本"
+        );
     }
 
     #[test]

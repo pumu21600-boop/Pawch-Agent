@@ -46,6 +46,74 @@ pub(super) async fn list_changes(
     }
 }
 
+/// GET /api/artifacts?session=<id> —— 本会话产物账本（工作区相对路径清单）。
+/// 与 /api/changes 的区别：后者是**工作区全局**改动（git 面板/未提交改动用），
+/// 本接口只认「这个会话的某一轮任务真正改到过」的文件。产物面板必须走这条，
+/// 绝不能再拿全局 diff 充数——会话活得久，别的会话写的东西会全算到它头上
+/// （2026-11-06 校园网会话里冒出便利店 index.html/截图，实锤）。
+/// tracked=false 表示旧会话还没有归属记录（前端回退到消息里的 write/edit 路径）。
+pub(super) async fn list_artifacts(
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let err = |e: String| (StatusCode::BAD_REQUEST, Json(json!({ "error": e })));
+    let session = params.get("session").map(|s| s.trim()).unwrap_or("");
+    if session.is_empty() {
+        return Err(err("缺少 session".into()));
+    }
+    let ws = crate::tools::workspace_root().to_path_buf();
+    // 旧会话没有账本（或账本还不是回溯来的）：从影子仓库里本会话自己的检查点链
+    // 回溯一次，写进账本再返回。回溯只认「相邻两个本会话提交」之间的 diff，
+    // 绝不拿工作区全局状态充数；影子仓库里没有这个会话的提交时返回 None，不写空账本。
+    let mut ledger = crate::artifacts::read(session);
+    let need_backfill = match &ledger {
+        None => true,
+        Some(l) => !l.backfilled && crate::artifacts::same_workspace(&l.workspace, &ws),
+    };
+    if need_backfill {
+        let ws_calc = ws.clone();
+        let sid = session.to_string();
+        let calc = tokio::task::spawn_blocking(move || crate::recovery::session_changed_paths(&ws_calc, &sid)).await;
+        if let Ok(Ok(Some(paths))) = calc {
+            let _ = crate::artifacts::record_backfill(session, &ws, paths);
+            ledger = crate::artifacts::read(session);
+        }
+    }
+    let Some(ledger) = ledger else {
+        return Ok(Json(json!({
+            "ok": true,
+            "tracked": false,
+            "files": [],
+            "note": "这个会话没有产物归属记录，也没找到可回溯的历史检查点"
+        })));
+    };
+    // 工作区换了：旧账本属于别的项目，不冒充当前工作区的产物
+    if !crate::artifacts::same_workspace(&ledger.workspace, &ws) {
+        return Ok(Json(json!({
+            "ok": true,
+            "tracked": true,
+            "backfilled": ledger.backfilled,
+            "files": [],
+            "note": "该会话的产物属于另一个工作区"
+        })));
+    }
+    let files: Vec<Value> = crate::artifacts::existing_paths(&ledger, &ws)
+        .into_iter()
+        .map(|p| json!({ "path": p, "status": "M", "adds": 0, "dels": 0 }))
+        .collect();
+    let note = if ledger.backfilled && files.is_empty() {
+        "旧会话：按检查点回溯没有找到工作区产出（可能只改了工作区外的文件）"
+    } else {
+        ""
+    };
+    Ok(Json(json!({
+        "ok": true,
+        "tracked": true,
+        "backfilled": ledger.backfilled,
+        "files": files,
+        "note": note
+    })))
+}
+
 /// GET /api/review/diff?baseline=xx[&path=xx][&origin=shadow|workspace] —— 相对基线的统一 diff 文本
 /// （git 面板逐文件看具体改动用；path 缺省 = 全量）。
 pub(super) async fn review_diff(

@@ -302,6 +302,7 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/workspace/doc", get(read_workspace_doc))
         .route("/api/workspace/doc-slides", get(read_workspace_doc_slides))
         .route("/api/changes", get(list_changes))
+        .route("/api/artifacts", get(list_artifacts))
         .route("/api/review/diff", get(review_diff))
         .route("/api/shell", post(run_shell))
         .route("/api/skills", get(list_skills).post(post_skills))
