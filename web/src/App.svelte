@@ -995,6 +995,7 @@
     const el = e.target;
     el.style.height = 'auto';
     el.style.height = Math.min(el.scrollHeight, 200) + 'px';
+    syncComposerHl();
   }
 
   // 程序化改动 input 后手动回收高度（不触发 input 事件，autoRows 不会跑）
@@ -1003,6 +1004,7 @@
     if (!el) return;
     el.style.height = 'auto';
     el.style.height = Math.min(el.scrollHeight, 200) + 'px';
+    syncComposerHl();
   }
 
   function scrollToBottom() {
@@ -1425,8 +1427,22 @@
     return highlightComposer(typeof content === 'string' ? content : String(content ?? ''));
   }
   function syncComposerHl() {
-    if (composerHlEl && composerInputEl) composerHlEl.scrollTop = composerInputEl.scrollTop;
+    if (!composerHlEl || !composerInputEl) return;
+    // 浮层宽度必须跟输入框的**内容区**走：草稿超过 max-height 后 textarea 出竖向滚动条，
+    // 滚动条吃掉十几像素，而浮层（inset:0）仍按整个盒宽折行 → 两层换行点不同，
+    // 字和光标看着互相错位、像叠了一层旧文字（实测 663 字草稿：clientWidth 839 vs 浮层 855）
+    composerHlEl.style.width = composerInputEl.clientWidth + 'px';
+    composerHlEl.scrollTop = composerInputEl.scrollTop;
   }
+  // 面板宽度变化（拖侧栏、开合右面板、窗口缩放）不会触发 input，单靠 input 同步会漏
+  let composerHlRo = null;
+  function observeComposerHl(el) {
+    if (composerHlRo) composerHlRo.disconnect();
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    composerHlRo = new ResizeObserver(() => syncComposerHl());
+    composerHlRo.observe(el);
+  }
+  $: if (composerInputEl) observeComposerHl(composerInputEl);
 
   // —— 加号菜单：光标处插入文本（@ 引用 / 能力模板 / $ 技能）——
   async function insertAtCursor(text) {

@@ -34,9 +34,11 @@
   .grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; align-items: start; }
   @media (min-width: 960px) { .grid { grid-template-columns: minmax(300px, 1fr) 300px minmax(320px, 1fr); } }
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
-  /* 本次对话统计：三格大字指标（输入/缓存输入/输出）+ 分隔线下的明细行（次数/费用/延迟/速度）。
+  /* 本次对话统计：四格大字指标（输入/缓存输入/缓存命中率/输出）+ 分隔线下的明细行（次数/费用/延迟/速度）。
      原先大小字号混排右对齐一列，数字一长就花 */
-  .stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+  /* 四格按内容宽度排开并顶到两端（等宽分栏时最后一格右边会留空，用户要求「排开一点」）；
+     间距只做下限，由 space-between 吃掉剩余宽度 */
+  .stats { display: grid; grid-template-columns: repeat(4, auto); justify-content: space-between; gap: 10px 16px; }
   .stat { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
   .stat .sk { font-size: 11.5px; color: var(--dim); white-space: nowrap; }
   .stat .sv {
@@ -50,7 +52,7 @@
   }
   .mrow .mv { color: var(--fg); font-variant-numeric: tabular-nums; text-align: right; }
   .mrow .mv.strong { font-weight: 650; }
-  @media (max-width: 420px) { .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  @media (max-width: 420px) { .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); justify-content: normal; } }
   .empty { color: var(--dim); font-size: 12px; padding: 16px 0; text-align: center; }
   .bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
   .seg { display: inline-flex; border: 1px solid var(--line2); border-radius: 7px; overflow: hidden; }
@@ -281,6 +283,8 @@ function renderUsage(r) {
   // 价格表的「输入」列仍是单价口径（非缓存部分按输入价、缓存按缓存价），两者不冲突。
   const inputTotal = t.prompt_tokens || 0;
   const inputOnly = Math.max(inputTotal - (t.cached_tokens || 0), 0); // 仅用于悬停提示的拆分说明
+  // 缓存命中率 = 缓存输入 / 输入总量（分母是含缓存的总量；输入为 0 时不给百分比）
+  const hitRate = inputTotal > 0 && t.cached_tokens != null ? ((t.cached_tokens / inputTotal) * 100).toFixed(1) + '%' : '—';
   // 计时行（2026-11-08）：平均首 token 延迟 / 平均输出速度来自台账的流式计时；
   // 旧记录没这两个字段，聚合为 null 时显示 —（新会话跑一两条就有了）
   const ttft = t.avg_ttft_ms;
@@ -289,6 +293,7 @@ function renderUsage(r) {
     <div class="stats">
       <div class="stat"><span class="sk">输入（含缓存）</span><span class="sv" title="其中缓存输入 ${num(t.cached_tokens)}，非缓存 ${num(inputOnly)}">${num(inputTotal)}</span></div>
       <div class="stat"><span class="sk">缓存输入</span><span class="sv">${num(t.cached_tokens)}</span></div>
+      <div class="stat"><span class="sk">缓存命中率</span><span class="sv">${hitRate}</span></div>
       <div class="stat"><span class="sk">输出</span><span class="sv">${num(t.completion_tokens)}</span></div>
     </div>
     <div class="meta">
