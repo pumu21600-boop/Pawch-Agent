@@ -40,12 +40,12 @@
   --tint-pink-fg: #f0a0c0;
   --tint-gray-bg: #2a2723;
   --tint-gray-fg: #b8b3a9;
-  /* 成熟化品牌强调色。2026-10-31 改版：浅暖橙（用户从效果图定的色）。
+  /* 成熟化品牌强调色。2026-10-31 改版：浅暖橙。
      --brand=填充面（按钮渐变亮端/激活底/呼吸点），--brand-text=文字场景（深底上更清晰），
      --brand-deep=渐变按钮暗端，--brand-ink=品牌底上的文字 */
   --brand: #ba8a78;
   --brand-hover: #c49c8d;
-  /* 深端只比亮端深半档（用户 2026-10-31 复验：按钮橙「不要那么艳」——之前深端太重把整颗按钮拖深） */
+  /* 深端只比亮端深半档（按钮橙「不要那么艳」——深端太重会把整颗按钮拖深） */
   --brand-deep: #b3836b;
   --brand-text: #c49c8d;
   --brand-ink: #3a1c0e;
@@ -458,7 +458,7 @@ select option:checked {
 [data-theme='light'] .tk-cm { color: #8a8478; }
 [data-theme='light'] .tk-type { color: #b45309; }
 
-/* 工具详情块专用 token（2026-10-31 用户复验：只有一色不够，键值/标点/路径/报错要分色） */
+/* 工具详情块专用 token（只有一色不够，键值/标点/路径/报错要分色） */
 .tk-key { color: #82aaff; }        /* JSON 键名、key= 形式的 key */
 .tk-punc { color: #6e695f; }       /* 括号/逗号/冒号，压暗让结构退后 */
 .tk-path { color: #89ddff; }       /* 路径与文件名 */

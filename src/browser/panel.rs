@@ -454,7 +454,7 @@ pub async fn panel_overlay(
     };
     // 没有活跃会话**也能开菜单**：菜单项按「没有可见标签」自禁（menu.html 的
     // disabled 逻辑）。原先这里 current_session()? 直接抛「浏览器未打开」——空态点
-    // 「⋯」整个菜单开不出来（2026-11-08 用户实锤「没看到开发者工具」的另一半）。
+    // 「⋯」整个菜单开不出来（「没看到开发者工具」问题的另一半）。
     let tab = match current_session().await {
         Ok(session) => {
             session.touch();

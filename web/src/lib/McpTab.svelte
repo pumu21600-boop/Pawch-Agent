@@ -22,7 +22,7 @@
     oauth_client_secret: '',
     oauth_scope: '',
   };
-  // 用户 2026-10-05：新建表单默认收起，点「新建 MCP」才展开，和技能页同款（表单开着时只留表单，列表让位）
+  // 新建表单默认收起，点「新建 MCP」才展开，和技能页同款（表单开着时只留表单，列表让位）
   let addOpen = false;
   function resetMcpForm() {
     mcpForm = {
@@ -90,7 +90,7 @@
 </script>
 
       {#if tab === 'mcp'}
-        <!-- 用户 2026-10-05：新建表单默认收起，点「新建 MCP」才展开；开着时只留表单（和技能页同款） -->
+        <!-- 新建表单默认收起，点「新建 MCP」才展开；开着时只留表单（和技能页同款） -->
         <div class="sub-row">
           <button class="btn primary" on:click={() => (addOpen = true)}>新建 MCP</button>
           <button class="btn" on:click={() => dispatch('reload')}>刷新</button>

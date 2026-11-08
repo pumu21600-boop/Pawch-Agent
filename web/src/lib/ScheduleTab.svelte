@@ -31,7 +31,7 @@
       });
   }
   let schedMsg = '';
-  // 操作类提示只在本页停留期间有效，下次进入本页（切页签/重开设置）就清（用户 2026-11-03）
+  // 操作类提示只在本页停留期间有效，下次进入本页（切页签/重开设置）就清
   $: if (tab === 'schedule') schedMsg = '';
   // 通用确认弹窗（桌面壳 WebView2 不实现 window.confirm，同 App 侧 ConfirmModal）
   let confirmModal = null;
@@ -60,7 +60,7 @@
   let schedCronPending = false;
   // 三档（2026-11-08 与「高危」下拉合并成一个：无人值守没有人点允许，高危策略由
   // 档位推导——只读/自动命中审批一律拒绝并回喂，完全访问全免审，
-  // 后端 schedule::unattended_on_approval；标签不带括号说明，用户拍板）
+  // 后端 schedule::unattended_on_approval；标签不带括号说明）
   const SCHED_MODES = [
     { value: 'read-only', label: '只读' },
     { value: 'auto', label: '自动' },

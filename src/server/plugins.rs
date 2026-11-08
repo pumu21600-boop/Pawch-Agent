@@ -256,7 +256,7 @@ const STARTER_INDEX_HTML: &str = r#"<!doctype html>
 </html>
 "#;
 
-/// POST /api/plugins/create —— 用户 2026-10-05：插件页「新建插件」脚手架。在工作区
+/// POST /api/plugins/create —— 插件页「新建插件」脚手架。在工作区
 /// plugins/<name>/ 下生成 manifest.json + 起始 index.html。创建即落位即加载（来源
 /// user、权限自己声明；模型自产的 draft 隔离区不适用于用户主动创建的场景）。
 pub(super) async fn create_plugin(

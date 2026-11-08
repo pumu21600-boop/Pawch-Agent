@@ -318,7 +318,7 @@ impl SessionManager {
     /// 不用等首条消息。同一工作区已有**没动过的**空会话（占位标题、无用量快照）
     /// 时直接复用，避免连点堆出一排空会话。
     /// 回滚成空的旧对话不算：标题还是原来的、用量快照也在，复用它会让「新建对话」
-    /// 落回原对话（2026-11-07 用户实报「标题还是一开始的」）。
+    /// 落回原对话（标题还是一开始的）。
     pub fn create_empty(&self, workspace: &str, title: &str) -> anyhow::Result<SessionFile> {
         if let Some(f) = self
             .list()
@@ -1006,7 +1006,7 @@ mod tests {
         assert_ne!(f4.id, f.id, "有消息的会话不该被复用");
     }
 
-    /// 2026-11-07 用户实报：回滚成空的旧对话不能被「新建对话」复用——
+    /// 回滚成空的旧对话不能被「新建对话」复用——
     /// 复用会让标题还是一开始的，圆环被清零但会话根本没换。
     #[test]
     fn create_empty_does_not_reuse_rolled_back_session() {

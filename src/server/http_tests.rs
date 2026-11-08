@@ -257,7 +257,7 @@ async fn post_json(app: &Router, uri: &str, body: Value) -> (StatusCode, Value) 
     (status, v)
 }
 
-/// 截断后圆环立即重算（2026-11-07 用户拍板）：回滚/编辑/删除把上下文变小了，
+/// 截断后圆环立即重算：回滚/编辑/删除把上下文变小了，
 /// 必须立刻按当前请求视图重估并广播——否则圆环挂着旧值，直到下一轮实报回来
 /// 「跳变」，用户会把跳变误读成压缩（真机：回滚到压缩边界之前，原文全量回归
 /// 约 16.8 万，圆环却还停在压缩完成时的 4.4 万）。
@@ -312,7 +312,7 @@ async fn truncate_refreshes_context_usage_ring() {
     assert!(projected < 50_000, "回滚后上下文变小，重估不得高于截断前: {ev}");
     // 校准偏差必须保留：旧快照实报 50_000、本地估价合计 59_000（偏差 -9_000），
     // 新 projected = 新构成合计 - 9_000。直接拿构成合计当 projected 会让删消息后
-    // 圆环不降反升（2026-11-07 用户实报）。
+    // 圆环不降反升。
     let raw: u64 = ["messages", "tools", "system", "other", "tools_schema"]
         .iter()
         .map(|k| cu["breakdown"][k].as_u64().unwrap_or(0))

@@ -29,14 +29,14 @@
   export let sandboxProbeBusy = false;
   export let runSandboxProbe = () => {};
   export let sandboxProbeTip = () => '';
-  // 用户 2026-11-03：「新建插件」直接开插件制作器弹窗（App 侧找 plugin-maker 并 openExt）
+  // 「新建插件」直接开插件制作器弹窗（App 侧找 plugin-maker 并 openExt）
   export let openMaker = () => {};
 </script>
 
 {#if tab === 'ext'}
   {#if extMsg}<div class="mcp-cmd">{extMsg}</div>{/if}
 
-  <!-- 用户 2026-10-05：「新建插件」与技能/MCP 同款——表单默认收起，点开才占地方 -->
+  <!-- 「新建插件」与技能/MCP 同款——表单默认收起，点开才占地方 -->
   <div class="sub-row">
     <button class="btn primary" on:click={openMaker}>新建插件</button>
     <button class="btn" on:click={() => loadExt()}>刷新</button>
@@ -134,7 +134,7 @@
       {#if gitRuntime && gitRuntime.ok}
         <div class="plug-desc">{gitSourceLabel(gitRuntime.source)}{gitRuntime.version ? ' ' + gitRuntime.version : ''} · {gitRuntime.path}</div>
       {:else if gitRuntime}
-        <!-- 用户 2026-11-03：检测不到就一句话，用户自己决定装不装 -->
+        <!-- 检测不到就一句话，用户自己决定装不装 -->
         <div class="plug-desc warn-text">git缺失 建议安装</div>
       {:else}
         <div class="plug-desc">读取中…</div>

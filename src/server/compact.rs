@@ -136,7 +136,7 @@ pub(super) fn maybe_start(state: &AppState, t: CompactTrigger) -> bool {
         );
         crate::gateway::replay::should_preserve_replay(&primary.model, &compat)
     };
-    // 守卫（用户拍板）：压完还 ≥ 线的 80% → 白压（很快又撞线），交给用户把控节奏。
+    // 守卫：压完还 ≥ 线的 80% → 白压（很快又撞线），交给用户把控节奏。
     // 工具定义等固定开销压不掉，是这条线的一部分——小窗口+重工具时守卫会偏保守，
     // 想压得更勤可以把线调高（线的 80% 高于固定底座后守卫自然放行）。
     // 尾段先过发送侧同一套卫生（重复结果去重+超大结果截断）：病理性的超大工具

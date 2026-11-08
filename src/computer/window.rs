@@ -197,7 +197,7 @@ pub fn foreground_title() -> Option<String> {
 }
 
 /// 找快捷方式的四个去处：桌面（用户/公共）+ 开始菜单（用户/全局）。
-/// 用户 2026-11-02：开应用不该再让模型先 dir 一遍这些目录。
+/// 开应用不该再让模型先 dir 一遍这些目录。
 fn app_search_dirs() -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     for key in ["USERPROFILE", "PUBLIC"] {

@@ -307,7 +307,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
             )
                 .into_response();
         }
-        // 027 + 2026-10-22 分家；「立即发送」2026-11-07 改语义（用户拍板）：
+        // 027 + 2026-10-22 分家；「立即发送」2026-11-07 改语义：
         // 缺省 = 排队（这一轮跑完自动接着发）；
         // steer=true = 引导（并入本轮，不打断，模型下一个决策点看到）；
         // interrupt=true = 立即发送 = **停掉正在跑的这一轮，这条消息作为新一轮发出**
@@ -403,7 +403,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
         } else {
             let _ = stx.send(Ok(json_event(json!({ "session": session_id.clone() }))));
             if mode == SteerMode::Interrupt {
-                // 「立即发送」= 停轮重启：回执**纯静默**（用户拍板「什么都不用显示」）。
+                // 「立即发送」= 停轮重启：回执**纯静默**（「什么都不用显示」）。
                 // 不发 notice（前端会显示成 [通知] 气泡）、不发 done（会误摘正在跑那轮
                 // 的流登记）。这条 SSE 只是给前端的 deliver 一个正常结束的响应；
                 // 界面上的变化全由被停那轮的 restarted + 紧接着的 turn 事件驱动。
@@ -472,7 +472,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
     // 审计 07：SSE 断线感知——send 失败即对端没了（关网页/断网/刷新）。
     // cancel_on_disconnect 开 → 看门狗先给宽限，真走了才取消本轮；关（默认）→ 任务跑完。
     // 刷新豁免：刷新也会断开 SSE，但页面几秒后就回来认领（/api/chat/revive），
-    // 宽限期内认领了就不取消（2026-11-07 用户实锤「刷新把在跑的任务终止了」）。
+    // 宽限期内认领了就不取消（刷新不能把在跑的任务终止）。
     const RELOAD_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
     let peer_gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // 任务结束标志（看门狗退出用；None = 本功能关着）。2026-10-08 修（M2）：

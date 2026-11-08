@@ -11,10 +11,10 @@
   // 列表数据(skills)与加载(loadSkills)在 App 侧:能力菜单共用;保存/删除/启停后回酒刷新
 
   let skillMsg = '';
-  // 操作/删除类提示只在本页停留期间有效，下次进入本页（切页签/重开设置）就清（用户 2026-11-03）
+  // 操作/删除类提示只在本页停留期间有效，下次进入本页（切页签/重开设置）就清
   $: if (tab === 'skills') skillMsg = '';
   let skillEditor = null; // { isNew, name, description, content, source }
-  // 用户 2026-10-02：新建输入框不再预填模板（正文自己写；name/description 由保存时回填校验）
+  // 新建输入框不再预填模板（正文自己写；name/description 由保存时回填校验）
   // 新建默认走全局（保存位置由后端定：无同名已存在技能 → ~/.pawch-agent/skills/）
   function newSkill() {
     skillEditor = { isNew: true, name: '', description: '', content: '', source: 'global' };
@@ -93,10 +93,10 @@
           <button class="btn" on:click={() => dispatch('reload')}>刷新</button>
           {#if skillMsg}<span class="hint">{skillMsg}</span>{/if}
         </div>
-        <!-- 用户 2026-10-02：编辑器开着时不出现下方技能列表（编辑态只留编辑器） -->
+        <!-- 编辑器开着时不出现下方技能列表（编辑态只留编辑器） -->
         {#if skillEditor}
           <div class="field">
-            <!-- 用户 2026-10-02：技能统一归全局（保存时项目级旧副本自动搬走），标签直说全局 -->
+            <!-- 技能统一归全局（保存时项目级旧副本自动搬走），标签直说全局 -->
             <label>{skillEditor.isNew ? '新建技能' : `编辑技能：${skillEditor.name}`}（全局技能）</label>
             <div class="sub-row">
               <!-- 2026-10-08 修：已存在技能的名字一律禁改。原条件只禁全局技能的改名、

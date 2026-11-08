@@ -50,7 +50,7 @@ const CTL_ADDR: (&str, u16) = ("127.0.0.1", 9225);
 const GUARD_PORT: u16 = 9224;
 /// child webview 弹窗防护：window.open 直接掐掉（on_new_window 再兜一层）
 const POPUP_GUARD_JS: &str = "window.open = function () { return null; };";
-/// 网页面板滚动条跟随应用主题（2026-11-08 用户实锤：浅色模式下深色页面/未声明
+/// 网页面板滚动条跟随应用主题（浅色模式下深色页面/未声明
 /// color-scheme 的页面把滚动条画成深色，跟浅色面板不搭）。首选色系（prefers-color-
 /// scheme）跟着窗口主题走、窗口主题跟应用主题走，所以这里监听它切换即可：
 /// 浅色 = 注入一套浅色滚动条样式（!important 压过页面自带的深色滚动条），
@@ -628,7 +628,7 @@ fn dispatch(app: &tauri::AppHandle, op: &Value) {
                 .initialization_script(SCROLLBAR_THEME_JS)
                 .on_new_window(|_url, _features| tauri::webview::NewWindowResponse::Deny);
             // 空白页（about:blank/未落地的页面）画布色跟主题走，别让系统深色把
-            // 浅色主题的网页面板衬出一块黑（2026-11-07 用户实锤）
+            // 浅色主题的网页面板衬出一块黑
             let bg = op_bg(op);
             if let Some(c) = bg {
                 builder = builder.background_color(c);

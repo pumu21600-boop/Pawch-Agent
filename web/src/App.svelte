@@ -127,7 +127,7 @@
   // —— 模型快选（输入栏）——
   let modelMenuOpen = false;
   let menuExpandedCfg = ''; // 模型快选菜单里展开的配置组（默认展开当前配置）
-  // —— 加号菜单（用户 2026-10-02 改版：只剩 @ 与 / 两个入口）——
+  // —— 加号菜单（只剩 @ 与 / 两个入口）——
   // @ = 上下文（对话 + 文件，见 openCtxPicker）；/ = 能力（模板 + 技能 + MCP/插件工具，
   // 一个菜单分组列出，$ 技能菜单并进来不再单列）
   let plusMenuOpen = false;
@@ -200,7 +200,7 @@
     guided = { ...guided, [key]: list };
   }
 
-  // —— 消息操作（2026-10-26 用户需求批）——
+  // —— 消息操作 ——
   // 回滚/删除共用服务端截断端点（/api/sessions/truncate，按文件里第 N 条 user 消息定位）；
   // 编辑=停流→回滚到该消息之前→以新文本重发；多选用于批量删除与生成上下文摘录。
   let editingMsg = null; // { id, text } 正在编辑的用户消息
@@ -652,7 +652,7 @@
       restoreUsage('@new');
       await loadSettings();
       await loadSessions(true);
-      // 手风琴（用户 2026-10-07）：切过来的项目独占展开态，其余工作区的对话
+      // 手风琴：切过来的项目独占展开态，其余工作区的对话
       // 列表一并收起——侧栏同时只显示当前项目的会话
       expandedFlags = workspace ? { [workspace]: true } : {};
       localStorage.setItem('projExpanded', JSON.stringify(expandedFlags));
@@ -691,7 +691,7 @@
     // 拖拽中用户也不看消息区，停手后下一次 flush 自然补上滚动位置与微调标记。
     const dragging = resizing || rpResizing || termResizing;
     // compactScrollHold：压缩标记出现/落定这类更新不钉底——标记只是背景工作的痕迹，
-    // 为它把正在看的视口往上推一截，看起来就是「对话区弹一下」（2026-11-08 用户实拍）
+    // 为它把正在看的视口往上推一截，看起来就是「对话区弹一下」
     if (!dragging && chatPinned && !compactScrollHold && chatBody) chatBody.scrollTop = chatBody.scrollHeight;
     // 单元素微调标记：Svelte 重渲染会重建节点，这里按存下的路径补盖 data-mt
     if (!dragging) stampMicroUids();
@@ -776,39 +776,49 @@
   // 最高档：橙渐变层亮起（非最高档纯品牌橙填充，ZCode 结构）
   $: thinkMax = !!(thinkLevels && thinkLevels.length > 1 && thinkLevelIdx === thinkLevels.length - 1);
   // 粒子速度随档位升高而加快：最低档 2.5x 基准时长，最高档 1x。
-  // 基准再整体提速 1/4（用户同日「整体再稍微快点」）：BUBBLE_SPEED 缩放基准时长
-  const BUBBLE_SPEED = 0.75;
+  // 2026-11-08 二次提速（「整体提高流速」）：BUBBLE_SPEED 0.75→0.5，基准时长也一并压短
+  const BUBBLE_SPEED = 0.5;
   $: bubbleSpeedMult = 1 + 1.5 * (1 - thinkProgress / 100);
-  // 粒子参数表：固定种子错峰流动（自右向左，透明度 0→0.4→0）。
-  // 全档显示（ZCode 只在最高档有），实际时长乘 bubbleSpeedMult 随档位加速
-  const EFFORT_BUBBLES = [
-    { top: 4, size: 2, duration: 2.6, delay: -0.4 },
-    { top: 14, size: 3, duration: 3.2, delay: -2.1 },
-    { top: 8, size: 4, duration: 2.8, delay: -1.1 },
-    { top: 18, size: 2, duration: 3.6, delay: -0.8 },
-    { top: 3, size: 3, duration: 3, delay: -2.5 },
-    { top: 12, size: 2, duration: 3.4, delay: -1.7 },
-    { top: 6, size: 3, duration: 3.1, delay: -0.9 },
-    { top: 17, size: 4, duration: 2.9, delay: -2.3 },
-    { top: 10, size: 2, duration: 3.5, delay: -0.2 },
-    { top: 2, size: 2, duration: 2.7, delay: -1.8 },
-    { top: 15, size: 3, duration: 3.3, delay: -1.2 },
-    { top: 7, size: 4, duration: 3.6, delay: -3.1 },
-  ];
-  // 档点悬停：原生 range 盖住圆点，按坐标反馈（±10px 内点亮，ZCode 同款）
-  let tsHoverIdx = null;
-  function tsHoverMove(e) {
-    const n = thinkLevels ? thinkLevels.length : 0;
-    const rect = e.currentTarget.getBoundingClientRect();
-    const trackWidth = rect.width - 28;
-    if (n < 2 || trackWidth <= 0) {
-      tsHoverIdx = null;
-      return;
-    }
-    const idx = Math.min(Math.max(Math.round(((e.clientX - rect.left - 14) / trackWidth) * (n - 1)), 0), n - 1);
-    const center = rect.left + 14 + (trackWidth * idx) / (n - 1);
-    tsHoverIdx = Math.abs(e.clientX - center) <= 10 ? idx : null;
-  }
+  // 粒子参数表：固定种子错峰流动（自右向左，透明度 0→0.55→0）。
+  // 全档显示（ZCode 只在最高档有），实际时长乘 bubbleSpeedMult 随档位加速。
+  // 2026-11-08 三轮重排：12→40→140→238 颗（用户「还是太少了」「再加大密度」），
+  // 约七成是 1px 细尘与 1px 高的横丝（高速下像被气流拉长的轨迹），2px 中粒维持
+  // 主体密度，3~4.5px 大泡只做点缀。形状/相位由固定种子伪随机生成，刷新不变。
+  const EFFORT_BUBBLES = (() => {
+    let seed = 20261108;
+    const rnd = () => {
+      seed = (Math.imul(seed, 1103515245) + 12345) & 0x7fffffff;
+      return seed / 0x7fffffff;
+    };
+    const grain = (n, mk) => Array.from({ length: n }, mk);
+    // 粒子色板：色相变化交给带子底（夕烧渐变），粒子回归以白为主——
+    // 亮白在深火/琥珀上都压得住，掺少量米金和一颗「白热」冷白点缀
+    const TINTS = ['#ffffff', '#ffffff', '#ffffff', '#ffffff', '#fff8e6', '#fff3d0', '#ffdf8a', '#ffd76a', '#dff2ff'];
+    const tint = () => TINTS[Math.min(TINTS.length - 1, Math.floor(rnd() * TINTS.length))];
+    return [
+      // 细尘：1px 圆点，透明度压到最低（最远的那层，铺满整条带子）
+      ...grain(128, () => ({ top: +(1.5 + rnd() * 21).toFixed(1), w: 1, h: 1, c: tint(), op: 0.3 + rnd() * 0.35, duration: 1.3 + rnd() * 0.8, delay: -rnd() * 2.2 })),
+      // 横丝：1px 高、4~10px 长，加速时读作细流线
+      ...grain(46, () => ({ top: +(3 + rnd() * 18).toFixed(1), w: +(4 + rnd() * 6).toFixed(1), h: 1, c: tint(), op: 0.28 + rnd() * 0.3, duration: 1.15 + rnd() * 0.7, delay: -rnd() * 2 })),
+      // 中粒：2px 圆点
+      ...grain(46, () => ({ top: +(3 + rnd() * 18).toFixed(1), w: 2, h: 2, c: tint(), op: 0.38 + rnd() * 0.28, duration: 1.5 + rnd() * 0.8, delay: -rnd() * 2.4 })),
+      // 大泡：3~4.5px，少量提亮层次
+      ...grain(18, () => {
+        const s = +(3 + rnd() * 1.5).toFixed(1);
+        return { top: +(5 + rnd() * 13).toFixed(1), w: s, h: s, c: tint(), op: 0.5 + rnd() * 0.24, duration: 1.8 + rnd() * 0.7, delay: -rnd() * 2.3 };
+      }),
+    ];
+  })();
+  // 粒子数量随填充宽度缩放：最低档填充只有 14px 圆头，全量塞进去会糊成一团。
+  // 按填充占比等距抽样（不是截前 N 颗——表按粒径分组排列，截取会只剩细尘）。
+  // 注意：pct 必须走参数传，Svelte 不追踪函数体内读到的响应式变量。
+  const sampleForFill = (arr, pct) => {
+    const n = Math.max(4, Math.round(arr.length * (0.05 + 0.95 * (pct / 100))));
+    if (n >= arr.length) return arr;
+    const step = arr.length / n;
+    return Array.from({ length: n }, (_, i) => arr[Math.floor(i * step)]);
+  };
+  $: effortBubbles = sampleForFill(EFFORT_BUBBLES, thinkProgress);
   // 原生 range 拖动/点选：离散步进，input 事件即落值（菜单保持展开，ZCode 面板同款）
   function thinkRangeInput(idx) {
     const l = thinkLevels && thinkLevels[idx];
@@ -933,7 +943,7 @@
       send();
       return;
     }
-    // 引用 token（/能力、@上下文）整体删除（2026-11-08 用户拍板）：光标在 token 尾部
+    // 引用 token（/能力、@上下文）整体删除：光标在 token 尾部
     // 或内部按 Backspace、头部或内部按 Delete，一次删整块（含紧随的空格）——
     // ZCode mention 同款。Ctrl+Backspace（删词）撞上 token 也走整块。
     if ((e.key === 'Backspace' || e.key === 'Delete') && !composerComposing) {
@@ -1382,7 +1392,7 @@
     if (model !== m) await sendSettings({ model: m });
   }
 
-  // —— 输入框引用高亮（2026-11-01 用户对照 ZCode：引用能力/技能后那段文字要用强调色）——
+  // —— 输入框引用高亮（引用能力/技能后那段文字要用强调色）——
   // textarea 不支持局部着色，用同字号同排版的浮层叠在上面对齐渲染：引用 token 上色，
   // 其余字符用透明色占位只为保住换行位置。**字体/行高/内边距/断词规则必须和
   // .composer-input 一字不差**，否则浮层字和输入框光标会错位。
@@ -1435,7 +1445,7 @@
     resetComposerHeight();
   }
 
-  // @ 上下文选择（用户 2026-10-02 改版：@ = 上下文，可挑**对话**加入、也可挑文件）：
+  // @ 上下文选择（@ = 上下文，可挑**对话**加入、也可挑文件）：
   // 文件走老路插 @相对路径（模型自己读）；对话走 /api/sessions/transcript 拉只读转写，
   // 发送时整块拼在消息正文后面（同 @文件「界面短引用、模型拿全文」的口径）。
   let ctxTab = 'files'; // 'conv' | 'files'
@@ -1513,7 +1523,7 @@
     if (!skillsData.length && !skillsLoading) loadSkills();
     if (!mcpServers.length && !wasmPlugins.length && !mcpLoading) loadMcp();
   }
-  // 「/」菜单分组（用户 2026-10-02 第三/四轮）：技能=自己建的非插件技能；
+  // 「/」菜单分组：技能=自己建的非插件技能；
   // 插件=**全部已启用插件**（第四轮实测「只列了那几个，全都要呀」）。
   // 点任意一行都往输入框插一个 /引用（带技能的插技能名，纯面板插件插插件标题；
   // 2026-10-02 真机实测「很多插件点了不插入输入框」后统一）——面板归右侧栏「+」菜单。
@@ -1559,7 +1569,7 @@
     return [];
   }
   // 页签列表与面板开合同一生命周期：**会话级**（sessionStorage）——刷新本页保留，重开
-  // 软件从零开始（用户 2026-10-30 复述 10-10 的决定：打开侧栏不该自己冒出任何面板）。
+  // 软件从零开始（打开侧栏不该自己冒出任何面板）。
   // 曾经存 localStorage：面板关着、页签列表却在重启后原样恢复，用户点开侧栏时
   // 「上次开着的那个面板」就成了默认值（实测：重启后点开侧栏直接是「使用统计」）。
   // 旧 localStorage 键一次性清掉，避免旧记录继续误导。
@@ -2106,13 +2116,13 @@
   $: webNative = webMode === 'shell' && inTauriShell();
   /// 浏览器面板宿主模式：活跃会话的 mode 是权威；**没有活跃会话**时 state 里的
   /// mode:"headless" 只是空态默认值——壳里下一次启动仍会是 shell（ctl 连着），
-  /// 按无头渲染会让「⋯」菜单丢掉「开发者工具」项（2026-11-08 用户实锤）。
+  /// 按无头渲染会让「⋯」菜单丢掉「开发者工具」项。
   function resolveWebMode(s) {
     const mode = s.mode || 'headless';
     if (mode === 'headless' && s.running === false && inTauriShell()) return 'shell';
     return mode;
   }
-  // 壳 webview 弹窗让位（2026-10-31 用户给 ZCode 截图对照：「有弹窗的时候浏览器画面也在」）：
+  // 壳 webview 弹窗让位（有弹窗时浏览器画面也要在）：
   // 壳里 child webview 是原生窗口，弹窗（DOM）永远盖不住它。做法：弹窗打开时服务端把
   // webview **移出屏幕外保活渲染**（visible 不关——IsVisible=false 会暂停渲染），
   // 前端切到帧流模式（弹窗态 50ms 一帧，约 20fps），画面实时垫在弹窗下；弹窗关闭立即
@@ -2503,7 +2513,7 @@
     if (!webActive || rpTab !== 'web') return;
     // 拖右面板手柄期间：**壳模式照常同步**（那只是把矩形经控制通道发过去挪 child
     // webview，一个本地写，很便宜）。2026-10-07 曾为治「拖侧栏巨卡」整段 return，
-    // 结果壳里网页整个拖拽过程都不跟手、松手才跳一下——用户 2026-10-30 复述
+    // 结果壳里网页整个拖拽过程都不跟手、松手才跳一下——
     // 「调宽不丝滑、画面和实际宽度一直不同步」，就是这条让路挡的。
     // 真正贵的是**截图流**（无头模式：每发一次视口就触发一次 <img> 重载 + CDP
     // 往返），所以只让无头模式让路；截图刷新（webShotT）在拖动期也一起压掉。
@@ -2917,7 +2927,7 @@
     activateRpTab(key);
   }
   // —— 文件预览标签：文本可编辑保存；文档类（docx/xlsx/pptx/pdf）只能预览不能编辑，
-  // xlsx/pptx/pdf 连预览组件也不留、内容直出（用户 2026-10-03）——
+  // xlsx/pptx/pdf 连预览组件也不留、内容直出——
   const RP_IMG_EXT = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico', 'avif']);
   const RP_PDF_EXT = new Set(['pdf']);
   const RP_MEDIA_EXT = new Set(['mp4', 'm4v', 'webm', 'mov', 'mp3', 'wav', 'ogg', 'm4a', 'flac']);
@@ -3150,7 +3160,7 @@
         commitErr = r.error || '提交失败';
         return;
       }
-      // 用户 2026-10-07：提交成功不再往聊天区塞「已提交 xxx」提示——面板状态行自己会变
+      // 提交成功不再往聊天区塞「已提交 xxx」提示——面板状态行自己会变
       commitBusy = false;
       commitMsg = '';
       commitErr = '';
@@ -3351,7 +3361,7 @@
     e.preventDefault();
     // 兜底一提前：目标元素自己有语义类名（md 表格行/单元格、代码块内部行……）就永远
     // 选它自己——旧顺序是 3 层内的登记容器先抢（点表格 td 被外层 .rp-body 拿走），
-    // 报修一个登记一个永远修不完（2026-11-03 用户「估计还有其他的，我不知道原因」实测）
+    // 报修一个登记一个永远修不完
     const auto0 = autoClassTarget(target);
     if (auto0) {
       openMicroPanel(e.clientX, e.clientY, auto0.name, auto0.sel, auto0.el);
@@ -3423,15 +3433,14 @@
     'group-head', 'wp-pick', 'css-injector', 'micro-readonly', 'content', 'user', 'assistant',
     'boxed', 'left', 'right', 'center', 'small', 'large', 'selected', 'checked', 'risk-0', 'risk-1', 'risk-2',
     // md-* 里只有微调无意义的排除（横线/图片自己有面板兜底），其余都是合法可调目标——
-    // 上一轮全量豁免 md-*，长按行内代码 .md-code 被迫回退到 .md-p（2026-11-03 用户二轮实测）
+    // 上一轮全量豁免 md-*，长按行内代码 .md-code 被迫回退到 .md-p
     'md-hr', 'md-img',
   ]);
   function autoClassTarget(el) {
     // 只认被点元素自己的类名（不再向上爬）：上一层是登记容器时不能反过来抢，
     // 上两层爬上去会把「点 A 选 B」的老毛病换个姿势带回来。没类名就交给登记表/结构兜底。
     // svelte-xxxx 必须一起滤掉：它带连字符，会被「优先带连字符的类」选中，
-    // 选择器就变成整个组件的作用域类（长按按钮选中 svelte-1a2xagz，调了等于没调，
-    // 2026-11-03 用户「设置里的按钮还是不行」实测）。
+    // 选择器就变成整个组件的作用域类（长按按钮选中 svelte-1a2xagz，调了等于没调）。
     // 状态类（primary/active 等）不当锚点，但保留作限定：选择器写成 .btn.primary——
     // 「同类全部」才不会把渐变底泼到 ghost/danger 兄弟身上（2026-11-04 默认改同类全部后的配套收口）
     const raw = typeof el.className === 'string' ? el.className : '';
@@ -4809,7 +4818,7 @@
     if (controller) controller.abort();
   }
 
-  // —— 消息操作（回滚/编辑/删除/多选，2026-10-26 用户需求批）——
+  // —— 消息操作（回滚/编辑/删除/多选）——
   function fmtTs(ts) {
     if (!ts) return '';
     const d = new Date(ts);
@@ -5430,7 +5439,7 @@
       syncCur();
       restoreUsage(id); // 从按会话账本恢复（跑完的会话不重发事件，不恢复就显示 0）
       // 空会话（回滚/删除成空）与「新建对话」同口径：没有消息就没有圆环占用。
-      // 服务端新回滚会广播 projected=0；这里再兜住旧快照留下的固定底（2026-11-07 用户拍板）
+      // 服务端新回滚会广播 projected=0；这里再兜住旧快照留下的固定底
       if (!(r.messages || []).length) {
         const prevU = usageBySession[id];
         const win = ctxWindow || (prevU ? prevU.ctx.window : ctxUsage.window) || 0;
@@ -5897,7 +5906,7 @@
 
   /** 「历史会话（同名文件夹）」组：这些是以前同名文件夹留下的旧会话。
    *  删除要做成真删会话文件——它不是项目，走「删除项目」只会删一个不存在的路径，
-   *  就是用户实报「一直删不掉」的根因。 */
+   *  就是「一直删不掉」的根因。 */
   async function clearLegacySessions() {
     const ids = legacySessions.map((s) => s.id);
     if (!ids.length) return;
@@ -6065,7 +6074,7 @@
     );
   }
 
-  // 待审批的执行询问：浮在输入框上方，不占对话流（用户 2026-11-03）；
+  // 待审批的执行询问：浮在输入框上方，不占对话流；
   // 决定后记录由 attachApprovalToToolPart 挂回时间线的工具卡
   $: pendingApprovals = (messages || [])
     .filter((m) => m.approval && m.approval.decided === null)
@@ -6275,7 +6284,7 @@
   }
 
   // 操作/删除类提示只在本页停留期间有效：下次进入该页（切页签或重开设置）就清掉，
-  // 不许旧通知挂在页首过夜（用户 2026-11-03 统一口径，技能/MCP/定时/数据页同理）
+  // 不许旧通知挂在页首过夜（技能/MCP/定时/数据页同理）
   $: if (settingsOpen && settingsTab === 'ext') extMsg = '';
   $: if (settingsOpen || settingsTab) settingsMsg = '';
 
@@ -6301,7 +6310,7 @@
   // git 运行时状态（插件分区顶部卡片）：系统装的 / 内置包解压的 / 不可用
   let gitRuntime = null;
   // 021：沙箱自检（真拉起受限进程跑探针套件）——结果由沙箱插件的 action.run 桥拉走；
-  // 插件页沙箱行的「检测」按钮也走这里（插件页不再给沙箱面板，用户 2026-10-03）
+  // 插件页沙箱行的「检测」按钮也走这里（插件页不再给沙箱面板）
   let sandboxProbe = null;
   let sandboxProbeBusy = false;
   // 021：应用版本（插件页信息行用；侧栏底部不再显示版本号）
@@ -6414,7 +6423,7 @@
   function menuExtIcon(name) {
     return EXT_ICONS[name] || EXT_ICON_FALLBACK;
   }
-  // 侧栏标签的内置类型图标（插件标签用各自己的，见 rpTabIcon）——文字左边要有对应符号（用户 2026-10-03）
+  // 侧栏标签的内置类型图标（插件标签用各自己的，见 rpTabIcon）——文字左边要有对应符号
   const RP_TAB_ICONS = {
     artifacts:
       '<path d="M21 8.2 12 3.4 3 8.2v7.6l9 4.8 9-4.8z"/><path d="M3 8.2l9 4.8 9-4.8"/><path d="M12 13v7.6"/>',
@@ -6539,7 +6548,7 @@
         if (['dark', 'light', 'system'].includes(m.mode)) applyThemeMode(m.mode);
       },
     },
-    // 壁纸（2026-10-04 用户真机反馈「帮我改壁纸」agent 说没通道——能力审计漏项，
+    // 壁纸（agent 说没通道——能力审计漏项，
     // 与主题同族补上；持久但可逆所以 normal 档，read-only/auto 会问、完全访问直放）
     wallpaper: {
       kind: 'wallpaper', title: '设置/清除应用壁纸', risk: 'normal', internal: false,
@@ -7004,7 +7013,7 @@
       },
     },
     // 各模型历史占比（面板中间的圆环）：全量台账按模型聚合，**不带 session**——
-    // 与上面「本次对话」是两个口径，同一页并排对照（用户 2026-11-01 要求）。
+    // 与上面「本次对话」是两个口径，同一页并排对照。
     'usage.models': {
       bridge: true, title: '读各模型历史用量占比',
       async run({ reply, get }) {
@@ -7106,7 +7115,7 @@
         if (params.roles && typeof params.roles === 'object') {
           // 白名单必须与 RolesSettings 的字段一一对应（summary/vision/video/audio/
           // embedding/budget/subagent）——漏一个键，插件每存一次就静默抹掉那条路由
-          // （真机验收时漏了多模态三个，用户 settings.json 里的 vision 被冲掉，实测）。
+          // （真机验收时漏了多模态三个，settings.json 里的 vision 被冲掉，实测）。
           // PUT /api/settings 对 roles 是全量替换，所以这里先把现有 roles 合进来再发。
           const allow = ['summary', 'vision', 'video', 'audio', 'embedding', 'budget', 'subagent'];
           const next = { ...roles };
@@ -7519,7 +7528,7 @@
   // 面板打开时待投递的插槽事件（iframe 还没 load 完就先排队）
   let extPendingMsgs = [];
 
-  // 用户 2026-11-03：「新建插件」不再就地建空壳，直接开插件制作器的弹窗——
+  // 「新建插件」不再就地建空壳，直接开插件制作器的弹窗——
   // 要求写清楚、选工作区、确定就落进新对话。制作器插件不在列表里（被删/老包）才退回旧表单。
   function openMaker() {
     const maker = [...builtInExts, ...thirdPartyExts].find((e) => e.name === 'plugin-maker');
@@ -7687,7 +7696,7 @@
     }
   }
 
-  // 用户 2026-10-05：插件页「新建插件」——和技能/MCP 同款，表单默认收起。创建只是在
+  // 插件页「新建插件」——和技能/MCP 同款，表单默认收起。创建只是在
   // 工作区 plugins/ 下生成脚手架（manifest + index.html），不等于放行：新插件出现在
   // 第三方分组，仍要走既有「审核/信任」链路才加载
   let extCreateOpen = false;
@@ -7786,7 +7795,7 @@
   const LIVE_STASH_KEY = 'pawchLiveStash';
   /// 刷新认领标记：sessionStorage 跨刷新保留、关页签即清——正好区分「刷新」与
   /// 「关页面」。断线取消开着时，刷新会断开 SSE；新页面在 30 秒宽限内凭它认领，
-  /// 本轮继续跑（2026-11-07 用户实锤「刷新把在跑的任务终止了」）。
+  /// 本轮继续跑（刷新不能把在跑的任务终止）。
   const LIVE_SID_KEY = 'pawchLiveSid';
   function reviveAfterReload() {
     try {
@@ -7934,7 +7943,7 @@
   function setCurSession(id, skipComposer = false) {
     const prev = currentSessionId || '@new';
     const next = id || '@new';
-    // 子代理回看面板按对话归属：切走就收，不跨对话常驻（用户 2026-11-07）
+    // 子代理回看面板按对话归属：切走就收，不跨对话常驻
     if (prev !== next) subagentPanelOpen = false;
     if (!skipComposer && prev !== next) {
       persistComposer(prev);
@@ -8508,7 +8517,7 @@
               {/if}
               <!-- 过程（思考 + 工具）与正文按真实发生顺序渲染：连续的过程合成一个可展开块，
                    正文把前后过程隔开。多步任务就是「过程 → 说明 → 过程 → 最终回答」。
-                   流式期间过程默认展开；收尾后默认收起，只留总结与结尾语（用户 2026-10-02）。 -->
+                   流式期间过程默认展开；收尾后默认收起，只留总结与结尾语。 -->
               {#each buildMessageBlocks(messageParts(m), m.streaming) as b, bi}
                 {@const pk = `${m.id}:${bi}`}
                 {@const open = processOpenMap[pk] !== undefined ? processOpenMap[pk] : !!m.streaming}
@@ -8668,7 +8677,7 @@
               {#if m.ts}<span class="msg-ts">{fmtTs(m.ts)}</span>{/if}
               {#if m.stats && !m.streaming}
                 <!-- 信息卡入口：首 token 延迟/输出耗时/渠道/模型/tokens/缓存命中。
-                     放回答下方右下角（用户 2026-10-27 点名布局） -->
+                     放回答下方右下角 -->
                 <span class="msg-acts" on:click|stopPropagation>
                   <button class="msg-act" title="这条回复的详细信息" aria-label="回答详情" on:click|stopPropagation={() => (statsModal = m)}>
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><path d="M12 8h.01"/></svg>
@@ -8748,7 +8757,7 @@
         </div>
       {/if}
       <!-- 操作电脑实时条（第 4 轮；同子代理纪律：主区、输入框上方、不落侧边栏）。
-           常驻：出现后一直显示，切会话或点 × 才消失（用户 2026-11-05 校正：不是
+           常驻：出现后一直显示，切会话或点 × 才消失（不是
            「最后一次动作过几秒就收起」）。有任务清单时多让一点距离，别贴在清单卡片上。 -->
       {#if computerOnUi && computerHint}
         <div class="computer-strip" class:with-todo={todoDockVisible}>
@@ -8914,7 +8923,7 @@
             {/each}
           </div>
         {/if}
-        <!-- 引用高亮（2026-11-01 用户对照 ZCode）：textarea 没法给部分文字上色，叠一层
+        <!-- 引用高亮：textarea 没法给部分文字上色，叠一层
              同字号同排版的浮层，只把 /能力、@文件 这些引用画成强调色；其余字符透明，
              纯为对齐换行。textarea 的文字照旧显示（浮层在上，视觉上正好盖住同款字形），
              这样浮层即使有亚像素偏差也只是轻微描边，不会出现"字没了"。 -->
@@ -8956,7 +8965,7 @@
                 </div>
               {/if}
               {#if abilityMenuOpen}
-                <!-- 用户 2026-10-02 第五轮实测：①三类平铺，插件全列、不许展开；
+                <!-- ①三类平铺，插件全列、不许展开；
                      ②引用前缀统一用「/」（技能/MCP/插件都 /，不再用 $） -->
                 <div class="bar-dropdown">
                   <div class="bar-group">技能</div>
@@ -9203,24 +9212,26 @@
                             >
                               {#key thinkLevelIdx}
                                 <div class="ts-bubbles">
-                                  {#each EFFORT_BUBBLES as b}
+                                  {#each effortBubbles as b}
                                     <span
                                       class="ts-bubble"
                                       style:top={`${b.top}px`}
                                       style:animation-duration={`${(b.duration * BUBBLE_SPEED * bubbleSpeedMult).toFixed(2)}s`}
-                                      style:animation-delay={`${b.delay}s`}
+                                      style:animation-delay={`${b.delay.toFixed(2)}s`}
                                     >
-                                      <span class="ts-bubble-dot" style:width={`${b.size}px`} style:height={`${b.size}px`}></span>
+                                      <span
+                                        class="ts-bubble-dot"
+                                        style:width={`${b.w}px`}
+                                        style:height={`${b.h}px`}
+                                        style:opacity={b.op}
+                                        style:color={b.c}
+                                      ></span>
                                     </span>
                                   {/each}
                                 </div>
+                                <!-- 掉落火花 2026-11-08 试装后按用户要求撤掉（效果见提交 3f1f1f5） -->
                               {/key}
                             </div>
-                          </div>
-                          <div class="ts-stops">
-                            {#each thinkLevels as lv, i}
-                              <span class="ts-stop" class:filled={i <= thinkLevelIdx} class:hovered={tsHoverIdx === i}></span>
-                            {/each}
                           </div>
                           <div class="ts-thumb" style:left={`calc((100% - 28px) * ${thinkProgress / 100})`}></div>
                         </div>
@@ -9233,8 +9244,6 @@
                           value={thinkLevelIdx}
                           aria-label="思考强度"
                           on:input={(e) => thinkRangeInput(+e.target.value)}
-                          on:pointermove={tsHoverMove}
-                          on:pointerleave={() => (tsHoverIdx = null)}
                         />
                       </div>
                     </div>
@@ -9686,7 +9695,7 @@
                 {/each}
                 </div>
                 {#if webStripBar}
-                  <!-- 溢出滑杆：压在 .web-tabbar 下边框线上，同右侧标签页那条（用户 2026-10-31） -->
+                  <!-- 溢出滑杆：压在 .web-tabbar 下边框线上，同右侧标签页那条 -->
                   <i
                     class="web-strip-track"
                     style="width:{webStripBar.track}px"
@@ -10096,7 +10105,7 @@
             <div class="trace-empty">加载中…</div>
           {:else}
             {#each ctxSessions.filter((s) => !ctxQuery || (s.title || '').toLowerCase().includes(ctxQuery.toLowerCase())) as s (s.id)}
-              <!-- 用户 2026-10-02 第五轮：上下两行结构（标题上、时间下）——行内 flex
+              <!-- 上下两行结构（标题上、时间下）——行内 flex
                    挤压问题反复踩，改成块级堆叠最稳，标题超长省略 -->
               <button class="ctx-file ctx-file-conv" on:click={() => pickCtxSession(s)}>
                 <span class="ctx-conv-title">{s.title || s.id}</span>
@@ -10196,7 +10205,7 @@
           <div class="folders-row">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M3.5 7.2c0-1 .8-1.7 1.7-1.7h4l1.9 2.2h8.2c1 0 1.7.8 1.7 1.7v8.4c0 1-.8 1.7-1.7 1.7H5.2c-1 0-1.7-.8-1.7-1.7Z"/><path d="M3.5 10.5h17"/></svg>
             <div class="folders-info">
-              <!-- 统一叫「副目录」（用户 2026-11-07）：不加编号不加盘符；具体路径在下一行 -->
+              <!-- 统一叫「副目录」：不加编号不加盘符；具体路径在下一行 -->
               <b>副目录</b>
               <div class="folders-path">{f}</div>
             </div>
@@ -12615,7 +12624,7 @@
     align-items: center;
     gap: 8px;
   }
-  /* —— 消息操作/边缘时间/多选/信息卡（2026-10-26 用户需求批）——
+  /* —— 消息操作/边缘时间/多选/信息卡 ——
      2026-10-27 布局重排：操作条从消息左侧/右侧挪到消息下方一行；时间贴行边，
      功能图标贴另一边。用户消息右对齐时时间仍在整行最左（视觉上是一条时间轴），
      模型回答的「回答详情」则落右下角。 */
@@ -12637,7 +12646,7 @@
     min-height: 18px;
     margin-top: 2px;
   }
-  /* 用户消息的时间贴着编辑操作组，放它们左边（用户 2026-10-30）；
+  /* 用户消息的时间贴着编辑操作组，放它们左边；
      助手消息保持时间在行左、详情在行右。 */
   .msg-meta.user-meta {
     justify-content: flex-end;
@@ -12838,7 +12847,7 @@
   }
   /* 压缩标记行作为最后一条时（.tail，移出分块单独渲染）：零高度浮在底部留白区，
      不占滚动高度——标记出现/落定曾把 scrollHeight 撑高，钉底跟随与 3s 运行态轮询
-     补滚把对话区往上顶一截（2026-11-08 用户实拍「压缩前会往上弹」）。
+     补滚把对话区往上顶一截（压缩前会往上弹）。
      之后变成历史（后面来了新消息）就回到块内按普通行高占位。 */
   .compact-divider.tail {
     height: 0;
@@ -13016,7 +13025,7 @@
     font-size: 10.5px;
   }
   /* 流式期间封顶 240px（不随吐字跳变）；读完后超长封顶 280。
-     开始没多少字时就是内容高度——攒到一定量才固定并滚动（用户 2026-10-01） */
+     开始没多少字时就是内容高度——攒到一定量才固定并滚动 */
   .think-text {
     padding: 1px 0 2px 12px;
     border-left: 2px solid var(--g3);
@@ -14641,11 +14650,15 @@
     color: var(--g7);
   }
   /* —— 档位滑杆：结构/动效自 ZCode ComposerModelMenu + composer-thought-slider.css 复刻 ——
-     几何：滑块块 32px、轨道 24px（top 4）、圆钮 28px（行程 100%-28px）、档点 4px inset 14px；
+     几何：滑块块 32px、轨道 24px（top 4）、圆钮 28px（行程 100%-28px）；
      动效：圆钮/填充 120ms ease-out（拖动也保留——离散档位切换不跳变，ZCode 源码注释同款）、
-     渐变层 200ms 透明度、档点悬停 scale 1.75。
+     渐变层 200ms 透明度。
      2026-11-01 两处定稿偏离 ZCode：①配色跟随主色橙（非 ZCode 绿蓝）；
-     ②粒子全档流动，速度随档位升高加快（ZCode 只在最高档有气泡）。 */
+     ②粒子全档流动，速度随档位升高加快（ZCode 只在最高档有气泡）。
+     2026-11-08 三处：①去掉静止档点（首/中/尾各一颗，看着像卡住的粒子）；
+     ②粒子 12→40→140→238 颗并掺 1px 细尘/横丝；③缓入曲线+整体提速（涡轮加速感）；
+     ④填充改多色夕烧渐变；粒子回到以白为主（少量米金 + 一颗冷白点缀）。
+     掉落火花试装过一次，用户看后要求撤掉，代码已移除（要恢复看提交 3f1f1f5）。 */
   .think-panel {
     min-width: 320px;
     padding: 6px;
@@ -14709,11 +14722,14 @@
     bottom: 0;
     left: 0;
     border-radius: 999px;
-    background: var(--brand); /* 主色调橙（颜色跟随主色，不用 ZCode 的绿蓝） */
+    /* 2026-11-08「整体颜色单一」：单色橙换成夕烧四段（余烬红→陶土→琥珀→浅金）。
+       低档填充窄时只露出左段（深火），档位越高色带越完整、越亮。
+       同日「左边颜色太深」：整条左端提亮一档（深酒红→灰玫瑰，深锈→中锈） */
+    background: linear-gradient(90deg, #b05a3c 0%, #c8734a 35%, #dfa06e 68%, #f0c795 100%);
     overflow: hidden;
     transition: width 120ms ease-out;
   }
-  /* 最高档渐变层：陶土橙由深锈到亮橙（同族色相收紧，不掺白——掺白会发粉发淡）。
+  /* 最高档渐变层：再加两档色相（左端压进酒红、右端推到浅金），比基础层更亮更有层次。
      纯色与渐变无法直接插值，用常驻层透明度过渡（200ms），反向调档也不瞬切（ZCode 结构同款） */
   .ts-fill::before {
     content: '';
@@ -14722,7 +14738,7 @@
     border-radius: inherit;
     opacity: 0;
     transition: opacity 200ms ease-out;
-    background: linear-gradient(90deg, #8f5a44 0%, #ba8a78 45%, #cf9367 100%);
+    background: linear-gradient(90deg, #8f4450 0%, #b2583f 18%, #d06f45 45%, #e89a63 72%, #f8dfa8 100%);
   }
   .ts-fill.max::before {
     opacity: 1;
@@ -14736,57 +14752,31 @@
     left: 0;
     right: 0;
     opacity: 0;
-    animation: ts-bubble-flow linear infinite;
+    /* 缓入曲线=涡轮加速：进场慢、越走越快，出口甩出视线（不是匀速滑过） */
+    animation: ts-bubble-flow cubic-bezier(0.45, 0.05, 0.8, 0.6) infinite;
   }
   .ts-bubble-dot {
     display: block;
     border-radius: 50%;
-    background: #fff;
+    background: currentColor; /* 色板经 color 传进来（主白 + 暖金点缀） */
   }
+  /* 粒子在可见区间的峰值透明度：238 颗时要把细尘托起来才看得出「满」，0.55→0.62 */
   @keyframes ts-bubble-flow {
     0% {
       transform: translateX(104%);
       opacity: 0;
     }
-    15%,
-    80% {
-      opacity: 0.55;
+    12%,
+    82% {
+      opacity: 0.62;
     }
     100% {
       transform: translateX(-4%);
       opacity: 0;
     }
   }
-  /* 档点：未过=灰、已过=白 0.3、悬停放大点亮（ZCode 同款三态） */
-  .ts-stops {
-    position: absolute;
-    left: 14px;
-    right: 14px;
-    top: 0;
-    bottom: 0;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-  }
-  .ts-stop {
-    width: 4px;
-    height: 4px;
-    border-radius: 50%;
-    flex-shrink: 0;
-    background: color-mix(in srgb, var(--g7) 30%, transparent);
-    scale: 1;
-    transition:
-      scale 120ms ease-out,
-      opacity 120ms ease-out;
-  }
-  .ts-stop.filled {
-    background: #fff;
-    opacity: 0.3;
-  }
-  .ts-stop.hovered {
-    scale: 1.75;
-    opacity: 1;
-  }
+  /* 档点已移除（首/中/尾不要有点占着不动，滑杆只留流动粒子）。
+     档位位置靠填充宽度+圆钮+上方档位名表达。 */
   .ts-thumb {
     position: absolute;
     top: 2px;
@@ -14872,7 +14862,7 @@
     color: var(--g7);
     border-color: var(--g4);
   }
-  /* 对话行（用户 2026-10-02 第五轮）：块级上下两行——标题一行（超长省略），
+  /* 对话行：块级上下两行——标题一行（超长省略），
      时间一行小字。不再用行内 flex（挤压问题反复踩） */
   .ctx-file-conv {
     display: block;
@@ -15252,8 +15242,8 @@
     gap: 8px;
     min-width: 0;
   }
-  /* —— 插件页（用户 2026-09-30 指示：紧凑行——单行 + 开关，Git/沙箱并入「内置能力」，撤独立「运行状态」卡） ——
-     plug-row / switch 一族样式已下沉 ui.css 全局：技能页、MCP 页（用户 2026-10-02 要求
+  /* —— 插件页（紧凑行——单行 + 开关，Git/沙箱并入「内置能力」，撤独立「运行状态」卡） ——
+     plug-row / switch 一族样式已下沉 ui.css 全局：技能页、MCP 页（
      与插件页同形式）也在用，跨组件共用 */
 </style>
 

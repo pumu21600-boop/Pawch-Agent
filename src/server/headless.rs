@@ -370,7 +370,7 @@ pub(crate) async fn run_headless_inner(
     // 任务指定工作区：跑前切过去（会话也记到该项目下），跑完 Drop 还原全局根
     let ws_override = req.workspace.trim().to_string();
     // 子代理子会话首次落盘就通知侧栏刷新：原来子代理轮一律不推 sessions_changed，
-    // 新会话要手动刷新页面才看得见（2026-11-07 用户实报「要刷新才有」）。
+    // 新会话要手动刷新页面才看得见（要刷新才看得见）。
     let is_child = !req.parent_session.trim().is_empty();
     let child_announced = AtomicBool::new(false);
 

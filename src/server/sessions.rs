@@ -7,8 +7,8 @@ use super::workspace::{apply_workspace, canon_workspace, same_workspace};
 /// `?scope=workspace` 只返回当前工作区的会话（composer @ 上下文「选对话加入」用；
 /// 工作区比对与时间线同一把尺子 same_workspace，别在前端拿裸字符串比）。
 /// 额外带 `workspace_born`（各工作区目录的创建时间，毫秒）：会话归属按路径字符串，
-/// 同名文件夹删掉再建时旧会话会被一起翻出来（2026-11-04 用户实报「空文件夹里凭空
-/// 出现旧对话」）——前端用「会话创建时间 < 目录创建时间」把它们标成历史会话。
+/// 同名文件夹删掉再建时旧会话会被一起翻出来（清掉再建后旧对话会凭空出现）——
+/// 前端用「会话创建时间 < 目录创建时间」把它们标成历史会话。
 pub(super) async fn list_sessions(
     State(state): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -408,7 +408,7 @@ pub(super) async fn truncate_session(
     }
 }
 
-/// 截断（回滚/编辑/删除）后圆环立即重算（2026-11-07 用户拍板）。
+/// 截断（回滚/编辑/删除）后圆环立即重算。
 ///
 /// 为什么需要：圆环分子 = 渠道实报锚点 + 自锚点以来的增量，锚点是截断**前**那次
 /// 请求的实报——消息删掉后锚点已失真。不重算的话圆环会一直挂着旧值，直到下一轮
@@ -427,7 +427,7 @@ pub(super) fn refresh_ring_after_truncate(state: &AppState, id: &str) {
     let view = crate::server::compact::build_view(&f.messages, f.compact.as_ref());
     // 回滚/删除到一条消息都不剩：与「新建对话」同一把尺子——没发过请求就没有圆环占用。
     // 固定底（系统提示词 + 工具定义）只在真正发请求时才算；回退后没有任何一轮读过它们，
-    // 圆环不应留着占比（2026-11-07 用户拍板）。窗口与历史 api 统计保留。
+    // 圆环不应留着占比。窗口与历史 api 统计保留。
     if view.is_empty() {
         let mut snap = prev;
         snap.apply_context(None, 0, window, &crate::context::Breakdown::default());
@@ -464,7 +464,7 @@ pub(super) fn refresh_ring_after_truncate(state: &AppState, id: &str) {
     let new_parts = b.total();
     // 保留上一轮实报锚点的校准偏差：`projected` 是「实报 + 增量」的结果，本地估价
     // 往往偏高（system/工具定义尤其明显）。直接拿 b.total() 当新 projected 会把偏差
-    // 丢掉——删掉消息后圆环反而可能变大（2026-11-07 用户实报「回滚后圆环没有变化」）。
+    // 丢掉——删掉消息后圆环反而可能变大（回滚后圆环没有变化）。
     // 只按构成增减平移：new = old + (new_parts - old_parts)，锚点仍作废（pressure=None），
     // 下一次请求的实报再重新校准。
     let old_parts = prev.messages + prev.tools + prev.system + prev.other + prev.tools_schema;
