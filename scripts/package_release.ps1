@@ -1,4 +1,4 @@
-# package_release.ps1 - build a self-contained Windows release folder (and zip).
+﻿# package_release.ps1 - build a self-contained Windows release folder (and zip).
 #
 # Layout produced (pawch-agent.exe resolves everything relative to its own directory):
 #   Pawch Agent\
