@@ -13,7 +13,7 @@
 #     start.bat stop.bat   double-click entries
 #     README.md LICENSE
 #
-# Two flavors (user decision 2026-10-06, "say it plainly"):
+# Two flavors:
 #   full (default)  - ships tools\git-runtime.zip (bundled MinGit). On machines with no
 #                     system git, checkpoints / undo / change list / review still work.
 #   -Slim           - leaves that zip out (smaller download). On machines with no system
@@ -108,7 +108,7 @@ foreach ($dir in @("prompts", "plugins", "ui-ext", "skills")) {
 # git 一律不捆绑（2026-11-04 final）：安装包体积减半（38MB MinGit），
 # 机器上有系统 git 就照常提供检查点/撤销/变更列表；没有时 UI 明说缺什么。
 if (Test-Path (Join-Path $out "tools")) { Remove-Item (Join-Path $out "tools") -Recurse -Force }
-Info "git not bundled (user decision 2026-11-04): system git used when present"
+Info "git not bundled: system git used when present"
 
 # --- 4. launch entries (ASCII only) ---
 $startBat = @"
