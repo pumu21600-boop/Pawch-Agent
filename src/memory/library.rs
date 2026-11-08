@@ -738,6 +738,7 @@ mod tests {
             pinned: false,
             archived: false,
             usage: None,
+                compact: None,
         };
         let d = digest_of(&f);
         assert!(d.contains("修登录") && d.contains("登录改 JWT"), "{d}");

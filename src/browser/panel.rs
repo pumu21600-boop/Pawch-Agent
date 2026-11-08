@@ -452,13 +452,19 @@ pub async fn panel_overlay(
         MENU_OPEN.store(false, std::sync::atomic::Ordering::Relaxed);
         return Err("开菜单需要面板矩形与按钮锚点".into());
     };
-    let session = current_session().await?;
-    session.touch();
-    if session.mode != HostMode::Shell {
-        return Ok(json!({ "ok": true, "open": true, "shell": false }));
-    }
-    // 菜单项要操作的那一页：壳里正显示的那一页（没有就空——页面会禁用菜单项）
-    let tab = session.shell_tab().unwrap_or_default();
+    // 没有活跃会话**也能开菜单**：菜单项按「没有可见标签」自禁（menu.html 的
+    // disabled 逻辑）。原先这里 current_session()? 直接抛「浏览器未打开」——空态点
+    // 「⋯」整个菜单开不出来（2026-11-08 用户实锤「没看到开发者工具」的另一半）。
+    let tab = match current_session().await {
+        Ok(session) => {
+            session.touch();
+            if session.mode != HostMode::Shell {
+                return Ok(json!({ "ok": true, "open": true, "shell": false }));
+            }
+            session.shell_tab().unwrap_or_default()
+        }
+        Err(_) => String::new(),
+    };
     shell::menu(panel.0, panel.1, panel.2, panel.3, anchor, &tab);
     Ok(json!({ "ok": true, "open": true, "shell": true, "tab": tab }))
 }

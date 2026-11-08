@@ -950,7 +950,7 @@ mod tests {
     fn index_prompt_scans_real_builtin_plugins() {
         let idx = index_prompt();
         assert!(idx.contains("## 可用插件"), "索引为空说明扫描没跑通: {idx}");
-        for t in ["中枢", "记忆库", "断线取消", "功能桥接", "css-ui工具", "浏览器", "时间线", "用量价格", "项目文件"] {
+        for t in ["中枢", "记忆库", "断线取消", "功能桥接", "css-ui工具", "浏览器", "时间线", "使用统计", "项目文件"] {
             assert!(idx.contains(&format!("- /{t}: ")), "内置插件 {t} 没进索引: {idx}");
         }
         // 降级/移出的都不该再出现在插件索引里

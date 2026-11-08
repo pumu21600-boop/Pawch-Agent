@@ -619,7 +619,7 @@ Content-Length: 2
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         handle.join().unwrap();
         match out {
-            Ok(ChatOutcome::Cancelled) => {}
+            Ok(ChatOutcome::Cancelled(_)) => {}
             Ok(ChatOutcome::Done(_)) => panic!("应返回 Cancelled，实际拿到完整回答"),
             Ok(ChatOutcome::Interrupted(_)) => panic!("应返回 Cancelled，实际拿到打断"),
             Err(e) => panic!("应返回 Cancelled，实际报错: {e:#}"),

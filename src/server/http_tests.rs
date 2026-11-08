@@ -33,6 +33,7 @@ fn test_state(root: &std::path::Path) -> AppState {
         steer: Arc::new(crate::core::steer::SteerQueue::new()),
         settings: Arc::new(std::sync::RwLock::new(Settings::default())),
         settings_write: Arc::new(std::sync::Mutex::new(())),
+        compact_fail_streak: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         agent_cfg: Arc::new(crate::config::AgentConfig::default()),
         sandbox_cfg: Arc::new(crate::config::SandboxConfig::default()),
         context_cfg: Arc::new(crate::config::ContextConfig::default()),
@@ -239,6 +240,163 @@ async fn post(app: &Router, uri: &str) -> (StatusCode, Value) {
     (status, v)
 }
 
+/// 发一个带 JSON 体的 POST（合法 Host + 本地访问令牌）。
+async fn post_json(app: &Router, uri: &str, body: Value) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("host", "127.0.0.1:5173")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {}", auth::current()))
+        .body(Body::from(body.to_string()))
+        .expect("构造请求");
+    let resp = app.clone().oneshot(req).await.expect("router 不应崩溃");
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.expect("读响应体").to_bytes();
+    let v = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, v)
+}
+
+/// 截断后圆环立即重算（2026-11-07 用户拍板）：回滚/编辑/删除把上下文变小了，
+/// 必须立刻按当前请求视图重估并广播——否则圆环挂着旧值，直到下一轮实报回来
+/// 「跳变」，用户会把跳变误读成压缩（真机：回滚到压缩边界之前，原文全量回归
+/// 约 16.8 万，圆环却还停在压缩完成时的 4.4 万）。
+#[tokio::test]
+async fn truncate_refreshes_context_usage_ring() {
+    let root = test_root("ring-refresh");
+    let state = test_state(&root);
+    let app = router(state.clone(), root.join("no-dist"));
+    let sid = "ring-refresh-1";
+    let msgs = vec![
+        json!({"id":"u1","role":"user","content":"第一问 ".repeat(200)}),
+        json!({"id":"a1","role":"assistant","content":"第一答 ".repeat(200)}),
+        json!({"id":"u2","role":"user","content":"第二问 ".repeat(200)}),
+        json!({"id":"a2","role":"assistant","content":"第二答 ".repeat(200)}),
+    ];
+    state.session.save(sid, &msgs, None).expect("写会话");
+    // 上一轮圆环快照：实报锚点 + 固定开销（system / 工具定义）——截断后从它带入
+    let breakdown = crate::context::Breakdown {
+        messages: 40_000,
+        tools: 2_000,
+        system: 5_000,
+        other: 3_000,
+        tools_schema: 9_000,
+    };
+    let mut usage = crate::session::SessionUsage::default();
+    usage.apply_context(Some(50_000), 50_000, 200_000, &breakdown);
+    state.session.update_usage(sid, usage).expect("写用量快照");
+
+    let mut rx = crate::server::ui_events::test_subscribe();
+    let (status, v) = post_json(&app, "/api/sessions/truncate", json!({"id": sid, "mode": "rollback", "user_index": 1})).await;
+    assert_eq!(status, StatusCode::OK, "截断应成功: {v}");
+    assert_eq!(v["messages"], json!(2), "回滚到第二条用户消息，只剩一问一答: {v}");
+
+    // 全局事件总线可能有别的用例的噪音：只认本会话的 context_usage
+    let mut ev = None;
+    for _ in 0..10 {
+        let Ok(Ok(e)) = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await else { break };
+        if e["kind"] == json!("context_usage") && e["session"] == json!(sid) {
+            ev = Some(e);
+            break;
+        }
+    }
+    let ev = ev.unwrap_or_else(|| panic!("截断后必须广播圆环刷新（context_usage）"));
+    let cu = &ev["context_usage"];
+    assert!(cu["pressure"].is_null(), "旧实报锚点随被删消息作废: {ev}");
+    let projected = cu["projected"].as_u64().unwrap_or(0);
+    assert!(projected > 0, "重估结果必须为正: {ev}");
+    assert_eq!(cu["window"], json!(200_000), "窗口沿用上一轮快照: {ev}");
+    assert_eq!(cu["breakdown"]["system"], json!(5_000), "system 从快照带入: {ev}");
+    assert_eq!(cu["breakdown"]["tools_schema"], json!(9_000), "工具定义从快照带入: {ev}");
+    // 重估口径：剩下的一问一答（含固定开销）——必须远小于截断前的 50_000 锚点
+    assert!(projected < 50_000, "回滚后上下文变小，重估不得高于截断前: {ev}");
+    // 校准偏差必须保留：旧快照实报 50_000、本地估价合计 59_000（偏差 -9_000），
+    // 新 projected = 新构成合计 - 9_000。直接拿构成合计当 projected 会让删消息后
+    // 圆环不降反升（2026-11-07 用户实报）。
+    let raw: u64 = ["messages", "tools", "system", "other", "tools_schema"]
+        .iter()
+        .map(|k| cu["breakdown"][k].as_u64().unwrap_or(0))
+        .sum();
+    assert_eq!(projected, raw.saturating_sub(9_000), "回滚重估要保留旧锚点的校准偏差: {ev}");
+
+    // 落盘同步：重启/切回会话后圆环也是新值
+    let snap = state.session.get(sid).and_then(|f| f.usage).unwrap();
+    assert_eq!(snap.projected, projected, "用量快照要与推送一致");
+    assert!(snap.pressure.is_none(), "旧锚点作废");
+
+    // 再回滚到空（一条消息不剩）：与新建对话同口径，圆环清零、固定底不再挂着
+    let (status, v) = post_json(&app, "/api/sessions/truncate", json!({"id": sid, "mode": "rollback", "user_index": 0})).await;
+    assert_eq!(status, StatusCode::OK, "回滚到空应成功: {v}");
+    let mut empty_ev = None;
+    for _ in 0..10 {
+        let Ok(Ok(e)) = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await else { break };
+        if e["kind"] == json!("context_usage")
+            && e["session"] == json!(sid)
+            && e["context_usage"]["projected"] == json!(0)
+        {
+            empty_ev = Some(e);
+            break;
+        }
+    }
+    let ee = empty_ev.unwrap_or_else(|| panic!("回滚到空后必须广播 projected=0 的圆环刷新"));
+    assert!(ee["context_usage"]["breakdown"].is_null(), "空会话不留构成: {ee}");
+    let snap = state.session.get(sid).and_then(|f| f.usage).unwrap();
+    assert_eq!(snap.projected, 0, "空会话圆环清零");
+    assert_eq!(
+        snap.messages + snap.tools + snap.system + snap.other + snap.tools_schema,
+        0,
+        "空会话构成清零"
+    );
+    assert_eq!(snap.window, 200_000, "窗口保留");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 删前核对（2026-11-08 防线二）：expect 与文件里第 N 条 user 对不上 → 400 且一条
+/// 不删。引导行被展示层合并透明化曾让视图序数整体少 1，真机两次「一次回滚冲掉
+/// 两轮问答」——序数类删除必须带内容核对，错了要响不要删完再说。
+#[tokio::test]
+async fn truncate_expect_guard_refuses_wrong_target() {
+    let root = test_root("truncate-expect");
+    let state = test_state(&root);
+    let app = router(state.clone(), root.join("no-dist"));
+    let sid = "truncate-expect-1";
+    let msgs = vec![
+        json!({"id":"u1","role":"user","content":"第一问"}),
+        json!({"id":"s1","role":"user","content":"引导插话","steered":true}),
+        json!({"id":"u2","role":"user","content":"第二问"}),
+    ];
+    state.session.save(sid, &msgs, None).expect("写会话");
+
+    // 视图错位（把第 1 条当成第 2 条）→ 拒绝，文件一条不动
+    let (status, v) = post_json(
+        &app,
+        "/api/sessions/truncate",
+        json!({"id": sid, "mode": "rollback", "user_index": 1, "expect": "第二问"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "序数与内容对不上必须拒绝: {v}");
+    let f = state.session.get(sid).expect("会话还在");
+    assert_eq!(f.messages.len(), 3, "拒绝 = 没删任何消息: {}", f.messages.len());
+
+    // 序数与内容都对 → 放行（delete_user 只删第 N 条 user 本身）
+    let (status, v) = post_json(
+        &app,
+        "/api/sessions/truncate",
+        json!({"id": sid, "mode": "delete_user", "user_index": 1, "expect": "引导插话"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "内容对得上要放行: {v}");
+    let f = state.session.get(sid).expect("会话还在");
+    assert_eq!(f.messages.len(), 2, "只删了引导那条: {}", f.messages.len());
+
+    // 不带 expect（旧客户端/兼容路径）→ 照旧放行
+    let (status, _) = post_json(&app, "/api/sessions/truncate", json!({"id": sid, "mode": "delete_user", "user_index": 1})).await;
+    assert_eq!(status, StatusCode::OK, "不带 expect 走原有语义");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// POST /api/checkpoints（手动重拍基线）契约：非 git 工作区 → 200 + ok:false + 人话 note
 /// （拍不了基线不是错误）；git 仓库（有已跟踪文件）→ ok:true + 检查点归属带上的会话。
 /// 产物/git 面板「基线过期 → 重新以当前状态为起点」走的就是这个端点（2026-10-31）。
@@ -297,5 +455,33 @@ async fn manual_checkpoint_endpoint_contract() {
     }
 
     crate::tools::set_workspace_root(&prev);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// HTML 文档必须 no-store + 下发同源 cookie。否则 WebView 恢复会话时直接用缓存页，
+/// 永远拿不到 cookie，所有 /api 401，界面显示「暂无会话/未选模型」像数据全丢
+/// （2026-11-06 桌面端实锤）。
+#[tokio::test]
+async fn html_document_gets_no_store_and_auth_cookie() {
+    let root = test_root("cookie");
+    let req = Request::builder()
+        .uri("/")
+        .header("host", "127.0.0.1:5173")
+        .header("accept", "text/html")
+        .body(Body::empty())
+        .expect("构造请求");
+    let resp = app(&root).oneshot(req).await.expect("router 不应崩溃");
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("cache-control").and_then(|v| v.to_str().ok()),
+        Some("no-store"),
+        "文档必须禁止缓存"
+    );
+    let cookie = resp
+        .headers()
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(cookie.contains("pawch_token="), "首屏要下发访问令牌 cookie: {cookie}");
     let _ = std::fs::remove_dir_all(&root);
 }

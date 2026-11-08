@@ -19,7 +19,7 @@ use axum::{
     extract::Request,
     http::{
         HeaderValue, Method, StatusCode,
-        header::{ACCEPT, AUTHORIZATION, COOKIE, SET_COOKIE},
+        header::{ACCEPT, AUTHORIZATION, CACHE_CONTROL, COOKIE, SET_COOKIE},
     },
     middleware::Next,
     response::{IntoResponse, Response},
@@ -164,10 +164,17 @@ pub async fn issue_cookie(req: Request, next: Next) -> Response {
             .and_then(|v| v.to_str().ok())
             .is_some_and(|a| a.contains("text/html"));
     let mut resp = next.run(req).await;
-    if is_document && resp.status().is_success() {
-        let cookie = format!("{COOKIE_NAME}={}; HttpOnly; SameSite=Strict; Path=/", current());
-        if let Ok(v) = HeaderValue::from_str(&cookie) {
-            resp.headers_mut().append(SET_COOKIE, v);
+    if is_document {
+        // 文档绝不缓存：WebView 恢复会话时若直接用缓存的 index.html，就不会向服务端
+        // 发请求，也就拿不到 Set-Cookie → 之后所有 /api 都是 401，界面显示「暂无会话 /
+        // 未选模型」像是数据全丢（2026-11-06 桌面端实锤）。no-store 保证每次导航都回源。
+        resp.headers_mut()
+            .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        if resp.status().is_success() {
+            let cookie = format!("{COOKIE_NAME}={}; HttpOnly; SameSite=Strict; Path=/", current());
+            if let Ok(v) = HeaderValue::from_str(&cookie) {
+                resp.headers_mut().append(SET_COOKIE, v);
+            }
         }
     }
     resp

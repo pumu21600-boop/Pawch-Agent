@@ -75,12 +75,8 @@ pub enum AgentEvent {
     /// 前端应把当前消息尾部各丢掉 `content` / `reasoning` 个 UTF-16 码元
     /// （与 JS String.length 同口径），否则半截回答会与重试后的完整回答叠在一起。
     StepReset { content: usize, reasoning: usize },
-    /// TITLE 角色：会话标题已生成（server 收到即改会话文件并转前端）
-    Title(String),
     /// 任务改动统计条：相对任务起点基线的文件数/增删行；「撤销」恢复到 id
     Checkpoint { id: String, files_changed: usize, additions: u64, deletions: u64 },
-    /// 滚动摘要更新：server 收到即写进会话文件（跨任务延续）
-    Summary(String),
     /// B3：Plan 档产出的结构化计划（模型最终回答中的 ```plan 块），前端渲染计划卡
     PlanProposal { goal: String, steps: Vec<String>, files: Vec<String> },
     /// N1/025 运行中追加消息（steering）：这些用户消息已并入本轮对话（模型下一步可见），
@@ -97,8 +93,6 @@ pub struct Plan {
     pub files: Vec<String>,
 }
 
-/// 滚动摘要消息的前缀标记（注入/剥离/快照过滤都认它）。
-pub const SUMMARY_PREFIX: &str = "【历史摘要】";
 
 /// B3：Plan 档 system prompt 增量。
 /// 红线（坑 13/ 红线 9）：不注入模型身份/人设——这里是纯任务行为约束与计划格式约定。
@@ -119,10 +113,6 @@ pub const PLAN_PROMPT: &str = "\
 pub struct LoopChannels {
     /// 主对话渠道（base_url/model/key/参数已从 settings+预设组装）
     pub primary: Channel,
-    /// SUMMARY 专用渠道（未配置=主渠道）
-    pub summary: Option<Channel>,
-    /// TITLE 专用渠道；None=不生成标题
-    pub title: Option<Channel>,
     /// 降级链：主渠道当轮失败时按序替换重试
     pub fallbacks: Vec<Channel>,
     /// 任务超 token 预算后的降级渠道（[roles] budget；None=不降级，维持主渠道）
@@ -413,7 +403,7 @@ async fn run_chain(
                     }
                     break 'channels; // Interrupted 不是错误，不降级——半截落地后本轮继续
                 }
-                Ok(ChatOutcome::Cancelled) => return (outcome, notices, used),
+                Ok(ChatOutcome::Cancelled(_)) => return (outcome, notices, used),
                 Err(e) => {
                     // 流中断原地重试（2026-10-31 渠道实测：连写大文件的长流中途被上游
                     // 掐断，降级链只有单渠道时直接失败）。读流失败/流超时是「上下文没变、
@@ -473,6 +463,11 @@ fn emit_notice(msgs: &mut Vec<Value>, on_event: &(impl Fn(AgentEvent) + Send + S
     on_event(AgentEvent::Notice(text.clone()));
     persist_notice(msgs, on_event, &text);
 }
+
+/// 截断提示文案（工具轮即时发、最终回答轮在回答落地后发——提示描述的就是那条
+/// 回答，插在前面会出现在回答上面，真机 2026-11-07 实锤）。
+const TRUNCATED_NOTICE: &str =
+    "模型输出被截断（达到最大输出长度）。建议在设置里调大该模型的「最大输出长度」，或让它分多次写入。";
 
 /// 测一次上下文占用并推给前端（唯一出口：圆环/构成/落盘全部读它）。
 /// `anchor = (实报 prompt, 那次请求发出时的本地估价)`；增量带符号，所以回复落地、
@@ -544,7 +539,9 @@ pub async fn run_task(
     ctx_cfg: &ContextConfig,
     rec_cfg: &RecoveryConfig,
     mem: &crate::memory::Memory,
-    prior_summary: Option<String>,
+    // 静默压缩视图（2026-11-07）：Some = 请求按「摘要消息 + tail_start 起的历史」发，
+    // msgs 仍持全量历史（快照/落盘/回滚都在全量上）；None = 请求与历史同形。
+    compact: Option<crate::compact::CompactView>,
     // B1：Plan 档（true=只读+先出计划；由请求级 plan_mode 带入，前端随会话持久化）
     plan_mode: bool,
     gate: &dyn ApprovalGate,
@@ -596,11 +593,6 @@ pub async fn run_task(
         "task.start",
         json!({ "text": messages.iter().rev().find(|m| m.get("role").and_then(Value::as_str) == Some("user")).and_then(|m| m.get("content")).and_then(Value::as_str).map(|s| s.chars().take(200).collect::<String>()).unwrap_or_default() }),
     );
-    // 滚动摘要：跨任务延续的当前摘要
-    let mut running_summary = prior_summary.filter(|s| !s.trim().is_empty());
-    // 摘要连续失败熔断（ZCode MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES 同款=3）：
-    // 摘要渠道挂了就别每步都白打一次辅助调用；成功即清零
-    let mut summary_fail_streak = 0u32;
     // 改动统计条基线：任务起点当场拍一个快照（提交当前工作树状态），
     // 结束时的 diff 就只包含本任务的改动，不会把历史漂移算进来
     let baseline: Option<String> = if rec_cfg.checkpoint_enabled {
@@ -629,9 +621,6 @@ pub async fn run_task(
     {
         last_user["cp"] = json!(cp_id);
     }
-    // 会话标题素材：本任务第一次最终回答（引导续跑后不从「好的已结束」生成标题）
-    let mut title_source: Option<String> = None;
-
     // A3 能力标记「工具调用」闭环：capabilities.tools=false 时不携带 tools
     // 参数，模型无法发起新工具调用；历史消息里的 tool_calls 回放不受影响（replay 只动消息字段）。
     let tools_def = tools_def_for(&primary.params);
@@ -681,18 +670,9 @@ pub async fn run_task(
         let steer = gate.take_steering();
         if !steer.is_empty() {
             // 引导/打断消息进上下文与落盘都带标记（模型照常看到内容——它就是给
-            // 模型的指令；标记只是给前端的渲染提示，发送侧 replay 剥掉）：
-            // 引导 steered=true（静默「已引导」行）；
-            // 打断 interrupted=true（正常用户气泡——立即发送的消息要在对话里）。
-            let added: Vec<Value> = steer
-                .iter()
-                .map(|s| match s.mode {
-                    crate::core::steer::SteerMode::Interrupt => {
-                        json!({ "role": "user", "content": s.content.clone(), "interrupted": true, "ts": now_ms() })
-                    }
-                    _ => json!({ "role": "user", "content": s.content.clone(), "steered": true, "ts": now_ms() }),
-                })
-                .collect();
+            // 模型的指令；标记只是给前端的渲染提示，发送侧 replay 剥掉）。
+            // 标记规则收敛在 SteerMsg::to_message 一处（引导=已引导行 / 打断=气泡 / 排队=普通消息）。
+            let added: Vec<Value> = steer.iter().map(|s| s.to_message()).collect();
             observability::event(
                 EventType::State,
                 json!({ "kind": "steer", "count": added.len(), "step": step }),
@@ -701,68 +681,20 @@ pub async fn run_task(
             on_event(AgentEvent::Steer { messages: added });
             on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
         }
-        // 上下文预算：超预算则归档旧工具结果/折叠旧轮次；占用推给前端圆环
-        {
-            // 摘要消息每步重新注入，先剥掉上一轮的（不参与裁剪统计）
-            msgs.retain(|m| !is_summary_msg(m));
-            let (mut compacted, stats) =
-                context::compact_messages(&msgs, ctx_cfg, tools_schema_tokens, count_reasoning);
-            if stats.compacted {
-                // 裁剪后不再清空实报值（旧做法：清零回落估算，等于把真实锚点丢了）：
-                // 锚点 + 带符号增量天然处理缩水——当前估价变小，增量就是负的，圆环当场回落。
-                observability::event(
-                    EventType::State,
-                    json!({
-                        "kind": "context.compacted",
-                        "step": step,
-                        "archived_tools": stats.archived_tools,
-                        "folded_messages": stats.folded_messages,
-                        "deduped_results": stats.deduped_results,
-                        "truncated_results": stats.truncated_results,
-                        "tokens_before": stats.tokens_before,
-                        "tokens_after": stats.tokens_after,
-                    }),
-                );
-                // 滚动摘要：有折叠 → 调模型把折叠内容压进摘要（失败保留占位符降级）。
-                // 连续失败 ≥3 次熔断：摘要渠道挂了别每步都白打一次辅助调用（占位符
-                // 照常降级，有新摘要需求时下轮也不再试——重启任务或换渠道后重置）。
-                // 用户点了停止就别再为了摘要干等渠道（辅助调用走非流式 complete，
-                // 本身不看取消标志）——取消即按「摘要失败」降级，下面立刻收尾。
-                if !stats.folded.is_empty() && mem.enabled && summary_fail_streak < 3 {
-                    let summarized = tokio::select! {
-                        s = summarize_folded(gateway, primary, channels.summary.as_ref(), &running_summary, &stats.folded, &sid) => s,
-                        () = cancel.cancelled() => None,
-                    };
-                    match summarized {
-                        Some(s) => {
-                            summary_fail_streak = 0;
-                            running_summary = Some(s.clone());
-                            observability::event(
-                                EventType::State,
-                                json!({ "kind": "memory.summarized", "step": step, "chars": s.chars().count() }),
-                            );
-                            on_event(AgentEvent::Summary(s));
-                        }
-                        None => {
-                            summary_fail_streak += 1;
-                            observability::event(
-                                EventType::State,
-                                json!({ "kind": "memory.summary_skipped", "step": step, "streak": summary_fail_streak, "note": "摘要调用失败，保留占位符" }),
-                            );
-                        }
-                    }
-                }
-            }
-            // 把当前摘要作为 system 消息紧跟主 system 注入（不进快照、不参与折叠）
-            if let Some(s) = &running_summary {
-                compacted.insert(1, json!({ "role": "system", "content": format!("{SUMMARY_PREFIX}{s}") }));
-            }
-            msgs = compacted;
-        }
+        // 请求视图（2026-11-07 静默压缩取代每步裁剪）：msgs 持全量历史，发给模型的
+        // 是「system + 摘要消息 + tail_start 起的历史」。保留两道与预算无关的卫生
+        // （重复结果去重 + 超大结果截断，防病理循环喂退化），归档/折叠/滚动摘要全部下线。
+        let req_msgs = {
+            let req = crate::compact::build_request(&msgs, compact.as_ref());
+            let (deduped, _) = context::dedupe_tool_results(&req);
+            let (truncated, _) =
+                context::truncate_oversized_results(&deduped, ctx_cfg.max_tool_result_chars);
+            truncated
+        };
         // 圆环数据源（唯一出口）：锚点 + 带符号增量 → 占用；构成走估算，只当近似值。
-        // 交接阈值仍用估算口径（est_total）。
+        // 交接阈值仍用估算口径（est_total）。占用按**请求视图**算——它才是真实计费面。
         let breakdown = emit_context_usage(
-            &msgs,
+            &req_msgs,
             anchor,
             tools_schema_tokens,
             count_reasoning,
@@ -808,7 +740,7 @@ pub async fn run_task(
         let (outcome, chain_notices, used_channel) = run_chain(
             gateway,
             &chain,
-            &msgs,
+            &req_msgs,
             tools_def.as_ref(),
             cancel,
             &interrupt,
@@ -819,10 +751,23 @@ pub async fn run_task(
         .await;
         // 本步模型调用耗时（中间步骤消息的 step_ms）
         let call_ms = call_started.elapsed().as_millis() as u64;
-        if matches!(&outcome, Ok(ChatOutcome::Cancelled)) {
+        if matches!(&outcome, Ok(ChatOutcome::Cancelled(_))) {
+            // 取消收尾：半截回答**落地**（有内容才落；tool_calls 已在网关侧清空）。
+            // 立即发送=停轮重启，被打断那轮的执行过程是真实发生过的工作——不落地的
+            // 话它只活在内存里，回滚/重启一按文件重建就整段蒸发（真机 2026-11-08：
+            // 立即发送后回退，上一轮执行过程消失）。思考一并落（reasoning_content）。
+            if let Ok(ChatOutcome::Cancelled(Some(t))) = &outcome
+                && (!t.content.trim().is_empty() || !t.reasoning.trim().is_empty())
+            {
+                let mut m = json!({ "role": "assistant", "content": t.content, "ts": now_ms() });
+                if !t.reasoning.trim().is_empty() {
+                    m["reasoning_content"] = json!(t.reasoning);
+                }
+                msgs.push(m);
+            }
             // 流式阶段取消同样要收尾：落盘当前消息（此前其它取消出口都有）、
             // 发改动统计条、补 task.finish——否则这轮新建文件不进影子仓库，
-            // 之后撤销会静默留在磁盘上（2026-11-02 审计）。
+            // 之后撤销会静默留在磁盘上（2026-11-02 审计）。Snapshot 事件即保存。
             on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
             emit_checkpoint_bar(baseline, gate.session_id(), &ws, task_started_wall, &on_event).await;
             mem.record("task.finish", json!({ "reason": "cancelled", "phase": "streaming", "step": step }));
@@ -835,7 +780,7 @@ pub async fn run_task(
         let outcome = outcome?;
 
         let turn = match outcome {
-            ChatOutcome::Cancelled => return Ok(LoopOutcome::Cancelled),
+            ChatOutcome::Cancelled(_) => return Ok(LoopOutcome::Cancelled),
             ChatOutcome::Interrupted(t) => {
                 // 「立即发送」打断（2026-10-22）：流式被用户插话让位——半截回答
                 // 落地（有内容才落），**本轮继续**：下一个决策点（循环顶部
@@ -879,17 +824,16 @@ pub async fn run_task(
         // 配置值+思考余量），思考不再吃掉「最大输出长度」额度——此处截断即正文
         // 本身超限，提示口径回归真实。此前的自动续写方案已撤（治标不治本且拖慢
         // 响应：续写要重传全量上下文，真机实测「还会卡」）。
-        if turn.finish_reason.as_deref() == Some("length") {
+        // 提示的发出时机：工具轮这里即时发；最终回答轮挪到回答落地之后（见下）。
+        let truncated = turn.finish_reason.as_deref() == Some("length");
+        if truncated {
             observability::event(
                 EventType::State,
                 json!({ "kind": "model.truncated", "step": step, "max_output_tokens": max_output_tokens }),
             );
-            emit_notice(
-                &mut msgs,
-                &on_event,
-                "模型输出被截断（达到最大输出长度）。建议在设置里调大该模型的「最大输出长度」，或让它分多次写入。"
-                    .to_string(),
-            );
+            if !turn.tool_calls.is_empty() {
+                emit_notice(&mut msgs, &on_event, TRUNCATED_NOTICE.to_string());
+            }
         }
 
         // 思考完整段落落 thought（分片级已记 model_chunk）
@@ -899,14 +843,21 @@ pub async fn run_task(
 
         // 没有工具调用 → 纯文本即最终回答（已流式转发），终止
         if turn.tool_calls.is_empty() {
-            // 兜底：弱模型/免费模型常只给 reasoning 不给 content，避免前端空回答
+            // 兜底：弱模型/免费模型常只给 reasoning 不给 content，避免前端空回答。
+            // 截断（finish_reason=length）时不兜底：思考撞上限被掐断、正文一个字
+            // 没有，思考内容流式里已按思考展示过，这里再转正文=把半截思考冒充
+            // 回答（真机 2026-11-06 实锤：29k 思考文本整段进了正文）。
             let final_text = if turn.content.trim().is_empty() && !turn.reasoning.trim().is_empty() {
-                observability::event(
-                    EventType::Error,
-                    json!({ "message": "模型未输出正文，回退展示思考内容" }),
-                );
-                on_event(AgentEvent::Content(turn.reasoning.clone()));
-                turn.reasoning.clone()
+                if turn.finish_reason.as_deref() == Some("length") {
+                    turn.content.clone()
+                } else {
+                    observability::event(
+                        EventType::Error,
+                        json!({ "message": "模型未输出正文，回退展示思考内容" }),
+                    );
+                    on_event(AgentEvent::Content(turn.reasoning.clone()));
+                    turn.reasoning.clone()
+                }
             } else {
                 turn.content.clone()
             };
@@ -947,12 +898,28 @@ pub async fn run_task(
             if let Some(ms) = turn.reasoning_ms() {
                 final_msg["reasoning_ms"] = json!(ms);
             }
+            // 配对视图先于 push 构建：请求视图 + 这条回复（clone）——push 之后
+            // final_msg 已被移动，只能在这里拿
+            let post_reply = {
+                let mut v = req_msgs.clone();
+                v.push(final_msg.clone());
+                v
+            };
             msgs.push(final_msg);
             on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
+            // 截断提示发在最终回答之后（msgs 顺序=用户读到的顺序：回答→提示，
+            // 不能让提示插在回答上面）
+            if truncated {
+                emit_notice(&mut msgs, &on_event, TRUNCATED_NOTICE.to_string());
+            }
             // 回复已落地 → 先报实报（更新锚点），再按新锚点重算占用推给前端：
-            // 圆环含这条回答，服务端那次落盘就是终态（重启后不丢这截增量）
+            // 圆环含这条回答，服务端那次落盘就是终态（重启后不丢这截增量）。
+            // 锚点配对的估价视图 = 请求视图 + 这条回复（2026-11-08 审计修复：e224905
+            // 曾直接拿请求视图配对，把「含回复的实报」配到「不含回复的估价」上——
+            // 校准偏差被最后一条回答污染，回滚/编辑后圆环虚高；渠道不回 completion
+            // 的增量也恒为 0，收尾圆环漏掉回答）
             report_api_usage(
-                &msgs,
+                &post_reply,
                 &turn,
                 est_at_request,
                 tools_schema_tokens,
@@ -961,17 +928,13 @@ pub async fn run_task(
                 &on_event,
             );
             emit_context_usage(
-                &msgs,
+                &post_reply,
                 anchor,
                 tools_schema_tokens,
                 count_reasoning,
                 ctx_cfg.budget_tokens,
                 &on_event,
             );
-            // 标题素材取本任务**第一次**最终回答：引导续跑后的「好的，已结束」不该当会话标题
-            if title_source.is_none() {
-                title_source = Some(final_text.clone());
-            }
             // 027 补口（2026-09-27 真机实测）：决策点只在每步模型调用**之前**，「立即发送」
             // 若在最终回答流式输出期间到达，会错过全部决策点——按旧逻辑直接收尾，这条引导
             // 被服务层收尾 drain_all 捡去当 followup 另起一轮（用户看到自己没再说话却多出
@@ -979,16 +942,8 @@ pub async fn run_task(
             // 已流出的回答，模型下一步就看到），没有才是真的结束。
             let steer = gate.take_steering();
             if !steer.is_empty() {
-                // 同决策点：按模式打标记（引导=steered 静默行 / 打断=interrupted 气泡）
-                let added: Vec<Value> = steer
-                    .iter()
-                    .map(|s| match s.mode {
-                        crate::core::steer::SteerMode::Interrupt => {
-                            json!({ "role": "user", "content": s.content.clone(), "interrupted": true, "ts": now_ms() })
-                        }
-                        _ => json!({ "role": "user", "content": s.content.clone(), "steered": true, "ts": now_ms() }),
-                    })
-                    .collect();
+                // 同决策点：按模式打标记（规则见 SteerMsg::to_message）
+                let added: Vec<Value> = steer.iter().map(|s| s.to_message()).collect();
                 observability::event(
                     EventType::State,
                     json!({ "kind": "steer", "phase": "post_answer", "count": added.len(), "step": step }),
@@ -1005,21 +960,8 @@ pub async fn run_task(
             );
             // 事件流水：任务完成
             mem.record("task.finish", json!({ "steps": step + 1, "chars": final_text.chars().count() }));
-            // TITLE 角色：任务结束用专用渠道生成会话标题（失败静默保留机械标题）。
-            // 同样接取消：回答已落地，用户点了停止就不该再为标题多等一次渠道往返。
-            if let Some(tch) = &channels.title {
-                let titled = tokio::select! {
-                    t = generate_title(gateway, tch, title_source.as_deref().unwrap_or(&final_text), &sid) => t,
-                    () = cancel.cancelled() => None,
-                };
-                if let Some(title) = titled {
-                    observability::event(
-                        EventType::State,
-                        json!({ "kind": "session.titled", "title": title }),
-                    );
-                    on_event(AgentEvent::Title(title));
-                }
-            }
+            // 会话标题不再在这里生成（2026-11-06 起由 session::save 用首条用户消息
+            // 前 10 字落盘）：不占一次辅助渠道往返，也不再有「辅助渠道挂死拖着不收尾」。
             return Ok(LoopOutcome::Done);
         }
 
@@ -1053,16 +995,21 @@ pub async fn run_task(
         if let Some(ms) = turn.reasoning_ms() {
             asst_msg["reasoning_ms"] = json!(ms);
         }
+        // 配对视图先于 push 构建：请求视图 + 这条回复（clone），不能拿纯请求视图
+        // 配对（2026-11-08 审计修复，见最终回答处注释）
+        let post_reply = {
+            let mut v = req_msgs.clone();
+            v.push(asst_msg.clone());
+            v
+        };
         msgs.push(asst_msg);
         // 本步工具结果槽位：`executed` 单独记「是否真的跑过」——不能拿空结果判断
         // （工具可能合法返回空串）。取消时要靠它给没执行的 tool_call 回填结果，
         // 否则落盘的 assistant(tool_calls) 没有对应 tool 消息，下一轮协议校验直接 400。
         let mut results: Vec<(String, bool)> = vec![(String::new(), true); turn.tool_calls.len()];
         let mut executed: Vec<bool> = vec![false; turn.tool_calls.len()];
-        // 带工具调用的回复同样先落地再报：锚点更新 + 圆环重算（工具结果回填后，
-        // 下一步开头那次测量会把它们按增量补上）
         report_api_usage(
-            &msgs,
+            &post_reply,
             &turn,
             est_at_request,
             tools_schema_tokens,
@@ -1071,7 +1018,7 @@ pub async fn run_task(
             &on_event,
         );
         emit_context_usage(
-            &msgs,
+            &post_reply,
             anchor,
             tools_schema_tokens,
             count_reasoning,
@@ -1663,8 +1610,6 @@ mod tests {
         );
         let channels = LoopChannels {
             primary: ch,
-            summary: None,
-            title: None,
             fallbacks: Vec::new(),
             downgrade: None,
             vision: None,
@@ -1819,8 +1764,9 @@ mod tests {
                         let _ = s.set_nonblocking(false);
                         let mut buf = [0u8; 65536];
                         let n = Read::read(&mut s, &mut buf).unwrap_or(0);
-                        bodies_c.lock().unwrap().push(String::from_utf8_lossy(&buf[..n]).to_string());
+                        let raw = String::from_utf8_lossy(&buf[..n]).to_string();
                         hits_c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        bodies_c.lock().unwrap().push(raw);
                         let body = "data: {\"choices\":[{\"delta\":{\"content\":\"半截正文\"}}]}\n\n\
                              data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n\
                              data: [DONE]\n\n";
@@ -1839,8 +1785,6 @@ mod tests {
         let ch = Channel::new(&format!("http://127.0.0.1:{port}/v1"), "mock-model", "sk-dummy", params);
         let channels = LoopChannels {
             primary: ch,
-            summary: None,
-            title: None,
             fallbacks: Vec::new(),
             downgrade: None,
             vision: None,
@@ -1933,6 +1877,149 @@ mod tests {
         );
     }
 
+    // 截断发生在思考里（只有 reasoning 分片 + finish_reason=length，正文一个字
+    // 没有）：思考不得转正文冒充回答（真机 2026-11-06 实锤：29k 思考文本整段
+    // 进了正文气泡）。期望：正文为空、思考照常随消息落盘、截断提示照发；
+    // 且事件流里没有把思考当 Content 重发。弱模型正常收尾（finish=stop）的
+    // 兜底不受影响（由既有用例覆盖）。
+    #[tokio::test]
+    async fn truncated_thinking_stays_thinking_not_content() {
+        fn init_logger() {
+            static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            ONCE.get_or_init(|| {
+                let dir = std::env::temp_dir().join("agent-test-logs");
+                let _ = crate::observability::init(&dir, "agent.jsonl", format!("ag-{}", uuid::Uuid::new_v4()));
+            });
+        }
+        init_logger();
+        use crate::config::MemoryConfig;
+        use crate::memory::Memory;
+        use std::sync::atomic::AtomicUsize;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_c = stop.clone();
+        let mock = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            while !stop_c.load(std::sync::atomic::Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut s, _)) => {
+                        let _ = s.set_nonblocking(false);
+                        let mut buf = [0u8; 65536];
+                        let _ = Read::read(&mut s, &mut buf).unwrap_or(0);
+                        let body = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"让我想想怎么画这只鹈鹕\"}}]}\n\n\
+                             data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"先画车身再画鸟\"}}]}\n\n\
+                             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n\
+                             data: [DONE]\n\n";
+                        let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n{body}");
+                        let _ = s.write_all(resp.as_bytes());
+                        let _ = s.flush();
+                        hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(15)),
+                }
+            }
+        });
+
+        let gateway = Arc::new(Gateway::new());
+        let params = ChatParams { max_tokens: Some(4096), thinking: Some("high".to_string()), ..Default::default() };
+        let ch = Channel::new(&format!("http://127.0.0.1:{port}/v1"), "mock-model", "sk-dummy", params);
+        let channels = LoopChannels {
+            primary: ch,
+            fallbacks: Vec::new(),
+            downgrade: None,
+            vision: None,
+            budget_hit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            subagents: None,
+            prior_anchor: None,
+        };
+        let ws = std::env::temp_dir().join(format!("agent-trunc-think-{}-{}", std::process::id(), port));
+        std::fs::create_dir_all(&ws).unwrap();
+        let mem = Memory::open_at(
+            &ws,
+            &MemoryConfig { enabled: false, persist_sensitive: false, profile_max_chars: 2500 },
+            crate::memory::GlobalDirs {
+                install: ws.join("global"),
+                user: ws.join("user"),
+                install_legacy: ws.join("global-legacy"),
+                user_legacy: ws.join("user-legacy"),
+            },
+        );
+        let notices = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let snaps = Arc::new(std::sync::Mutex::new(Vec::<Vec<Value>>::new()));
+        let contents = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let notices_c = notices.clone();
+        let snaps_c = snaps.clone();
+        let contents_c = contents.clone();
+        struct G;
+        impl ApprovalGate for G {
+            fn needs_approval_for(&self, _tool: &str, _args_json: &str) -> bool {
+                false
+            }
+            fn sandbox_enabled(&self) -> bool {
+                true
+            }
+            fn ask(&self, _tool: &str, _args: &str) -> std::pin::Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+                Box::pin(async { true })
+            }
+        }
+        let cancel = Arc::new(CancelFlag::new());
+        let outcome = run_task(
+            &gateway,
+            &channels,
+            "sys prompt",
+            &[json!({ "role": "user", "content": "画个图" })],
+            &cancel,
+            &AgentConfig::default(),
+            &SandboxConfig::default(),
+            0,
+            &ContextConfig::default(),
+            &RecoveryConfig { checkpoint_enabled: false },
+            &mem,
+            None,
+            false,
+            &G,
+            crate::tools::workspace_root(),
+            move |ev: AgentEvent| match ev {
+                AgentEvent::Notice(t) => notices_c.lock().unwrap().push(t),
+                AgentEvent::Snapshot { messages } => snaps_c.lock().unwrap().push(messages),
+                AgentEvent::Content(t) => contents_c.lock().unwrap().push(t),
+                _ => {}
+            },
+        )
+        .await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        mock.join().unwrap();
+        let _ = std::fs::remove_dir_all(&ws);
+
+        assert_eq!(outcome.unwrap(), LoopOutcome::Done);
+        assert!(notices.lock().unwrap().iter().any(|n| n.contains("模型输出被截断")));
+        let snaps = snaps.lock().unwrap();
+        let last = snaps.last().expect("至少落一次快照");
+        let final_msg = last
+            .iter()
+            .rev()
+            .find(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+            .expect("快照应有最终回答消息");
+        assert_eq!(
+            final_msg.get("content").and_then(Value::as_str),
+            Some(""),
+            "截断在思考里：正文必须为空，不得回填思考文本"
+        );
+        assert_eq!(
+            final_msg.get("reasoning_content").and_then(Value::as_str),
+            Some("让我想想怎么画这只鹈鹕先画车身再画鸟"),
+            "思考内容照常随消息落盘，前端恢复成思考块"
+        );
+        assert!(
+            contents.lock().unwrap().is_empty(),
+            "思考不得经 Content 事件重发成正文，实际 {:?}",
+            *contents.lock().unwrap()
+        );
+    }
+
     // —— 删掉「连续两步相同工具调用 → 终止」护栏（与步数上限一样
     // 属变相限制，一律不要）。真机实测：建个定时任务翻几步配置就被判「模型重复请求相同
     // 工具调用」当场击杀。mock SSE：第 1、2 轮返回**完全相同**的 tool_calls，第 3 轮才收尾；
@@ -1998,8 +2085,6 @@ mod tests {
         );
         let channels = LoopChannels {
             primary: ch,
-            summary: None,
-            title: None,
             fallbacks: Vec::new(),
             downgrade: None,
             vision: None,

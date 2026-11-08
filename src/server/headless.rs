@@ -13,7 +13,7 @@ use super::*;
 use super::chat::{CancelRun, assemble_turn_channels, first_turn_brief, inject_brief_into_first_user, normalize_mode, turn_system_prompt};
 use super::gate::ChatGate;
 use super::subagent;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// 无头运行期间的工作区切换守卫：Drop 还原全局根。
 /// 放在跑整轮的任务里（随任务生命周期）——取消/超时后任务在后台收尾期间
@@ -112,7 +112,6 @@ struct Collectors {
     prompt_tokens: AtomicU64,
     cached_tokens: AtomicU64,
     last_snapshot: std::sync::Mutex<Vec<Value>>,
-    summary: std::sync::Mutex<Option<String>>,
     /// 会话用量快照（与 /api/chat 同一份口径）：无头轮过去完全不落盘，导致
     /// `pawch-agent.exe run` / 定时任务 / 子代理跑过的会话切回去圆环是空的——现在同样维护。
     usage: std::sync::Mutex<crate::session::SessionUsage>,
@@ -246,7 +245,14 @@ pub(crate) async fn run_headless_inner(
     let rec_cfg = (*state.recovery_cfg).clone();
     let allow_unsandboxed = cfg.allow_unsandboxed;
     let (mode, mode_notice) = normalize_mode(&cfg, &req.approval_mode);
-    // M1：档位写进本会话（与 /api/chat 同一张表，UI 切档对进行中的无头轮同样即时生效）
+    // M1：档位写进本会话（与 /api/chat 同一张表，UI 切档对进行中的无头轮同样即时生效）。
+    // 跑完要还原（见任务收尾处）：只插不删会把定时任务跑过的固定会话钉死在任务当时
+    // 的档位上——之后在界面里聊天也沿用旧档，改全局默认、删任务都无效。
+    let prev_approval = state
+        .session_approval
+        .read()
+        .ok()
+        .and_then(|m| m.get(&session_id).cloned());
     if let Ok(mut m) = state.session_approval.write() {
         m.insert(session_id.clone(), mode.clone());
     }
@@ -275,7 +281,12 @@ pub(crate) async fn run_headless_inner(
         .map(|f| f.messages)
         .unwrap_or_default();
     history.push(json!({ "role": "user", "content": message }));
-    let mut prior_summary = state.session.get(&session_id).and_then(|f| f.summary);
+    // 静默压缩视图：会话文件里的 compact 记录 → 请求侧「摘要 + 尾段」
+    let compact_view = state
+        .session
+        .get(&session_id)
+        .and_then(|f| f.compact.clone())
+        .map(|r| crate::compact::CompactView::from_record(&r));
     let ch = assemble_turn_channels(&state, &s, &active_cfg, &req.model, &req.base_url, &req.api_key);
     let system_prompt = turn_system_prompt(&state, &ch.primary).await;
     // 新会话第一轮：项目现状 brief 并进首条 user 消息（不进系统提示，保缓存前缀，
@@ -334,6 +345,9 @@ pub(crate) async fn run_headless_inner(
     let col_task = col.clone();
     let notices_task = notices_cell.clone();
     let task_tokens = AtomicU64::new(0);
+    // 档位登记的还原件：跑完在任务收尾处把会话档位放回跑前的值
+    let approval_modes = state.session_approval.clone();
+    let inserted_mode = mode.clone();
     // 子代理 token 并入本任务预算的水印（无头父任务同样防拆解绕过预算）
     let subagent_seen = AtomicU64::new(subagent::subagent_tokens(&session_id));
     let budget_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -355,6 +369,10 @@ pub(crate) async fn run_headless_inner(
 
     // 任务指定工作区：跑前切过去（会话也记到该项目下），跑完 Drop 还原全局根
     let ws_override = req.workspace.trim().to_string();
+    // 子代理子会话首次落盘就通知侧栏刷新：原来子代理轮一律不推 sessions_changed，
+    // 新会话要手动刷新页面才看得见（2026-11-07 用户实报「要刷新才有」）。
+    let is_child = !req.parent_session.trim().is_empty();
+    let child_announced = AtomicBool::new(false);
 
     // 整轮（含排队追加消息的有界续跑）跑在独立任务里：取消守卫随任务生命周期，
     // 超时后任务仍在后台收尾也保持着「会话在跑」的登记——不会出现双写会话文件。
@@ -388,8 +406,6 @@ pub(crate) async fn run_headless_inner(
                 &gateway,
                 &agent::LoopChannels {
                     primary: ch.primary.clone(),
-                    summary: ch.summary.clone(),
-                    title: ch.title.clone(),
                     fallbacks: ch.fallbacks.clone(),
                     downgrade: ch.downgrade.clone(),
                     // 视觉转写渠道（主模型没勾图片解析时，给截图当眼睛）
@@ -408,7 +424,7 @@ pub(crate) async fn run_headless_inner(
                 &ctx_cfg,
                 &rec_cfg,
                 &mem,
-                prior_summary.clone(),
+                compact_view.clone(),
                 plan_mode,
                 &gate,
                 pinned_ws.clone(),
@@ -468,19 +484,15 @@ pub(crate) async fn run_headless_inner(
                         let mut messages = messages;
                         crate::server::chat::strip_brief_from_first_user(&mut messages);
                         *col_task.last_snapshot.lock().unwrap_or_else(|e| e.into_inner()) = messages.clone();
-                        let cur = col_task.summary.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                        if let Err(e) = session_mgr.save(&sid, &messages, cur.as_deref()) {
+                        if let Err(e) = session_mgr.save(&sid, &messages, None) {
                             observability::event(
                                 EventType::Error,
                                 json!({ "message": format!("会话落盘失败: {e}") }),
                             );
+                        } else if is_child && !child_announced.swap(true, Ordering::Relaxed) {
+                            // 子代理子会话第一次落盘 → 侧栏立即刷新，新会话不用手动刷新才出现
+                            crate::server::ui_events::emit(json!({ "kind": "sessions_changed" }));
                         }
-                    }
-                    agent::AgentEvent::Summary(sm) => {
-                        *col_task.summary.lock().unwrap_or_else(|e| e.into_inner()) = Some(sm);
-                    }
-                    agent::AgentEvent::Title(t) => {
-                        let _ = session_mgr.rename(&sid, &t);
                     }
                     agent::AgentEvent::Notice(n) => {
                         notices_task.lock().unwrap_or_else(|e| e.into_inner()).push(n);
@@ -534,19 +546,27 @@ pub(crate) async fn run_headless_inner(
             if next.is_empty() {
                 next = history.clone();
             }
-            let turn_msgs: Vec<Value> = extra
-                .iter()
-                .map(|s| match s.mode {
-                    crate::core::steer::SteerMode::Interrupt => json!({ "role": "user", "content": s.text, "interrupted": true }),
-                    _ => json!({ "role": "user", "content": s.text, "steered": true }),
-                })
-                .collect();
+            let turn_msgs: Vec<Value> = extra.iter().map(|s| s.to_message()).collect();
             next.extend(turn_msgs);
             history = next;
-            prior_summary = col_task.summary.lock().unwrap_or_else(|e| e.into_inner()).clone();
         }
         // 钩子（027）：任务结束挂点（Done / Cancelled / 出错都算结束；含续跑轮）
         crate::hooks::session_end(&sid).await;
+        // 档位登记只属于这一轮：跑完还原成跑前的值（跑前没有就摘掉，新会话不留
+        // 隐性档位）。用户中途在界面切过档（当前值不再是本轮写入的）就以用户为准，
+        // 同 WorkspaceGuard 的「只还我自己设的那个值」纪律。
+        if let Ok(mut m) = approval_modes.write()
+            && m.get(&sid).map(String::as_str) == Some(inserted_mode.as_str())
+        {
+            match &prev_approval {
+                Some(v) => {
+                    m.insert(sid.clone(), v.clone());
+                }
+                None => {
+                    m.remove(&sid);
+                }
+            }
+        }
         (status, error)
     });
 
@@ -602,7 +622,7 @@ pub(crate) async fn run_headless_inner(
     );
     // 顶层无头轮（定时任务/CLI/脚本唤醒，非子代理）跑完 → 通知打开中的页面刷新会话列表：
     // 新建的会话即时进侧栏，不用重启/手动刷新（2026-10-05 真机实测「重启软件才能看到」）。
-    // 子代理轮（parent_session 非空）不推，免得刷屏。界面刷新类事件，无人订阅即丢弃。
+    // 子代理轮在子会话首次落盘时已推过一次（见上方 Snapshot 分支），这里不重复推。
     if req.parent_session.trim().is_empty() {
         crate::server::ui_events::emit(json!({ "kind": "sessions_changed" }));
     }

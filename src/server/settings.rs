@@ -63,6 +63,9 @@ pub struct SettingsUpdate {
     /// 内置功能开关（功能桥接/css-ui工具/记忆库）。Some = 整体替换
     #[serde(default)]
     pub features: Option<crate::config::settings::FeatureSettings>,
+    /// 上下文压缩线（% 窗口，40–85；0=清除恢复默认 85）
+    #[serde(default)]
+    pub compact_percent: Option<u8>,
 }
 
 /// 供应商预设列表（数据驱动自 providers.json）。
@@ -103,7 +106,7 @@ pub(super) async fn get_settings_schema() -> Json<Value> {
 
 pub(super) async fn get_settings(State(state): State<AppState>) -> Json<Value> {
     let s = state.settings.read().unwrap_or_else(|e| e.into_inner()).clone();
-    let mut v = config_state_json(&s);
+    let mut v = config_state_json(&s, state.context_cfg.budget_tokens);
     v["env_key"] = json!(std::env::var("DEEPSEEK_API_KEY").is_ok());
     Json(v)
 }
@@ -111,13 +114,30 @@ pub(super) async fn get_settings(State(state): State<AppState>) -> Json<Value> {
 /// 把 SettingsUpdate 应用到当前激活配置（put_settings 的主体逻辑，独立成纯函数便于单测；
 /// pub(crate)：agent 的 settings 工具复用同一套字段语义，见 tools/settings.rs）。
 /// 返回 (url_changed, provider_id, effective_model)。
-pub(crate) fn apply_settings_update(s: &mut Settings, req: &SettingsUpdate) -> (bool, String, String) {
+pub(crate) fn apply_settings_update(s: &mut Settings, req: &SettingsUpdate) -> Result<(bool, String, String), String> {
     s.ensure_active_config();
 
     if let Some(v) = &req.name {
         s.set_active_name(v);
     }
 
+    if let Some(v) = req.compact_percent {
+        // 40–85 之外一律拒：压缩线是用户把控节奏的阀，静默钳制会让「设了没生效」变成悬案
+        if v == 0 {
+            s.compact_percent = None;
+        } else if (40..=85).contains(&v) {
+            s.compact_percent = Some(v);
+        } else {
+            let msg = format!("compact_percent={v} 不在 40–85（0 = 清除回默认）");
+            crate::observability::event(
+                crate::observability::EventType::Error,
+                serde_json::json!({ "message": msg }),
+            );
+            // 显式报错而不是静默吞掉：以前这里早退后，本次更新里排在后面的字段
+            // 全部不生效，端点却照样 200——「设了没生效」成了悬案（2026-11-08 审计）
+            return Err(msg);
+        }
+    }
     let mut result = (false, "deepseek".to_string(), "deepseek-chat".to_string());
     if let Some(c) = s.active_mut() {
         let url_before = crate::config::settings::normalize_base(&c.effective_base_url());
@@ -175,7 +195,7 @@ pub(crate) fn apply_settings_update(s: &mut Settings, req: &SettingsUpdate) -> (
                 _ => None,
             };
         }
-        if let Some(v) = req.thinking_style.as_deref() {
+        if let Some(v) = &req.thinking_style.as_deref() {
             let v = v.trim().to_lowercase();
             c.thinking_style = if v.is_empty() || v == "auto" { None } else { Some(v.to_string()) };
         }
@@ -193,7 +213,7 @@ pub(crate) fn apply_settings_update(s: &mut Settings, req: &SettingsUpdate) -> (
         }
         result = (changed, c.provider_id.clone(), c.effective_model());
     }
-    result
+    Ok(result)
 }
 
 /// 保存设置。api_key 非空则 DPAPI 加密持久化到当前激活配置；clear_key=true 则清除。
@@ -206,7 +226,13 @@ pub(super) async fn put_settings(
     // settings 工具改设置即中，前者的键在内存与磁盘上一致地丢）。
     let _w = state.settings_write.lock().unwrap_or_else(|e| e.into_inner());
     let mut s = state.settings.write().unwrap_or_else(|e| e.into_inner()).clone();
-    let (url_changed, pid, eff_model) = apply_settings_update(&mut s, &req);
+    // 非法值（如 compact_percent 越界）→ 400 人话错误，不再静默跳过整次更新
+    // 非法值（如 compact_percent 越界）→ 400 人话错误，不再静默跳过整次更新
+    let (url_changed, pid, eff_model) = match apply_settings_update(&mut s, &req) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))),
+    };
+
 
     if url_changed {
         observability::event(
@@ -241,7 +267,7 @@ pub(super) async fn put_settings(
         EventType::State,
         json!({ "kind": "settings.updated", "provider_id": pid, "model": eff_model }),
     );
-    (StatusCode::OK, Json(config_state_json(&s)))
+    (StatusCode::OK, Json(config_state_json(&s, state.context_cfg.budget_tokens)))
 }
 
 /// settings.json 变更后的运行时同步（幂等）：settings 落盘后把停用名单/MCP 配置/
@@ -406,11 +432,13 @@ pub(super) async fn manage_configs(
         EventType::State,
         json!({ "kind": "config.changed", "action": req.action, "provider_id": pid, "model": model }),
     );
-    (StatusCode::OK, Json(config_state_json(&s)))
+    (StatusCode::OK, Json(config_state_json(&s, state.context_cfg.budget_tokens)))
 }
 
 /// 配置快照（含各配置 key 状态与角色路由），供前端全量刷新。
-fn config_state_json(s: &Settings) -> Value {
+/// `global_budget` = config.toml `[context].budget_tokens`：渠道没设 context_length
+/// 时生效的全局窗口，前端圆环分母要的是「渠道覆盖后的生效值」`context_window`。
+fn config_state_json(s: &Settings, global_budget: u64) -> Value {
     let active = s.active_or_default();
     let preset = gateway::providers::find(&active.provider_id);
     let key = s.get_key();
@@ -445,6 +473,9 @@ fn config_state_json(s: &Settings) -> Value {
         "model": active.model,
         "models": active.models,
         "context_length": active.context_length,
+        // 渠道覆盖后的生效窗口（圆环分母 / 压缩线同一把尺子；前端不再自己猜全局值）。
+        // 0 视同未设（手工改出来的 0 不该把窗口压成 0）。
+        "context_window": active.context_length.filter(|v| *v > 0).unwrap_or(global_budget),
         "max_output_tokens": active.max_output_tokens,
         "temperature": active.temperature,
         "top_p": active.top_p,
@@ -463,6 +494,8 @@ fn config_state_json(s: &Settings) -> Value {
         "thinking_style": effective_thinking_style(active, preset),
         "roles": s.roles,
         "features": s.features,
+        // 压缩线回传给前端（漏了它 applyState 会把输入框弹回默认 85）
+        "compact_percent": s.compact_percent,
     })
 }
 
@@ -530,6 +563,16 @@ mod tests {
         s.configs.push(test_config());
         s.active_config_id = Some("cfg-t".into());
         s
+    }
+
+    #[test]
+    fn context_window_covers_channel_and_global_budget() {
+        let mut s = test_settings();
+        // 渠道没设上下文长度 → 生效窗口 = 全局预算（config.toml [context].budget_tokens）
+        assert_eq!(config_state_json(&s, 96000)["context_window"], json!(96000));
+        // 渠道设了 → 覆盖全局；前端圆环分母读的就是它（2026-11-07 圆环停在旧值）
+        s.active_mut().unwrap().context_length = Some(200_000);
+        assert_eq!(config_state_json(&s, 96000)["context_window"], json!(200_000));
     }
 
     #[test]
@@ -656,7 +699,7 @@ mod tests {
             thinking_style: Some("zai".into()),
             ..Default::default()
         };
-        apply_settings_update(&mut s, &req);
+        let _ = apply_settings_update(&mut s, &req);
         assert_eq!(s.active().unwrap().thinking_style.as_deref(), Some("zai"));
         let mut p = build_chat_params(s.active().unwrap(), gateway::providers::find("custom"));
         // 端点探测对中转域名给 openai 兜底；显式覆盖必须赢
@@ -683,7 +726,7 @@ mod tests {
             thinking_style: Some("auto".into()),
             ..Default::default()
         };
-        apply_settings_update(&mut s, &req);
+        let _ = apply_settings_update(&mut s, &req);
         assert!(s.active().unwrap().thinking_style.is_none(), "auto=清除覆盖");
     }
 
@@ -697,14 +740,14 @@ mod tests {
             thinking_style: Some("deepseek".into()),
             ..Default::default()
         };
-        apply_settings_update(&mut s, &req);
+        let _ = apply_settings_update(&mut s, &req);
         assert_eq!(s.active().unwrap().thinking_style.as_deref(), Some("deepseek"));
         // 换供应商预设 → 覆盖让位回端点探测
         let req = SettingsUpdate {
             provider_id: Some("zhipu".into()),
             ..Default::default()
         };
-        apply_settings_update(&mut s, &req);
+        let _ = apply_settings_update(&mut s, &req);
         assert_eq!(
             s.active().unwrap().thinking_style.as_deref(),
             None,
@@ -716,14 +759,14 @@ mod tests {
             thinking_style: Some("openai".into()),
             ..Default::default()
         };
-        apply_settings_update(&mut s, &req);
+        let _ = apply_settings_update(&mut s, &req);
         assert_eq!(s.active().unwrap().thinking_style.as_deref(), Some("openai"));
         // 同值重写不清（没真正换供应商就不动覆盖）
         let req = SettingsUpdate {
             provider_id: Some("stepfun".into()),
             ..Default::default()
         };
-        apply_settings_update(&mut s, &req);
+        let _ = apply_settings_update(&mut s, &req);
         assert_eq!(
             s.active().unwrap().thinking_style.as_deref(),
             Some("openai"),
@@ -745,7 +788,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        apply_settings_update(&mut s, &req);
+        let _ = apply_settings_update(&mut s, &req);
         assert!(s.active().unwrap().capabilities_user_set);
         assert!(s.active().unwrap().capabilities.vision);
         // 切到别的模型：手动标记原样保留
@@ -753,7 +796,7 @@ mod tests {
             model: Some("qwen3.8-flash".into()),
             ..Default::default()
         };
-        apply_settings_update(&mut s, &req);
+        let _ = apply_settings_update(&mut s, &req);
         assert!(
             s.active().unwrap().capabilities.vision,
             "用户手动标记的 vision 不得被模型切换冲掉"
@@ -765,7 +808,7 @@ mod tests {
             model: Some("qwen-vl-max".into()),
             ..Default::default()
         };
-        apply_settings_update(&mut s2, &req);
+        let _ = apply_settings_update(&mut s2, &req);
         let c = s2.active().unwrap();
         assert!(
             !c.capabilities.vision,
@@ -787,7 +830,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        apply_settings_update(&mut s, &req);
+        let _ = apply_settings_update(&mut s, &req);
         let p = build_chat_params(s.active().unwrap(), gateway::providers::find("custom"));
         assert!(!p.tools_enabled);
         let body = gateway::build_body(

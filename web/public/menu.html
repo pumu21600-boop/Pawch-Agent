@@ -21,6 +21,13 @@
         inset: 0;
         background: transparent;
       }
+      /* 浅色主题：主界面同一套微橙暖色（html.light 由下面脚本按 localStorage 的 theme 切，
+         与宿主 App 的 resolveTheme 口径一致，system 也在这解） */
+      html.light .card {
+        background: #fffefc;
+        border-color: #e7e2da;
+        box-shadow: 0 8px 28px rgba(15, 23, 42, 0.18);
+      }
       .card {
         position: absolute;
         display: none;
@@ -62,6 +69,18 @@
         flex: none;
         color: #a7abb5;
       }
+      html.light .card button {
+        color: #1f1d1a;
+      }
+      html.light .card button:hover {
+        background: #f3f0eb;
+      }
+      html.light .card button:disabled {
+        color: #87827a;
+      }
+      html.light .card svg {
+        color: #87827a;
+      }
     </style>
   </head>
   <body>
@@ -77,9 +96,16 @@
       </button>
     </div>
     <script>
+      const params = new URLSearchParams(location.search);
       // 壳按需创建本 webview 时把锚点放进了 URL query（ax/ay = 「⋯」按钮相对本 webview
       // 左上角的坐标，aw/ah = 按钮尺寸，tab = 当前可见标签）。加载即得，无时序竞态。
-      const params = new URLSearchParams(location.search);
+      // 主题跟宿主 App：以壳随 URL 传入的为准（服务端从当前应用主题算出的权威值）；
+      // URL 没带时回落 localStorage（App 存 theme 键），system 再按 OS 深浅色解析
+      try {
+        const mode = params.get('theme') || localStorage.getItem('theme') || 'dark';
+        const light = mode === 'light' || (mode === 'system' && matchMedia('(prefers-color-scheme: light)').matches);
+        document.documentElement.classList.toggle('light', light);
+      } catch {}
       const anchor = {
         ax: parseFloat(params.get('ax') || '0'),
         ay: parseFloat(params.get('ay') || '0'),

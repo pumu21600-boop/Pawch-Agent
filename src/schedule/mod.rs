@@ -65,10 +65,13 @@ pub struct ScheduleTask {
     /// 非空时整轮切到该目录跑（完成会话也记在这个项目下），跑完还原全局根。
     #[serde(default)]
     pub workspace: String,
-    /// 审批档位（透传无头会话；空 = 用 config 默认档）
+    /// 审批档位（透传无头会话；空 = 用 config 默认档）。
+    /// 设置→定时 只露这三档（2026-11-08 档位下拉合并）；高危策略不再单独选，
+    /// 由生效档位推导（见 [`unattended_on_approval`]）。
     #[serde(default)]
     pub approval_mode: String,
-    /// 高危操作策略：deny（缺省）| approve
+    /// 高危操作策略：deny | approve。**已废弃**：界面不再提供这个选项，执行时
+    /// 改由生效档位推导（本字段只为老 settings.json 兼容保留，校验照常放行旧值）
     #[serde(default)]
     pub on_approval: String,
     #[serde(default = "yes")]
@@ -378,6 +381,16 @@ pub fn run_now(state: &AppState, id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 无头轮每轮都推的固定话术前缀——落进完成记录就是噪音，展示时滤掉。
+const UNATTENDED_NOTICE_PREFIX: &str = "无人值守会话：";
+
+/// 定时任务的高危策略由生效档位决定（无人值守没有人点允许）：
+/// 只读/自动 = 命中审批一律拒绝并回喂；完全访问 = 全免审。
+/// 旧的 on_approval 任务字段废弃不再读取（子代理路径显式 deny，不受影响）。
+fn unattended_on_approval(eff_mode: &str) -> &'static str {
+    if eff_mode == "full-access" { "approve" } else { "deny" }
+}
+
 /// 发起一次唤醒：占守卫 → 无头会话 → 回写状态 + 通知。
 fn fire(state: &AppState, task: ScheduleTask, trigger: &'static str, manual: bool) {
     {
@@ -431,6 +444,9 @@ fn fire(state: &AppState, task: ScheduleTask, trigger: &'static str, manual: boo
         } else {
             task.message.clone()
         };
+        // 高危策略由生效档位推导（2026-11-08 档位下拉合并成三档）：只读/自动命中审批
+        // 一律拒绝，完全访问全免审。存量 on_approval 字段废弃，不再读取。
+        let (eff_mode, _) = crate::server::normalize_mode(&state.agent_cfg, &task.approval_mode);
         let req = crate::server::HeadlessRequest {
             message,
             session_id: task.fixed_session().unwrap_or("").to_string(),
@@ -438,31 +454,43 @@ fn fire(state: &AppState, task: ScheduleTask, trigger: &'static str, manual: boo
             api_key: String::new(),
             approval_mode: task.approval_mode.clone(),
             plan_mode: false,
-            on_approval: task.on_approval.clone(),
-                budget_tokens: task.budget_tokens,
-                config_id: task.config_id.clone(),
-                model: task.model.clone(),
-                timeout_secs: if task.timeout_secs == 0 {
-                    DEFAULT_TIMEOUT_SECS
-                } else {
-                    task.timeout_secs
-                },
-                purpose: "schedule".into(),
-                parent_session: String::new(),
-                workspace: task.workspace.clone(),
-            };
+            on_approval: unattended_on_approval(&eff_mode).to_string(),
+            budget_tokens: task.budget_tokens,
+            config_id: task.config_id.clone(),
+            model: task.model.clone(),
+            timeout_secs: if task.timeout_secs == 0 {
+                DEFAULT_TIMEOUT_SECS
+            } else {
+                task.timeout_secs
+            },
+            purpose: "schedule".into(),
+            parent_session: String::new(),
+            workspace: task.workspace.clone(),
+        };
         let result = crate::server::run_headless_inner(state.clone(), req).await;
-        let (status, session_id, error, duration_ms) = match result {
+        let (status, session_id, error, duration_ms, run_notices) = match result {
             Ok(r) => (
                 r.status.clone(),
                 r.session_id.clone(),
                 r.error.clone().unwrap_or_default(),
                 r.duration_ms,
+                r.notices,
             ),
-            Err((_code, msg)) => ("error".to_string(), String::new(), msg, 0),
+            Err((_code, msg)) => ("error".to_string(), String::new(), msg, 0, Vec::new()),
         };
-        // 通知不贴回答内容（去会话里看）；只有出错才带一句原因
-        let detail = if status == "done" { String::new() } else { error.clone() };
+        // 完成记录带上无头轮的提示（原来整段丢弃——选了「完全访问」实际被回退成
+        // 自动，用户在记录里看不到任何原因）。无人值守固定话术每轮都推、落进记录
+        // 全是噪音，滤掉；last_error 仍只存真错误。
+        let detail = {
+            let mut ns: Vec<String> = run_notices
+                .into_iter()
+                .filter(|n| !n.starts_with(UNATTENDED_NOTICE_PREFIX))
+                .collect();
+            if !error.is_empty() {
+                ns.insert(0, error.clone());
+            }
+            ns.join("；")
+        };
         // 回写任务状态（自动触发才动 last_run_ts——排期基准不能被手动跑打乱）
         write_back(
             &state,
@@ -608,6 +636,14 @@ fn parse_rfc3339(s: &str) -> Option<i64> {
 mod tests {
     use super::*;
     use chrono::Timelike;
+
+    /// 高危策略随生效档位走（2026-11-08 档位下拉合并）：只读/自动拒绝、完全访问放行。
+    #[test]
+    fn unattended_on_approval_follows_mode() {
+        assert_eq!(unattended_on_approval("read-only"), "deny");
+        assert_eq!(unattended_on_approval("auto"), "deny");
+        assert_eq!(unattended_on_approval("full-access"), "approve");
+    }
 
     fn task(cron: &str, mode: &str, sid: &str) -> ScheduleTask {
         ScheduleTask {

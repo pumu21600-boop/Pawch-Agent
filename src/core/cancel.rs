@@ -20,6 +20,9 @@ use std::sync::{Arc, Mutex};
 #[derive(Debug, Default)]
 pub struct CancelFlag {
     flag: AtomicBool,
+    /// 「刷新回来认领」标记：断线取消的看门狗在宽限期内看到它就不再取消本轮
+    /// （刷新会断开 SSE，但人没有走开）。
+    revived: AtomicBool,
     /// 异步等待用——工具执行（如卡在浏览器 CDP 调用里）只靠轮询 is_set
     /// 要等工具自己超时（用户点「结束回答」后新消息会白等几十秒进队列）。
     /// set() 时唤醒所有等待者，agent 循环用 select! 当场中断工具执行。
@@ -28,7 +31,21 @@ pub struct CancelFlag {
 
 impl CancelFlag {
     pub fn new() -> Self {
-        Self { flag: AtomicBool::new(false), notify: tokio::sync::Notify::new() }
+        Self {
+            flag: AtomicBool::new(false),
+            revived: AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// 页面刷新回来认领本轮：断线取消的宽限窗口到此结束，任务继续跑。
+    pub fn revive(&self) {
+        self.revived.store(true, Ordering::SeqCst);
+    }
+
+    /// 本轮是否已被刷新回来的页面认领。
+    pub fn is_revived(&self) -> bool {
+        self.revived.load(Ordering::SeqCst)
     }
 
     /// 置位（停止按钮 / 审批卡的取消路径）。
@@ -142,6 +159,34 @@ impl CancelRegistry {
         flags.len()
     }
 
+    /// 页面刷新回来认领指定会话（断线取消宽限内）：命中在跑的一轮返回 true。
+    /// 只豁免断线看门狗，不清「停止」标志——用户点过停止的轮次认领也救不回来。
+    pub fn revive(&self, session_id: &str) -> bool {
+        let flag = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session_id)
+            .cloned();
+        match flag {
+            Some(f) => {
+                f.revive();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 指定会话当前这一轮是否已被刷新回来的页面认领。
+    pub fn is_revived(&self, session_id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session_id)
+            .map(|f| f.is_revived())
+            .unwrap_or(false)
+    }
+
     /// 指定会话是否已被请求取消（没在跑 = false）。
     pub fn is_set(&self, session_id: &str) -> bool {
         self.inner
@@ -225,6 +270,24 @@ mod tests {
         // 别的会话新一轮同样不影响 a
         let b = reg.try_begin("b").unwrap();
         assert!(a2.is_set() && !b.is_set(), "新会话不得复位他人已收到的停止");
+    }
+
+    #[test]
+    fn revive_marks_only_the_running_turn() {
+        let reg = CancelRegistry::new();
+        let a = reg.try_begin("a").unwrap();
+        assert!(!reg.is_revived("a"), "新一轮默认没有被认领");
+        assert!(reg.revive("a"), "在跑的一轮可以认领");
+        assert!(reg.is_revived("a") && a.is_revived());
+        assert!(!a.is_set(), "认领不得把取消位当成置过的信号");
+        assert!(!reg.revive("b"), "没在跑的会话认领是空操作");
+        // 停止仍然有效：认领只豁免断线看门狗
+        reg.cancel("a");
+        assert!(a.is_set());
+        // 新一轮是全新标志，不继承上一轮的认领
+        reg.end("a", &a);
+        let a2 = reg.try_begin("a").unwrap();
+        assert!(!reg.is_revived("a") && !a2.is_revived());
     }
 
     #[test]

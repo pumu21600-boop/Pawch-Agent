@@ -50,6 +50,46 @@ const CTL_ADDR: (&str, u16) = ("127.0.0.1", 9225);
 const GUARD_PORT: u16 = 9224;
 /// child webview 弹窗防护：window.open 直接掐掉（on_new_window 再兜一层）
 const POPUP_GUARD_JS: &str = "window.open = function () { return null; };";
+/// 网页面板滚动条跟随应用主题（2026-11-08 用户实锤：浅色模式下深色页面/未声明
+/// color-scheme 的页面把滚动条画成深色，跟浅色面板不搭）。首选色系（prefers-color-
+/// scheme）跟着窗口主题走、窗口主题跟应用主题走，所以这里监听它切换即可：
+/// 浅色 = 注入一套浅色滚动条样式（!important 压过页面自带的深色滚动条），
+/// 深色 = 摘掉样式还页面本来面目。只在网页面板的 webview 注入，menu 弹层不注。
+const SCROLLBAR_THEME_JS: &str = r#"(function () {
+  var CSS = '::-webkit-scrollbar{width:14px !important;height:14px !important}'
+    + '::-webkit-scrollbar-track{background:#efedea !important}'
+    + '::-webkit-scrollbar-thumb{background:#c9c4bd !important;border-radius:7px !important;border:3px solid #efedea !important}'
+    + '::-webkit-scrollbar-thumb:hover{background:#b3ada4 !important}'
+    + '::-webkit-scrollbar-corner{background:#efedea !important}';
+  var style = null;
+  function apply() {
+    var light = false;
+    try { light = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches; } catch (e) {}
+    if (!light) {
+      if (style) { style.parentNode && style.parentNode.removeChild(style); style = null; }
+      return;
+    }
+    if (style) return;
+    // 绝不能在 document 上 append：document_start 时 head/documentElement 还没建出来，
+    // 挂到 document 上的 <style> 会成为文档根元素，解析器随后建不出 html/body——
+    // 整页白屏（2026-11-08 真机实锤：file:// 页面全白，http 页碰巧没中）。
+    // 没有可挂的父节点就等后续机会（readystatechange / DOMContentLoaded 一定会来）。
+    var parent = document.head || document.documentElement;
+    if (!parent) return;
+    style = document.createElement('style');
+    style.id = 'pawch-light-scrollbar';
+    style.textContent = CSS;
+    parent.appendChild(style);
+  }
+  apply();
+  document.addEventListener('DOMContentLoaded', apply);
+  document.addEventListener('readystatechange', apply);
+  try {
+    window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', apply);
+  } catch (e) {
+    try { window.matchMedia('(prefers-color-scheme: light)').addListener(apply); } catch (e2) {}
+  }
+})();"#;
 /// 主 webview 的身份标记：给本壳窗口里所有 `/api/browser/*` 请求打上
 /// `X-Agent-Client: shell`。服务端据此分辨「壳里那个客户端」和「用户在普通浏览器里
 /// 开的第二个客户端」——浏览器客户端量的 x/y 是它自己窗口的坐标，不认出来的话会被
@@ -310,12 +350,17 @@ static APP_HANDLE: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::
 
 /// 显示并聚焦主窗口（托盘左键/菜单「打开主窗口」与「第二个壳敲守卫端口」共用）。
 fn show_main_window() {
-    if let Some(app) = APP_HANDLE.get() {
-        if let Some(w) = app.get_webview_window("main") {
+    let Some(app) = APP_HANDLE.get() else { return };
+    match app.get_webview_window("main") {
+        Some(w) => {
             let _ = w.show();
             let _ = w.unminimize();
             let _ = w.set_focus();
         }
+        // 窗口对象不在（被销毁/尚未建好）：静默返回 = 用户点托盘毫无反应
+        // （2026-11-08 偶发实锤，疑似强杀壳的幽灵托盘图标+窗口销毁的组合）。
+        // 留一行日志，下次复发有迹可查。
+        None => slog("托盘打开：主窗口对象不在（已销毁或尚未建好）"),
     }
 }
 
@@ -443,6 +488,17 @@ fn op_f64(op: &Value, key: &str, default: f64) -> f64 {
 fn op_bool(op: &Value, key: &str, default: bool) -> bool {
     op.get(key).and_then(Value::as_bool).unwrap_or(default)
 }
+/// 背景色字段（[r,g,b]；缺省 = 不设置，WebView2 自己的画布色跟系统深浅色走——
+/// 系统深色时 about:blank 等空白页就是黑的，应用浅色主题下必须显式给亮色）。
+fn op_bg(op: &Value) -> Option<tauri::utils::config::Color> {
+    op.get("bg")
+        .and_then(Value::as_array)
+        .filter(|a| a.len() == 3)
+        .map(|a| {
+            let v = |i: usize| a.get(i).and_then(Value::as_u64).unwrap_or(0) as u8;
+            tauri::utils::config::Color(v(0), v(1), v(2), 255)
+        })
+}
 /// 尺寸字段（宽高有下限，防 0 尺寸的 webview）。
 fn op_size(op: &Value) -> (f64, f64) {
     (
@@ -566,17 +622,35 @@ fn dispatch(app: &tauri::AppHandle, op: &Value) {
                 slog(&format!("create 失败：URL 解析不了 {url}"));
                 return;
             };
-            let builder = WebviewBuilder::new(&label, WebviewUrl::External(parsed))
+            let mut builder = WebviewBuilder::new(&label, WebviewUrl::External(parsed))
                 .additional_browser_args(BROWSER_ARGS)
                 .initialization_script(POPUP_GUARD_JS)
+                .initialization_script(SCROLLBAR_THEME_JS)
                 .on_new_window(|_url, _features| tauri::webview::NewWindowResponse::Deny);
+            // 空白页（about:blank/未落地的页面）画布色跟主题走，别让系统深色把
+            // 浅色主题的网页面板衬出一块黑（2026-11-07 用户实锤）
+            let bg = op_bg(op);
+            if let Some(c) = bg {
+                builder = builder.background_color(c);
+                // 窗口主题跟**应用**主题（不是系统）：child webview 的
+                // PreferredColorScheme 继承窗口主题——系统深色时 about:blank 这类
+                // 没有自身背景色的页面会被 UA 直接画成 #121212 深色画布，
+                // background_color 只在页面不画的地方生效，根本轮不到（真机 2026-11-07
+                // CDP 截图实锤）。set_theme 同时经 ThemeChanged 事件同步全部存量 webview。
+                let theme =
+                    if c.0 > 128 { tauri::Theme::Light } else { tauri::Theme::Dark };
+                let _ = win.set_theme(Some(theme));
+            }
             match win.add_child(builder, LogicalPosition::new(x, y), LogicalSize::new(w, h)) {
                 Ok(wv) => {
                     if !visible {
                         let _ = wv.hide();
                     }
                     host.insert(label.clone(), wv);
-                    slog(&format!("create {label} {url} {w}x{h} visible={visible}"));
+                    slog(&format!(
+                        "create {label} {url} {w}x{h} visible={visible} bg={:?}",
+                        bg.map(|c| [c.0, c.1, c.2])
+                    ));
                 }
                 Err(e) => slog(&format!("create {label} 失败: {e}")),
             }
@@ -649,8 +723,13 @@ fn dispatch(app: &tauri::AppHandle, op: &Value) {
             let (ax, ay) = (op_f64(op, "ax", 0.0) - x, op_f64(op, "ay", 0.0) - y);
             let (aw, ah) = (op_f64(op, "aw", 26.0), op_f64(op, "ah", 26.0));
             let tab = op_str(op, "tab", "");
+            // 窗口主题对齐**当前**应用主题：主题是窗口级设置，浅色时代建过网页会把
+            // 窗口主题卡在 Light，之后切深色 → 菜单/DevTools 全跟浅色（真机 2026-11-08）。
+            // 顺手随 URL 传给菜单页——比菜单页自己读 localStorage 更权威（无时序差）。
+            let theme = op_str(op, "theme", "dark");
+            let _ = win.set_theme(Some(if theme == "light" { tauri::Theme::Light } else { tauri::Theme::Dark }));
             let url = format!(
-                "http://{SERVICE_URL}/menu.html?ax={ax}&ay={ay}&aw={aw}&ah={ah}&tab={tab}"
+                "http://{SERVICE_URL}/menu.html?ax={ax}&ay={ay}&aw={aw}&ah={ah}&tab={tab}&theme={theme}"
             );
             let Ok(parsed) = url.parse::<tauri::Url>() else {
                 slog("menu 失败：URL 解析不了");
@@ -834,8 +913,8 @@ fn main() {
             use tauri::menu::{Menu, MenuItem};
             use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
-            let open = MenuItem::with_id(app, "open", "打开主窗口", true, None::<&str>)?;
-            let quit = MenuItem::with_id(app, "quit", "退出壳（服务保持运行）", true, None::<&str>)?;
+            let open = MenuItem::with_id(app, "open", "打开", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&open, &quit])?;
 
             let _tray = TrayIconBuilder::with_id("main-tray")
@@ -844,13 +923,7 @@ fn main() {
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, ev| match ev.id.as_ref() {
-                    "open" => {
-                        if let Some(w) = app.get_webview_window("main") {
-                            let _ = w.show();
-                            let _ = w.unminimize();
-                            let _ = w.set_focus();
-                        }
-                    }
+                    "open" => show_main_window(),
                     "quit" => {
                         cleanup_shell_files();
                         app.exit(0)
@@ -864,12 +937,7 @@ fn main() {
                         ..
                     } = ev
                     {
-                        let app = tray.app_handle();
-                        if let Some(w) = app.get_webview_window("main") {
-                            let _ = w.show();
-                            let _ = w.unminimize();
-                            let _ = w.set_focus();
-                        }
+                        show_main_window();
                     }
                 })
                 .build(app)?;

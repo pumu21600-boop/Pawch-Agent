@@ -759,7 +759,7 @@ pub(crate) async fn dispatch(cmd: BrowserCommand, max_chars: usize) -> Result<St
                     // 静默图没有落盘路径兜底：不内联 = 模型什么都看不到，必须明说
                     "内部截图没有内联（超过 2MB，模型看不到）；请改用局部截图"
                 } else {
-                    "内部截图（只给你自己看，未在对话中展示）"
+                    "内部截图"
                 }
             } else if session.mode == HostMode::Shell {
                 "截图已拍下（网页面板显示实时页面，截图在对话里）"

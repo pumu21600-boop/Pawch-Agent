@@ -41,6 +41,10 @@ const ALLOW = [
   [/await fetch\('\/api\/ask'/, 'ask 回答提交：只判 r.ok，无响应体要读'],
   // 视频壁纸清除：发了就忘的 DELETE，本地状态立即重置
   [/fetch\('\/api\/wallpaper'/, '视频壁纸清除：发了就忘的 DELETE，不读响应体'],
+  // 刷新回来认领在跑的一轮：发了就忘，认领结果不影响页面状态（继续由对账轮询补齐）
+  [/fetch\('\/api\/chat\/revive'/, '刷新认领：发了就忘，不读响应体'],
+  // 刷新后重新附着直播（/api/chat/attach）：URL 在下一行，响应体走 getReader() 流式解析（同 /api/chat）
+  [/\? await fetch\($/, '重附着 SSE：流式响应走 getReader()，不能整体 json()'],
 ];
 
 function walk(dir, out = []) {

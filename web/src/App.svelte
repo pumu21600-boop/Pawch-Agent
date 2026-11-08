@@ -23,6 +23,7 @@
     partsFromStoredMessage,
     messageParts,
     mergeAssistantRun,
+    fileUserIndexOf,
     attachToolPreview,
     attachApprovalToToolPart,
     settleApprovalOnParts,
@@ -36,6 +37,7 @@
     processSummary,
     processIsLive,
     toolMeta,
+    parseArgs,
     prettyArgs,
   } from './lib/chat.js';
   import RenameModal from './lib/RenameModal.svelte';
@@ -86,8 +88,13 @@
   // projected=下一次请求的预估占用（圆环分子，实报锚点+带符号增量）、
   // pressure=最近一次渠道实报的 prompt（锚点，没拿到时为 null）、window=模型窗口（圆环分母）
   let ctxUsage = { projected: 0, pressure: null, window: 0, breakdown: null };
+  // 当前生效的上下文窗口（渠道 context_length 覆盖全局预算后的值，由设置接口给出）：
+  // 圆环分母的唯一事实源。不能跟着某一轮的 context_usage 走——跑着的时候改设置，
+  // 那一轮手里还是旧窗口，每个 step 的 context_usage 会把圆环打回旧值（真机 2026-11-07）。
+  let ctxWindow = 0;
   let ctxLen = 0; // 当前模型上下文长度（0=默认）
   let maxOut = 0; // 当前模型最大输出长度（0=默认）
+  let compactPercent = 85; // 上下文压缩线（% 窗口，40–85；settings.compact_percent 缺省=85）
   let temperature = null; // 采样温度（null=渠道默认）
   let topP = null; // 核采样（null=渠道默认）
   let thinking = ''; // 思考开关：''=渠道默认 / on / off
@@ -143,16 +150,28 @@
   // 只更新变动的那一条，初次加载同样受益（只有可见块参与布局绘制）。
   // 块的估位高度 = 块内条数 × 140px（沿用单条消息的估位口径，滚动条不跳）。
   const CV_CHUNK = 20;
+  // 压缩标记行若是最后一条，从分块里拆出来单独渲染：cv-chunk 带 paint containment，
+  // 零高度溢出的文案会被裁掉（2026-11-08 真机踩过）；且它作为 chat-body 直接子元素
+  // 零高度渲染 = 不占滚动高度，标记出现/落定不再顶动对话区
+  let tailCompactMarker = null;
+  $: tailCompactMarker = (() => {
+    const last = messages[messages.length - 1];
+    return last && last.role === 'system' && last.kind === 'compact_marker' ? last : null;
+  })();
   $: messageChunks = (() => {
+    const list = tailCompactMarker ? messages.slice(0, -1) : messages;
     const out = [];
-    for (let i = 0; i < messages.length; i += CV_CHUNK) {
-      const msgs = messages.slice(i, i + CV_CHUNK);
+    for (let i = 0; i < list.length; i += CV_CHUNK) {
+      const msgs = list.slice(i, i + CV_CHUNK);
       out.push({ key: msgs[0].id, n: msgs.length, msgs });
     }
     return out;
   })();
   let sessionMsgs = {}; // key（会话 id 或 '@new'）→ 消息数组
   let streams = {}; // key → { asstId, controller } 正在跑的那条流
+  // 每会话最后收到的事件 seq：刷新后 /api/chat/attach 从这里接着补发+直播。
+  // 一轮开始（后端 begin 重置 seq）时清掉旧值。
+  let chatSeq = {};
   // 服务端在跑、但本页没有流的会话（别的窗口/页面重载后）：侧栏也给转圈，
   // 不然「原对话看着已结束，其实后台还在跑」，人就不知道该不该引导（2026-11-05 实测）。
   let serverRunning = {};
@@ -494,6 +513,9 @@
   }
   onMount(() => {
     adoptWinApi();
+    // 第一件事：刷新回来就认领在跑的一轮（断线取消宽限 30 秒，越早越好——
+    // 后面 loadProviders/loadSettings 重会话恢复要几秒）
+    reviveAfterReload();
     // 输入区草稿：先按本标签页当前的 key 载入（随后恢复上次会话时由 setCurSession 换成那条的）
     restoreComposer(curKey());
     window.addEventListener('agentwinready', adoptWinApi);
@@ -668,7 +690,9 @@
     // 全量 reflow，拖拽就跟不上手——真机实测拖拽帧 p95 41ms、22% 掉到 30fps 以下。
     // 拖拽中用户也不看消息区，停手后下一次 flush 自然补上滚动位置与微调标记。
     const dragging = resizing || rpResizing || termResizing;
-    if (!dragging && chatPinned && chatBody) chatBody.scrollTop = chatBody.scrollHeight;
+    // compactScrollHold：压缩标记出现/落定这类更新不钉底——标记只是背景工作的痕迹，
+    // 为它把正在看的视口往上推一截，看起来就是「对话区弹一下」（2026-11-08 用户实拍）
+    if (!dragging && chatPinned && !compactScrollHold && chatBody) chatBody.scrollTop = chatBody.scrollHeight;
     // 单元素微调标记：Svelte 重渲染会重建节点，这里按存下的路径补盖 data-mt
     if (!dragging) stampMicroUids();
   });
@@ -837,7 +861,12 @@
   function onGlobalClick(e) {
     rpAddOpen = false;
     const t = e.target;
-    if (t instanceof Element && t.closest('.bar-menu')) return;
+    if (!(t instanceof Element)) return;
+    // 目标已不在文档里 = 点击过程中菜单 DOM 被框架拆掉（点「选择能力」会先收加号
+    // 菜单再开能力菜单）：事件仍在冒泡，但 closest 已够不着 .bar-menu——
+    // 当成「点在外面」会把刚开的菜单立刻关掉，看起来就是「点了没反应」（2026-11-07 实锤）。
+    if (!t.isConnected) return;
+    if (t.closest('.bar-menu')) return;
     plusMenuOpen = false;
     abilityMenuOpen = false;
     approvalMenuOpen = false;
@@ -850,6 +879,16 @@
   // 自动 = 工作区与整台电脑都可动（越界写按高危先问），shell 恒沙箱
   // 完全访问 = 整台电脑可动且免审批，shell 本机直跑（需 config 总开关）
   const APPROVAL_LABELS = { 'read-only': '只读', auto: '自动', 'full-access': '完全访问' };
+  // 审批档图标（收起态只显示图标；展开选择时才显示图标 + 名称）：
+  // 只读=闭锁，自动=盾牌勾，完全访问=开锁。
+  const APPROVAL_ICONS = {
+    'read-only':
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4.5" y="10.5" width="15" height="9.5" rx="2"/><path d="M8 10.5V7.6a4 4 0 0 1 8 0v2.9"/></svg>',
+    auto: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.2 19 6v5.2c0 4.4-3 7.6-7 9.1-4-1.5-7-4.7-7-9.1V6Z"/><path d="m9 11.6 2 2 4.2-4.4"/></svg>',
+    'full-access':
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4.5" y="10.5" width="15" height="9.5" rx="2"/><path d="M8 10.5V7.6a4 4 0 0 1 7.7-1.6"/></svg>',
+  };
+  const approvalIcon = (m) => APPROVAL_ICONS[m] || APPROVAL_ICONS.auto;
   // 审批档切换的请求序号：并发乱序时以「最后一次点击」为准，过期响应丢弃（F14）
   let approvalPickSeq = 0;
   async function pickApproval(m) {
@@ -892,6 +931,54 @@
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       send();
+      return;
+    }
+    // 引用 token（/能力、@上下文）整体删除（2026-11-08 用户拍板）：光标在 token 尾部
+    // 或内部按 Backspace、头部或内部按 Delete，一次删整块（含紧随的空格）——
+    // ZCode mention 同款。Ctrl+Backspace（删词）撞上 token 也走整块。
+    if ((e.key === 'Backspace' || e.key === 'Delete') && !composerComposing) {
+      const el = composerInputEl;
+      if (!el || el.selectionStart !== el.selectionEnd) return; // 有选区：原生整段删就是整块
+      const p = el.selectionStart;
+      const dir = e.key === 'Backspace' ? 'back' : 'del';
+      if (dir === 'back' ? p === 0 : p >= (input || '').length) return;
+      const span = composerTokenAt(input || '', p, dir);
+      if (!span) return;
+      e.preventDefault();
+      removeComposerSpan(span);
+    }
+  }
+  /// 光标处命中引用 token（与 COMPOSER_REF_RE 同一把尺子）：back=找 s<pos≤e，
+  /// del=找 s≤pos<e。命中返回 [start, end]（end 吃掉紧随的一个空格）。
+  function composerTokenAt(text, pos, dir) {
+    const re = /(^|\s)([/@][^\s]+)/g;
+    let m;
+    while ((m = re.exec(text))) {
+      const s = m.index + m[1].length;
+      let e = s + m[2].length;
+      const hit = dir === 'back' ? s < pos && pos <= e : s <= pos && pos < e;
+      if (!hit) continue;
+      if (text[e] === ' ') e += 1; // 引用插入时带尾随空格，删块连它一起
+      return [s, e];
+    }
+    return null;
+  }
+  function removeComposerSpan([s, e]) {
+    const el = composerInputEl;
+    if (!el) return;
+    el.focus();
+    el.setSelectionRange(s, e);
+    // execCommand('delete')：走原生编辑命令，input 事件照发（绑定/autoRows/高亮自动跟），
+    // 且 Ctrl+Z 能撤销这次整块删除。只认它的返回值当失败依据——不能拿 el.value === input
+    // 判失败：成功路径绑定同步完成后两者恰好相等，会误触发回退把后面的字符再删一遍
+    // （2026-11-08 实测「/引用 后缀」被删成「/引用 」）。
+    let ok = false;
+    try { ok = document.execCommand('delete'); } catch {}
+    if (!ok) {
+      el.setRangeText('', s, e, 'end');
+      input = el.value;
+      autoRows({ target: el });
+      syncComposerHl();
     }
   }
   function autoRows(e) {
@@ -937,7 +1024,17 @@
     while (Date.now() < deadline) {
       try {
         const r = await fetch('/api/version', { cache: 'no-store' });
-        if (r.ok) return true;
+        if (r.ok) {
+          sessionStorage.removeItem('pawch_auth_reloaded');
+          return true;
+        }
+        // 401 = 页面本身是缓存/旧文档，没有同源 cookie。普通重试永远是 401，
+        // 必须强制回源一次拿 Set-Cookie（2026-11-06 桌面端实锤：显示暂无会话/未选模型）。
+        if (r.status === 401 && !sessionStorage.getItem('pawch_auth_reloaded')) {
+          sessionStorage.setItem('pawch_auth_reloaded', '1');
+          location.replace('/?t=' + Date.now());
+          return false;
+        }
       } catch (e) {
         /* 服务还没起：继续等 */
       }
@@ -1001,6 +1098,21 @@
     if (!editingField('configName')) configName = s.name || '';
     if (!editingField('ctxLen')) ctxLen = s.context_length || 0;
     if (!editingField('maxOut')) maxOut = s.max_output_tokens || 0;
+    if (!editingField('compactPercent')) compactPercent = s.compact_percent || 85;
+    // 圆环分母 = 当前生效的上下文窗口（服务端算好：渠道 context_length > 全局预算）。
+    // 之前只看 s.context_length：跑着的时候改设置，那一轮每个 step 的 context_usage
+    // 又带着旧窗口把它打回去；清空长度（0）更是永远停在旧值（真机 2026-11-07
+    // 「改完圆环一直是旧的」）。这里存成常驻值，后面所有恢复/事件都向它对表。
+    {
+      const win = Number(s.context_window) || Number(s.context_length) || 0;
+      if (win) {
+        ctxWindow = win;
+        if (win !== ctxUsage.window) ctxUsage = { ...ctxUsage, window: win };
+        const k = curKey();
+        if (usageBySession[k])
+          usageBySession = { ...usageBySession, [k]: { ...usageBySession[k], ctx: { ...usageBySession[k].ctx, window: win } } };
+      }
+    }
     if (!editingField('temperature')) temperature = s.temperature ?? null;
     if (!editingField('topP')) topP = s.top_p ?? null;
     providerId = s.provider_id || 'deepseek';
@@ -1021,9 +1133,9 @@
       normPath(prevWorkspace).toLowerCase() !== normPath(workspace).toLowerCase()
     ) notifyExtsWorkspace(workspace);
     recentWorkspaces = s.recent_workspaces || [];
-    // 圆环常驻：会话未开始时也用配置预算初始化（context_length 或全局默认 96000）
+    // 圆环常驻：会话未开始时也用配置预算初始化（context_window 或全局默认 96000）
     if (!ctxUsage.window) {
-      ctxUsage = { ...ctxUsage, window: s.context_length || 96000 };
+      ctxUsage = { ...ctxUsage, window: ctxWindow || s.context_length || 96000 };
     }
     configs = s.configs || [];
     activeConfigId = s.active_config_id || '';
@@ -1391,12 +1503,15 @@
   }
 
   // 2026-10-04 修：原来 loadMcp/loadSkills 不 await，菜单先于数据打开——第一次开
-  // 能力菜单 MCP/技能组永远空的（数据到了要开第二次才见）。改成等加载完再开。
-  async function openAbilityMenu() {
+  // 能力菜单 MCP/技能组永远空的（数据到了要开第二次才见）。当时改成等加载完再开；
+  // 2026-11-07 真机实锤反过来也伤人：任一接口慢/挂住（MCP 预连、服务忙），
+  // 点「选择能力」就完全没有反应。改成菜单**先开**，数据后台补上——Svelte 响应式
+  // 会把到了的技能/MCP 直接填进开着的菜单，加载中给一行占位。
+  function openAbilityMenu() {
     plusMenuOpen = false;
-    if (!skillsData.length) await loadSkills();
-    if (!mcpServers.length && !wasmPlugins.length) await loadMcp();
     abilityMenuOpen = true;
+    if (!skillsData.length && !skillsLoading) loadSkills();
+    if (!mcpServers.length && !wasmPlugins.length && !mcpLoading) loadMcp();
   }
   // 「/」菜单分组（用户 2026-10-02 第三/四轮）：技能=自己建的非插件技能；
   // 插件=**全部已启用插件**（第四轮实测「只列了那几个，全都要呀」）。
@@ -1446,7 +1561,7 @@
   // 页签列表与面板开合同一生命周期：**会话级**（sessionStorage）——刷新本页保留，重开
   // 软件从零开始（用户 2026-10-30 复述 10-10 的决定：打开侧栏不该自己冒出任何面板）。
   // 曾经存 localStorage：面板关着、页签列表却在重启后原样恢复，用户点开侧栏时
-  // 「上次开着的那个面板」就成了默认值（实测：重启后点开侧栏直接是「用量价格」）。
+  // 「上次开着的那个面板」就成了默认值（实测：重启后点开侧栏直接是「使用统计」）。
   // 旧 localStorage 键一次性清掉，避免旧记录继续误导。
   try {
     localStorage.removeItem('rpTabs');
@@ -1903,9 +2018,10 @@
     if (p) openPreviewTab(p);
   }
   // 工具结果里的截图：browser 截图会把 `![页面截图](/api/workspace/raw?path=...)`
-  // 写在结果最前面。过程块（思考+工具）收尾后默认收起，图不能留在里面——
-  // 提到气泡层面常显，用户才真的「看得到」（2026-11-05 实测「截完一直不发给我，
-  // 一直说保存在浏览器面板」）。只认工作区图片，别的链接不放。
+  // 写在结果最前面。**只在收尾展示**（多步任务中途的截图是模型自查用的，静默让
+  // 模型自己看；气泡里摊出整轮的每一张只会重复刷屏——真机 2026-11-07「两张一样的图」）：
+  // 调用方在收尾态取最后一张摊开，中途一律不摊；要看中间的走工具行点主语开侧栏预览。
+  // 只认工作区图片，别的链接不放。
   function shotsFromParts(parts) {
     const out = [];
     for (const p of parts || []) {
@@ -1914,6 +2030,23 @@
       if (m && !out.includes(m[1])) out.push(m[1]);
     }
     return out;
+  }
+  // 工具行可点的主语 → 侧栏预览路径（ZCode 式：行上只有文件名，点一下侧边栏看
+  // 内容/图，平时不摊截图）。文件工具从参数拿完整路径（半截 JSON 参数点了没用，
+  // 只认解析成功的）；截图从结果动作文本里拿 screenshots/*.png（结果到了才可点）。
+  function toolPreviewPath(it) {
+    const o = parseArgs(it.args);
+    if (o) {
+      for (const k of ['path', 'file_path', 'file', 'filename']) {
+        const v = o[k];
+        if (typeof v === 'string' && v.trim()) return v.trim();
+      }
+    }
+    if (it.preview) {
+      const m = String(it.preview).match(/screenshots\/[^\s"')]+\.png/);
+      if (m) return m[0];
+    }
+    return null;
   }
   let webActiveId = '';
   let webAddress = '';
@@ -1971,6 +2104,14 @@
   }
   // 原生托管：壳模式 + 本客户端就是壳 → 面板内容区让给 child webview
   $: webNative = webMode === 'shell' && inTauriShell();
+  /// 浏览器面板宿主模式：活跃会话的 mode 是权威；**没有活跃会话**时 state 里的
+  /// mode:"headless" 只是空态默认值——壳里下一次启动仍会是 shell（ctl 连着），
+  /// 按无头渲染会让「⋯」菜单丢掉「开发者工具」项（2026-11-08 用户实锤）。
+  function resolveWebMode(s) {
+    const mode = s.mode || 'headless';
+    if (mode === 'headless' && s.running === false && inTauriShell()) return 'shell';
+    return mode;
+  }
   // 壳 webview 弹窗让位（2026-10-31 用户给 ZCode 截图对照：「有弹窗的时候浏览器画面也在」）：
   // 壳里 child webview 是原生窗口，弹窗（DOM）永远盖不住它。做法：弹窗打开时服务端把
   // webview **移出屏幕外保活渲染**（visible 不关——IsVisible=false 会暂停渲染），
@@ -2015,10 +2156,13 @@
     webSyncViewport();
   }
   function shellSuppressSync() {
-    // 需要「让位」的 DOM 浮层有三类：弹窗（.modal-backdrop）、标签栏「＋」的添加菜单
-    // （.rp-add-menu）、记忆库星云（.galaxy）。都能盖住网页菜单——壳里 child webview
-    // 是原生窗口、永远浮在 DOM 之上（2026-11-05 截图：浏览器开着时压在记忆库上层）。
-    // 处理同弹窗：webview 移出屏幕保活 + 面板走帧流，浮层就能完整显示。
+    // 需要「让位」的 DOM 浮层有四类：弹窗（.modal-backdrop）、标签栏「＋」的添加菜单
+    // （.rp-add-menu）、记忆库星云（.galaxy）、大图预览（.backdrop.modal-backdrop，
+    // 2026-11-07 审计补入——「预览图片被内置浏览器盖住」）。都能盖住网页——壳里
+    // child webview 是原生窗口、永远浮在 DOM 之上（2026-11-05 截图：浏览器开着时
+    // 压在记忆库上层）。处理同弹窗：webview 移出屏幕保活 + 面板走帧流，浮层就能
+    // 完整显示。审计口径：凡 position:fixed inset:0 的浮层都必须在列（全仓扫过，
+    // 其余=壁纸层 z0/非原生模式的网页菜单/侧栏区小菜单，均与 webview 无交集）。
     const has = !!document.querySelector('.modal-backdrop, .rp-add-menu, .galaxy');
     if (has && !shellModalLive) shellModalOn();
     else if (!has && shellModalLive) shellModalOff();
@@ -2110,7 +2254,7 @@
     try {
       const s = await webApi('/api/browser/state', { cache: 'no-store' });
       webTabs = s.tabs || [];
-      webMode = s.mode || 'headless';
+      webMode = resolveWebMode(s);
       webDialog = s.dialog || null;
       // 就绪门：状态到手后 web-tabbar 行才定型（有标签 = 多一行，无标签 = 整行消失），
       // 之前量的矩形都是瞬态（webview 会跳一下再跳回）。就绪后补一发同步——若标签条
@@ -2185,7 +2329,7 @@
         // 走的是这条路——不同步的话面板按**无头模式**渲染（截图 img 分支），壳里的真
         // webview 随后才_pop_进来，用户看到的就是「先闪几下」（坏截图/暗区→真页面）。
         // 壳模式面板直接渲染 .web-native 占位，等 webview 就位即可。
-        if (s.mode && s.mode !== webMode) webMode = s.mode;
+        if (s.mode && s.mode !== webMode) webMode = resolveWebMode(s);
         if (s.dialog !== undefined) webDialog = s.dialog || null;
         // 标签清单随时同步：agent 开新页/导航之后，页签条上的标题和地址必须跟着变。
         // 以前只有 loadWebState 才刷这份清单——agent 操作完面板里留着旧标题，用户看到的
@@ -4044,67 +4188,106 @@
   }
 
   // 真正发一轮（key 会话；调用时该会话没在跑）。返回 false = 这条没送进服务端。
+  // opts.resume：刷新后重新附着正在跑的一轮（不新建气泡/不发消息，只续播事件）。
   async function deliver(key, text, atts, opts = {}) {
-    const convs = opts.convs || [];
-    // 引用对话块只在发送侧拼（模型拿全文），用户气泡保持「我打的那句 + 引用 chip」
-    const fullMsg = (text || '') + convBlocks(convs);
-    const effectiveMsg = fullMsg.trim() || (atts.length > 0 ? '请查看分析附带的媒体文件' : '');
-    if (!effectiveMsg) return true;
-    // 发送时收起所有输入区菜单
-    plusMenuOpen = false;
-    abilityMenuOpen = false;
-    modelMenuOpen = false;
-    // 新会话：顶栏标题即时取首条消息（与后端初始标题一致），不等标题生成
-    if (!currentSessionId && effectiveMsg) currentTitle = effectiveMsg.slice(0, 50);
-    const history = (sessionMsgs[key] || [])
-      .filter((m) => (m.role === 'user' && m.content && !m.queued) || (m.role === 'assistant' && m.content && !m.streaming))
-      .map((m) => ({ role: m.role, content: m.content }));
-    history.push({ role: 'user', content: effectiveMsg, ts: Date.now() });
-    const asstId = nextId();
-    // 出队 / 立即发送的那条：原地把「排队中」气泡转正（保持顺序），不新增用户气泡。
-    // 引导（steer + silentSteer）反过来：**撤掉**排队气泡——
-    // 引导是静默的，不占对话气泡位，只显示「已引导」标记。
-    const hasBubble = opts.bubbleId && (sessionMsgs[key] || []).some((m) => m.id === opts.bubbleId);
-    if (opts.silentSteer) {
-      updMsgs(key, (a) => [
-        ...a.filter((m) => m.id !== opts.bubbleId),
-        { id: asstId, role: 'assistant', content: '', thinking: '', tools: [], parts: [], streaming: true, workStartedAt: Date.now(), ts: Date.now() },
-      ]);
-    } else {
-      updMsgs(key, (a) => [
-        ...a.map((m) => (opts.bubbleId && m.id === opts.bubbleId ? { ...m, queued: false, steered: !!opts.steer, interrupted: !!opts.interrupt } : m)),
-        ...(hasBubble ? [] : [{ id: nextId(), role: 'user', content: text, attachments: atts, convs, ts: Date.now() }]),
-        { id: asstId, role: 'assistant', content: '', thinking: '', tools: [], parts: [], streaming: true, workStartedAt: Date.now(), ts: Date.now() },
-      ]);
+    const resume = opts.resume || null;
+    const convs = resume ? [] : (opts.convs || []);
+    let effectiveMsg = '';
+    if (!resume) {
+      // 引用对话块只在发送侧拼（模型拿全文），用户气泡保持「我打的那句 + 引用 chip」
+      const fullMsg = (text || '') + convBlocks(convs);
+      effectiveMsg = fullMsg.trim() || (atts.length > 0 ? '请查看分析附带的媒体文件' : '');
+      if (!effectiveMsg) return true;
+      // 发送时收起所有输入区菜单
+      plusMenuOpen = false;
+      abilityMenuOpen = false;
+      modelMenuOpen = false;
+      // 新会话：顶栏标题即时取首条消息前 10 字（与后端落盘口径一致），不等任何生成
+      if (!currentSessionId && effectiveMsg) currentTitle = effectiveMsg.slice(0, 10);
+    }
+    const history = [];
+    if (!resume) {
+      for (const m of sessionMsgs[key] || []) {
+        if ((m.role === 'user' && m.content && !m.queued) || (m.role === 'assistant' && m.content && !m.streaming)) {
+          history.push({ role: m.role, content: m.content });
+        }
+      }
+      history.push({ role: 'user', content: effectiveMsg, ts: Date.now() });
+    }
+    const asstId = resume ? resume.asstId : nextId();
+    if (!resume) {
+      // 出队的那条：原地把「排队中」气泡转正（保持顺序），不新增用户气泡。
+      // 引导（steer + silentSteer）反过来：**撤掉**排队气泡——
+      // 引导是静默的，不占对话气泡位，只显示「已引导」标记。
+      // 立即发送（interrupt，2026-11-07 语义变更）= 服务端停掉当前轮、这条作为
+      // **新一轮**发出：气泡保持「排队中」，等被停那轮收尾的 turn 事件转正开新一轮；
+      // 不预开回答气泡（服务端回 interrupted 回执，本轮不在本请求的流上）。
+      const hasBubble = opts.bubbleId && (sessionMsgs[key] || []).some((m) => m.id === opts.bubbleId);
+      if (opts.silentSteer) {
+        updMsgs(key, (a) => [
+          ...a.filter((m) => m.id !== opts.bubbleId),
+          { id: asstId, role: 'assistant', content: '', thinking: '', tools: [], parts: [], streaming: true, workStartedAt: Date.now(), ts: Date.now() },
+        ]);
+      } else if (opts.interrupt) {
+        updMsgs(key, (a) =>
+          hasBubble
+            ? a.map((m) => (m.id === opts.bubbleId ? { ...m, queued: true, steered: false, interrupted: false } : m))
+            : [...a, { id: nextId(), role: 'user', content: text, attachments: atts, convs, queued: true, ts: Date.now() }]
+        );
+      } else {
+        updMsgs(key, (a) => [
+          ...a.map((m) => (opts.bubbleId && m.id === opts.bubbleId ? { ...m, queued: false, steered: !!opts.steer, interrupted: !!opts.interrupt } : m)),
+          ...(hasBubble ? [] : [{ id: nextId(), role: 'user', content: text, attachments: atts, convs, ts: Date.now() }]),
+          { id: asstId, role: 'assistant', content: '', thinking: '', tools: [], parts: [], streaming: true, workStartedAt: Date.now(), ts: Date.now() },
+        ]);
+      }
     }
     const ac = new AbortController();
-    // 引导/打断不是一轮对话：**不登记 streams**——登记会顶掉运行中那轮的
-    // 流条目，引导响应一结束 finally 又把它删掉，原轮还在跑本页却以为空闲了
-    // （再发消息走错分支、出队逻辑乱序）。引导的 SSE 只回执不产出，用不上这些。
-    const ownsTurn = opts.steer !== true && opts.interrupt !== true;
-    if (ownsTurn) streams = { ...streams, [key]: { asstId, controller: ac } };
+    // 引导/打断/重附着都不是一轮对话：**不登记 streams**——登记会顶掉运行中那轮的
+    // 流条目，流一结又把它删掉，原轮还在跑本页却以为空闲了。
+    const ownsTurn = !resume && opts.steer !== true && opts.interrupt !== true;
+    if (ownsTurn) {
+      streams = { ...streams, [key]: { asstId, controller: ac } };
+      // 新一轮：后端 seq 从 1 重新开始，清掉上一轮的尾号。
+      // 引导/打断不能清——它们接的是正在跑的那一轮，清了会把 seq 记回 0。
+      chatSeq = { ...chatSeq, [key]: 0 };
+    } else if (resume) {
+      // 重附着也登记流标记（attach:true，2026-11-08）：刷新后的页面原本 streams 为空，
+      // ①发送走成「普通发送」（服务端排队、回执渲染链路在重放窗口里不可靠）；
+      // ②refreshSessionsAndDropStale 见「本页没流」就按文件重建当前会话，把服务端
+      //   已接管的排队气泡抹掉（不在文件里）——点引导没反应、气泡闪没、任务像卡住。
+      //   登记后：发送=本地排队、停止按钮回来、防重建抹除；轮结束随流摘除。
+      streams = { ...streams, [key]: { asstId: resume.asstId, controller: ac, attach: true } };
+    }
     syncCur();
     const stream = { asstId, controller: ac };
     let skey = key; // 会话 id 到手后 key 会从 '@new' 变成真 id
     const patch = (fn) => patchAsst(skey, stream.asstId, fn);
     let ok = false;
     try {
-      const res = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          messages: history,
-          message: effectiveMsg,
-          attachments: atts.length > 0 ? atts.map((a) => ({ name: a.name, mime: a.mime, data: a.data })) : undefined,
-          model,
-          base_url: baseUrl,
-          approval_mode: approvalBySession[key] || approvalMode,
-          session_id: skey === '@new' ? '' : skey,
-          steer: opts.steer === true,
-          interrupt: opts.interrupt === true,
-        }),
-        signal: ac.signal,
-      });
+      const res = resume
+        ? await fetch(
+            `/api/chat/attach?session=${encodeURIComponent(resume.session || key)}&after=${resume.after || 0}`,
+            { signal: ac.signal }
+          )
+        : await fetch('/api/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              messages: history,
+              message: effectiveMsg,
+              attachments: atts.length > 0 ? atts.map((a) => ({ name: a.name, mime: a.mime, data: a.data })) : undefined,
+              model,
+              base_url: baseUrl,
+              approval_mode: approvalBySession[key] || approvalMode,
+              session_id: skey === '@new' ? '' : skey,
+              steer: opts.steer === true,
+              interrupt: opts.interrupt === true,
+              // 排队气泡原地升级（服务端把同文本 Queued 改档，不再排新的一条）
+              promote: opts.promote === true,
+            }),
+            signal: ac.signal,
+          });
       if (!res.ok) {
         // 服务端拒绝（如 409 同会话并发）：带出服务端文案，不伪装成连接错误
         let detail = '';
@@ -4113,13 +4296,16 @@
         } catch {}
         const err = new Error(detail || `HTTP ${res.status}`);
         err.busy = res.status === 409;
+        // 重附着 404 = 这一轮刚好结束：静默交给对账，不弹「连接错误」
+        if (resume) err.attachGone = true;
         throw err;
       }
       ok = true;
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buf = '';
-      for (;;) {
+      let attachStale = false;
+      attachOuter: for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
         buf += decoder.decode(value, { stream: true });
@@ -4131,11 +4317,19 @@
             if (!line.startsWith('data: ')) continue;
             try {
               const d = JSON.parse(line.slice(6));
-              if (d.session) {
+              // 重附着时 seq 不该倒退：倒退=同一会话已经开始了新一轮（旧页的尾号
+              // 比新轮大）——别再往旧气泡上贴，退出走文件重载
+              if (resume && d.seq && d.seq <= (resume.after || 0)) {
+                attachStale = true;
+                break attachOuter;
+              }
+              // 补发窗口与实时订阅交界处可能重复一条：按 seq 幂等跳过
+              if (d.seq && (chatSeq[skey] || 0) >= d.seq) continue;
+              if (d.session && !resume) {
                 // 新会话：服务端分配了 id → 缓冲 / 流 / 队列挪到真 id 下（显示中的话直接切过去）
                 rekey(skey, d.session);
                 skey = d.session;
-              } else if (d.queued) {
+              } else if (d.queued && !resume) {
                 // 服务端判成「这个会话在跑」（流断了/别的窗口刚起了一轮）：本条转排队、撤掉空回答气泡。
                 // **服务端接管了这条的投递**（本轮收尾它自己排水跑掉）——必须把它从出队队列摘掉：
                 // 否则「排队→流结束→出队→再发→又排队」就是无限请求风暴
@@ -4159,6 +4353,11 @@
                 }
                 const nid = nextId();
                 stream.asstId = nid;
+                // 登记条目的 asstId 一起改（done 分支按 controller 认自己的登记、
+                // 按 asstId 比对不再成立没关系，但登记留旧值会让「立即摘登记」落空）；
+                // 只动 controller 是本请求的那条——重附着流的 d.turn 是回放，不许碰。
+                const turnReg = streams[skey];
+                if (turnReg && turnReg.controller === ac) streams = { ...streams, [skey]: { ...turnReg, asstId: nid } };
                 updMsgs(skey, (a) => [...a, ...adds, { id: nid, role: 'assistant', content: '', thinking: '', tools: [], parts: [], streaming: true, workStartedAt: Date.now(), ts: Date.now() }]);
               } else if (d.content) {
                 // 正文 = 本段思考结束：把这段的跨度累进总时长并停表（实时数字不再走）。
@@ -4193,17 +4392,43 @@
                   parts: trimParts(trimParts(m.parts, 'content', d.reset.content || 0), 'thinking', d.reset.reasoning || 0),
                 }));
               else if (d.steer) {
-                // 引导/打断的消息并入了本轮。本页自己发过的（localSteers 按序配对）跳过——
-                // 引导的已在发送时显示「已引导」标记（不发气泡），打断的气泡已转正。
-                // 别的窗口发的在这里补：打断=正常用户气泡，引导=「已引导」静默标记（不占气泡位）。
+                // 引导并入（打断=正常用户气泡，转正路径不变）。并入的引导以
+                // {type:'steer'} part 插进当前回答 parts 的**末尾**——与重建后
+                // mergeAssistantRun 的落点一致（引导发生的边界处、过程流内），
+                // 不再追加独立行挂在轮尾（2026-11-08 真机：看着像掉队的消息）。
+                // 文件里这条是真 user（回滚序数命根）：fileUserIndexOf 对实时行与
+                // steer part 两形态都计数，实时/重建两边序数一致。
+                // 输入区上方的「已引导」提示按原设计保留到本轮结束；别的窗口在这里补。
                 const add = [];
                 for (const m of d.steer.messages || []) {
                   // content 可能是内容块数组（2026-11-03 引导带附件）：取文本部分比对/展示；
                   // 带附件时服务端会在原文后追加「附件已落盘/已内联」的提示，比对用前缀
                   const st = contentText(m.content);
                   if (localSteers.length > 0 && (st === localSteers[0] || st.startsWith(localSteers[0]))) localSteers.shift();
-                  else if (m.interrupted) add.push({ id: nextId(), role: 'user', content: st, interrupted: true, ts: m.ts || Date.now() });
-                  else guided = { ...guided, [skey]: [...(guided[skey] || []), { text: st }] };
+                  if (m.interrupted) {
+                    add.push({ id: nextId(), role: 'user', content: st, interrupted: true, ts: m.ts || Date.now() });
+                  } else {
+                    const part = { type: 'steer', text: st, ts: m.ts || Date.now() };
+                    updMsgs(skey, (arr) => {
+                      for (let i = arr.length - 1; i >= 0; i--) {
+                        if (arr[i].role === 'assistant') {
+                          const prevParts = arr[i].parts || [];
+                          // 幂等：同文标记已在尾部 = 同一事件被投递了两遍（回放边界/重连），
+                          // 再插就是重复标记
+                          const tail = prevParts[prevParts.length - 1];
+                          if (tail && tail.type === 'steer' && tail.text === st) return arr;
+                          const next = [...arr];
+                          next[i] = { ...next[i], parts: [...prevParts, part] };
+                          return next;
+                        }
+                      }
+                      // 没有回答行（极端时序）：退回补真实行，序数照样对
+                      return [...arr, { id: nextId(), role: 'user', content: st, steered: true, ts: m.ts || Date.now() }];
+                    });
+                    // 提示去重：pending_steers 铺回 + 事件同文会撞车
+                    const cur = guided[skey] || [];
+                    if (!cur.some((g) => g.text === st)) guided = { ...guided, [skey]: [...cur, { text: st }] };
+                  }
                 }
                 if (add.length) updMsgs(skey, (a) => [...a, ...add]);
               } else if (d.tool_call)
@@ -4344,18 +4569,21 @@
                   }
                   return a;
                 });
-              else if (d.title) {
-                loadSessions(true); //  TITLE：标题已生成，刷新会话列表
-                if (d.title && d.title !== currentTitle) currentTitle = d.title; // 顶栏同步模型生成的标题
-              }
+              // 「标题已生成」的 SSE 分支已删（2026-11-08 标题=首条消息前 10 字，服务端不再发 title 字段）
               else if (d.context_usage) {
                 // 用量按会话记账（后台会话写各自账本）；正在看的才刷到显示。
                 // 圆环的**唯一**写入口：后端按「实报锚点 + 带符号增量」算好 projected 推来，
-                // 前端只做展示，不再自己加减（旧写法与 api_usage 两处都写，口径会打架）
+                // 前端只做展示，不再自己加减（旧写法与 api_usage 两处都写，口径会打架）。
+                // 只认自己这轮：压缩收尾会往旧流补发 context_usage，若该会话已被
+                // 新一轮占用，旧快照会把圆环瞬时打小（下一步自愈，但闪一下）
+                const reg0 = streams[skey];
+                if (!(reg0 && reg0.controller !== ac)) {
                 const ctx = {
                   projected: d.context_usage.projected || 0,
                   pressure: d.context_usage.pressure ?? null,
-                  window: d.context_usage.window || 0,
+                  // 分母以当前设置为准：这一轮开始后改了上下文长度，事件里带的还是
+                  // 本轮启动时捕获的旧窗口，照单全收会把圆环打回旧值
+                  window: ctxWindow || d.context_usage.window || 0,
                   breakdown: d.context_usage.breakdown || null,
                 };
                 usageBySession = {
@@ -4363,6 +4591,7 @@
                   [skey]: { ctx, api: (usageBySession[skey] || {}).api || { prompt: 0, cached: 0 } },
                 };
                 if (skey === curKey()) ctxUsage = ctx;
+                }
               }
               else if (d.api_usage) {
                 // 渠道实报只进「累计流量」账（平均缓存命中率行）；圆环不在这里改
@@ -4382,32 +4611,87 @@
               } else if (d.error) {
                 patch(endTurn);
                 pushMsg(skey, { id: nextId(), role: 'error', content: d.error });
+              } else if (d.restarted) {
+                // 「立即发送」停掉旧轮开新轮：只收掉旧回答气泡，不显示「已停止」；
+                // 紧接着到来的 turn 事件把排队气泡转正并开新一轮的回答气泡。
+                patch(endTurn);
               } else if (d.cancelled) {
                 patch(endTurn);
                 pushMsg(skey, { id: nextId(), role: 'system', content: '已停止' });
+              } else if (d.compact_started) {
+                // 收尾静默压缩（2026-11-07）：done 已发（回答完成态），后台压缩在跑。
+                // 用户切走再切回来本地缓冲还在，行不丢；整页刷新后走会话文件重建（完成后才有）。
+                // 同 id 去重（2026-11-08 审计）：服务端同一事件走 SSE 与全局总线双通道，
+                // 总线先到时这里再插一条同 id 的，旧的那条永远转圈（settle 只收敛最后一条）。
+                const cmId = 'cm-' + d.compact_started.id;
+                if (!((sessionMsgs[skey] || []).some((x) => x.id === cmId))) {
+                  holdCompactScroll(() => pushMsg(skey, { id: cmId, role: 'system', kind: 'compact_marker', content: d.compact_started.text || '————正在压缩上下文————', state: 'running', ts: Date.now() }));
+                }
+              } else if (d.compact_done) {
+                settleCompactMarker(skey, d.compact_done.id, d.compact_done.text, 'done');
+              } else if (d.compact_failed) {
+                settleCompactMarker(skey, d.compact_failed.id, d.compact_failed.text || '————压缩失败，下轮结束后重试————', 'failed');
               } else if (d.done) {
                 patch(endTurn);
-                // 产物账本在任务收尾写入（零改动也会落空账本，用于区分「已记账、
-                // 本轮没产物」与「旧会话无记录」）；产物标签开着就刷新
-                if (rpTab === 'artifacts') loadArtifacts();
+                // done = 回答完成态。**流登记只摘自己的**（controller 是本请求的才摘）：
+                // 引导回执的 done 曾把在跑那轮的登记误摘——停止按钮闪没（完成态），
+                // 3 秒后「运行中」轮询又翻回未完成态（真机 2026-11-08）。压缩等收尾
+                // 事件还在同一条流上继续来，读循环继续吃；流关闭时 finally 再摘一次是幂等的。
+                // 带 seq 的 done 才是「这一轮真的结束」（引导/排队回执没有 seq）——
+                // 「已引导」标记完成使命。刷新/重附着进来的页面没有 ownsTurn 的
+                // finally，只能在这里摘。
+                if (d.seq) {
+                  const nextGuided = { ...guided };
+                  delete nextGuided[skey];
+                  guided = nextGuided;
+                }
+                const reg = streams[skey];
+                if (reg && reg.controller === ac) {
+                  const nextStreams = { ...streams };
+                  delete nextStreams[skey];
+                  streams = nextStreams;
+                  syncCur();
+                  // 产物账本在任务收尾写入（零改动也会落空账本，用于区分「已记账、
+                  // 本轮没产物」与「旧会话无记录」）；产物标签开着就刷新
+                  if (rpTab === 'artifacts') loadArtifacts();
+                }
               }
+              // 记住最后收到的事件序号：刷新后 attach 从这里补发（同一轮的直播尾巴）
+              if (d.seq) chatSeq = { ...chatSeq, [skey]: d.seq };
             } catch (e) {
               // 忽略坏行
             }
           }
         }
       }
+      if (attachStale) resume.stale = true;
     } catch (e) {
-      if (e.name !== 'AbortError') {
+      if (resume) {
+        // 重附着失败/这一轮刚好结束：不弹连接错误、不把气泡收成完成态；
+        // 交给 attachLiveSession 判断是重连还是文件重载
+        ok = false;
+      } else if (e.name !== 'AbortError') {
         pushMsg(skey, { id: nextId(), role: 'error', content: e.busy ? e.message : `[连接错误] ${e}` });
       }
-      // 停止后把还挂着的审批框标为失效，避免界面停在「等待决定」
-      updMsgs(skey, (a) =>
-        a.map((m) => (m.approval && m.approval.decided === null ? { ...m, approval: { ...m.approval, decided: false } } : m))
-      );
-      patch(endTurn);
+      if (!resume) {
+        // 停止后把还挂着的审批框标为失效，避免界面停在「等待决定」
+        updMsgs(skey, (a) =>
+          a.map((m) => (m.approval && m.approval.decided === null ? { ...m, approval: { ...m.approval, decided: false } } : m))
+        );
+        patch(endTurn);
+      }
     } finally {
-      if (ownsTurn) {
+      if (resume) {
+        // 重附着的流标记随流摘除（d.done 带序号时已摘过，这里是幂等兜底）；
+        // 本地排队的消息由 attachLiveSession 收尾的 drainOutbox 按序补发。
+        const reg = streams[skey];
+        if (reg && reg.controller === ac && reg.attach) {
+          const nextStreams = { ...streams };
+          delete nextStreams[skey];
+          streams = nextStreams;
+          syncCur();
+        }
+      } else if (ownsTurn) {
         // 这条流结束（本会话可再次发送）；只清本会话的流登记，别的会话在跑不受影响。
         // 引导请求（ownsTurn=false）绝不能走这段：它的流条目根本没登记，误删会把
         // 还在跑的那一轮登记清掉（本页从此以为会话空闲，出队/重发全部乱套）。
@@ -4421,11 +4705,12 @@
         guided = nextGuided;
         syncCur();
         // 流死了没产出任何内容（网络断/服务重启等）：撤掉空回答气泡，别留一个空壳。
+        // 思考不算「空」（截断在思考里=正文空但思考要留着，2026-11-07）。
         // 缓冲已被清掉的会话（切工作区 abort）不复活条目——否则空数组是 truthy，
         // 切回来会被当成「本地缓冲」用，历史照样全不见。
         if (sessionMsgs[skey]) {
           updMsgs(skey, (a) =>
-            a.filter((m) => m.id !== stream.asstId || m.content || (m.tools && m.tools.length) || m.approval)
+            a.filter((m) => m.id !== stream.asstId || m.content || m.thinking || (m.tools && m.tools.length) || m.approval)
           );
         }
         loadSessions(); // 刷新会话列表（新会话出现/标题更新）
@@ -4439,8 +4724,9 @@
     return ok;
   }
 
-  // 「立即发送 / 引导」（027 + 2026-10-22 分家）：把排队的这条马上并进正在跑的那一轮。
-  // mode='interrupt'（立即发送）= 打断：审批/工具/流式让位，新指令立即生效（消息正常上气泡）；
+  // 「立即发送 / 引导」（027 + 2026-10-22 分家；立即发送 2026-11-07 改语义）。
+  // mode='interrupt'（立即发送）= 停掉正在跑的这一轮，这条消息作为**新一轮**发出：
+  // 气泡保持「排队中」，被停那轮收尾的 turn 事件把它转正开新一轮（中途不占新气泡）；
   // mode='steer'（引导）= 不打断：跑完当前这步就并入，**静默**——撤掉排队气泡，
   // 只显示「已引导」标记，输入框立即可继续干别的。
   // 跑完了/没送进去会自动退回队列。
@@ -4456,6 +4742,10 @@
         ? { id: queuedMsg.id, text: queuedMsg.content, atts: queuedMsg.attachments || [], convs: queuedMsg.convs || [] }
         : null);
     if (!item) return;
+    // 这条只活在**服务端**队列里（本页 outbox 没有它）：引导/立即发送要走「原地升级」，
+    // 让服务端把那条 Queued 改档，而不是再排一条新的——否则本轮收尾会排水把原来那条
+    // 排队消息当新一轮发出去，用户就看到同一句话既「已引导」又自动重发（2026-11-07 真机）。
+    const serverQueued = !!queuedMsg && !(outbox[key] || []).some((x) => x.id === itemId);
     const label = mode === 'steer' ? '引导' : '立即发送';
     // 先出队（免得本轮结束时又自动发一遍）
     outbox = { ...outbox, [key]: (outbox[key] || []).filter((x) => x.id !== itemId) };
@@ -4481,8 +4771,11 @@
     const nAtt = (item.atts || []).length;
     const sentText = item.text || (nAtt ? '请查看分析附带的媒体文件' : '');
     const guidedText = nAtt ? `${item.text || '附件消息'}（附件 ${nAtt}）` : item.text;
-    localSteers.push(sentText);
+    // localSteers 只记引导：它靠服务端 steer 事件按序配对防重复补泡。
+    // 立即发送不再产生 steer 事件（新语义=停轮重启，走 turn 事件转正），
+    // 记进去反而会吞掉别的窗口真引导的同文消息。
     if (mode === 'steer') {
+      localSteers.push(sentText);
       // 引导：静默——撤气泡 + 「已引导」标记（带附件时标明数量）
       guided = { ...guided, [key]: [...(guided[key] || []), { text: guidedText }] };
     }
@@ -4491,6 +4784,7 @@
       steer: mode === 'steer',
       silentSteer: mode === 'steer',
       interrupt: mode === 'interrupt',
+      promote: serverQueued,
     });
     if (!ok) {
       // 没送进服务端：退回队列，等这一轮结束自动发
@@ -4542,13 +4836,15 @@
   }
 
   // 服务端截断（409=服务端还在收尾，退避重试）。cp=任务起点基线 id：带上时先恢复
-  // 工作区文件再截对话（回滚=文件+对话一起）
-  async function truncateRequest(key, userIndex, mode, cp = '') {
+  // 工作区文件再截对话（回滚=文件+对话一起）。expect=目标 user 消息的内容前缀：
+  // 服务端删前核对第 N 条是不是它——视图与文件序数一旦错位就「响」而不是删错段
+  // （防线二；真机 2026-11-08 两次数据损失后加）
+  async function truncateRequest(key, userIndex, mode, cp = '', expect = '') {
     for (let i = 0; i < 25; i++) {
       const r = await fetch('/api/sessions/truncate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: key, user_index: userIndex, mode, restore_checkpoint: cp || undefined }),
+        body: JSON.stringify({ id: key, user_index: userIndex, mode, restore_checkpoint: cp || undefined, expect: expect || undefined }),
       });
       const d = await r.json().catch(() => ({}));
       if (r.ok) return d;
@@ -4558,26 +4854,98 @@
     throw new Error('会话还在收尾，稍后再试');
   }
 
-  // 目标消息在会话文件里的「第几条 user 消息」序数（0 基）。
-  // 前端视图比文件多出排队气泡（没发出去）与检查点行（纯前端）——排除 queued 即对齐；
-  // 引导消息（steered）在文件里真有一条 user，必须计入。
+  // 目标消息在会话文件里的「第几条 user 消息」序数（0 基）。规则与坑都在
+  // chat.js 的 fileUserIndexOf（可单测）：排队排除、引导行/引导 part 计入。
+  // 2026-11-08 真机两次实锤：引导行被 mergeAssistantRun 透明化后序数整体少 1，
+  // 回滚把目标的前一步连带滚掉——防线二（服务端 expect 内容校验）见 truncateRequest。
   function fileUserIndex(key, m) {
-    const arr = sessionMsgs[key] || [];
-    const at = arr.findIndex((x) => x.id === m.id);
-    let n = 0;
-    for (let k = 0; k < at; k++) {
-      const x = arr[k];
-      if (x.role === 'user' && !x.queued) n++;
-    }
-    return n;
+    return fileUserIndexOf(sessionMsgs[key] || [], m.id);
   }
 
   // 从服务端重拉当前会话视图（截断后以文件为真源自愈）
   async function reloadSessionView(key) {
     const r = await fetch(`/api/session?id=${encodeURIComponent(key)}`).then((x) => x.json());
-    sessionMsgs = { ...sessionMsgs, [key]: rebuildFromSession(r.messages || []) };
+    await swapMsgsKeepScroll(key, withRunningCompacts(key, rebuildFromSession(r.messages || [])));
     syncCur();
     loadSessions();
+  }
+
+  // 压缩标记行的两个兜底（2026-11-07「正在压缩弹出来就消失」）：
+  // ① settleCompactMarker：完成/失败事件按 job id 找实时行；id 对不上（行刚被按文件
+  //    重建冲掉）就落到任意一条 running 标记上，一条都没有就补一行——事件不许静默丢失。
+  // ② withRunningCompacts：按文件重建视图时，压缩还在后台跑（文件里还没有标记行）
+  //    就把本地 running 行接回去；文件里已有完成标记则让位（以文件为真源）。
+  // 压缩标记的滚动守卫：标记行插入/文本落定不触发钉底跟随（见 afterUpdate 注释）。
+  // 标志只在一帧内有效，afterUpdate 消费后由 rAF 复位。
+  let compactScrollHold = false;
+  function holdCompactScroll(fn) {
+    compactScrollHold = true;
+    try {
+      fn();
+    } finally {
+      requestAnimationFrame(() => { compactScrollHold = false; });
+    }
+  }
+  function settleCompactMarker(key, jobId, text, state) {
+    holdCompactScroll(() => updMsgs(key, (a) => {
+      const wantId = 'cm-' + jobId;
+      const byId = a.some((m) => m.id === wantId);
+      let hit = false;
+      // 从后往前：万一同时挂着多条 running（理论不发生），新事件的完成态落最后一条
+      const next = [...a];
+      for (let i = next.length - 1; i >= 0; i--) {
+        const m = next[i];
+        const match = byId ? m.id === wantId : m.kind === 'compact_marker' && m.state === 'running';
+        if (!match) continue;
+        next[i] = { ...m, content: text, state };
+        hit = true;
+        break;
+      }
+      if (!hit) {
+        // 完成事件迟到且文件重建已经把完成标记铺在末尾时，别再补一行重复的
+        const lastRow = next[next.length - 1];
+        if (!(lastRow && lastRow.kind === 'compact_marker' && lastRow.state !== 'running')) {
+          next.push({ id: wantId, role: 'system', kind: 'compact_marker', content: text, state, ts: Date.now() });
+        }
+      }
+      return next;
+    }));
+  }
+  function withRunningCompacts(key, arr) {
+    const running = (sessionMsgs[key] || []).filter((m) => m.kind === 'compact_marker' && m.state === 'running');
+    if (!running.length) return arr;
+    // 文件**末尾**已是完成标记 = 本次压缩已落盘，实时行让位。不能拿「文件里有任意
+    // 标记行」当判据——会话压过一次后文件里永远留着旧标记（历史中部），会把刚弹出的
+    // 「正在压缩」误杀（真机 2026-11-07：出现约 1 秒就被重建冲掉）。
+    const lastRow = arr[arr.length - 1];
+    if (lastRow && lastRow.kind === 'compact_marker' && lastRow.state !== 'running') return arr;
+    return [...arr, ...running];
+  }
+
+  // 后台重载替换当前会话的消息数组时保滚动：整列表重建（标记行从底部归位到
+  // 压缩边界等）会让浏览器在节点重建瞬间把滚动塌到顶——真机 2026-11-07 实锤
+  // 「压缩完瞬间弹到页面上面」。锚定替换前的视口：scrollTop 加上高度差，
+  // 钉底的依旧钉底、阅读中的停在原内容上。
+  async function swapMsgsKeepScroll(key, arr) {
+    const el = chatBody;
+    const prevTop = el ? el.scrollTop : 0;
+    const prevH = el ? el.scrollHeight : 0;
+    const pinned = chatPinned;
+    compactScrollHold = true; // afterUpdate 的钉底跟随让位给下面的精确锚定
+    setMsgs(key, arr);
+    await tick();
+    const fix = () => {
+      if (!el) return;
+      if (pinned) el.scrollTop = el.scrollHeight;
+      else if (prevH > 0) el.scrollTop = Math.max(0, prevTop + (el.scrollHeight - prevH));
+    };
+    fix();
+    // 第二帧再校准一次：content-visibility 块的估位要一帧才换成真实高度，
+    // 第一次读 scrollHeight 可能带着估位误差（压缩完成重建时表现为「弹一下」）
+    requestAnimationFrame(() => {
+      fix();
+      compactScrollHold = false;
+    });
   }
 
   async function rollbackMsg(m) {
@@ -4588,7 +4956,7 @@
       : '回滚到这条消息？\n这条消息没有文件基线记录（旧会话），只回滚对话、文件不动；这条和它之后的所有消息都会删除。'))) return;
     await ensureIdle(key);
     try {
-      await truncateRequest(key, fileUserIndex(key, m), 'rollback', m.cp || '');
+      await truncateRequest(key, fileUserIndex(key, m), 'rollback', m.cp || '', contentText(m.content).trim().slice(0, 80));
       await reloadSessionView(key);
     } catch (e) {
       pushMsg(key, { id: nextId(), role: 'error', content: `[回滚失败] ${e.message || e}` });
@@ -4602,7 +4970,7 @@
     if (!(await confirmAsk('删除这条消息？\n只删这一条，同一问答里的回答会保留；删除后不可恢复，工作区文件不受影响。'))) return;
     await ensureIdle(key);
     try {
-      await truncateRequest(key, fileUserIndex(key, m), 'delete_user');
+      await truncateRequest(key, fileUserIndex(key, m), 'delete_user', '', contentText(m.content).trim().slice(0, 80));
       await reloadSessionView(key);
     } catch (e) {
       pushMsg(key, { id: nextId(), role: 'error', content: `[删除失败] ${e.message || e}` });
@@ -4621,7 +4989,7 @@
     if (!text || !target) return;
     await ensureIdle(key);
     try {
-      await truncateRequest(key, fileUserIndex(key, target), 'rollback');
+      await truncateRequest(key, fileUserIndex(key, target), 'rollback', '', contentText(target.content).trim().slice(0, 80));
       await reloadSessionView(key);
       // 编辑后的文本走正常发送路（时间戳/流式/落盘全在既有链路上）
       await deliver(key, text, [], {});
@@ -4713,10 +5081,21 @@
       try {
         if (streams[skey]) return; // 本页又起了流：对账交给正常流程
         const c = await fetch(`/api/cancel?session=${encodeURIComponent(skey)}`).then((r) => r.json());
-        if (c.running) return; // 服务端还在跑：继续等
+        if (c.running) {
+          // 在跑期间铺回挂着的「已引导」标记（同 loadSession：只铺空位，叉掉的不复活）
+          if (!streams[skey] && !guided[skey] && Array.isArray(c.pending_steers) && c.pending_steers.length) {
+            guided = { ...guided, [skey]: c.pending_steers.map((t) => ({ text: t })) };
+          }
+          return; // 服务端还在跑：继续等
+        }
         clearInterval(reconcileTimers[skey]);
         delete reconcileTimers[skey];
-        // 这一轮已经结束：刷新快照的使命完成，清掉避免下次误用旧内容
+        // 这一轮已经结束：「已引导」标记完成使命（对账页可能没收到带 seq 的 done，
+        // 也没有 ownsTurn 的 finally，只能在这里摘）
+        const nextGuided = { ...guided };
+        delete nextGuided[skey];
+        guided = nextGuided;
+        // 刷新快照的使命完成，清掉避免下次误用旧内容
         clearLiveStash();
         if (currentSessionId !== skey) {
           // 不在这个会话的页面：丢掉本地陈旧缓冲，下次打开时从服务端重建
@@ -4728,7 +5107,7 @@
         if (streams[skey]) return;
         const r = await fetch(`/api/session?id=${encodeURIComponent(skey)}`).then((r) => r.json());
         if ((r.messages || []).length > 0) {
-          sessionMsgs = { ...sessionMsgs, [skey]: rebuildFromSession(r.messages || []) };
+          await swapMsgsKeepScroll(skey, withRunningCompacts(skey, rebuildFromSession(r.messages || [])));
           syncCur();
           loadSessions();
         }
@@ -4834,14 +5213,16 @@
     }
     if (!changed.length) return;
     const next = { ...sessionMsgs };
-    for (const id of changed) if (!streams[id]) delete next[id];
-    sessionMsgs = next;
+    // 当前会话的缓冲先留着：下面的重建要用它兜「压缩还在跑」的 running 标记行，
+    // 而且重建失败（网络抖动）时屏上旧内容也不该清空
     const cur = currentSessionId;
+    for (const id of changed) if (!streams[id] && id !== cur) delete next[id];
+    sessionMsgs = next;
     if (cur && changed.includes(cur) && !streams[cur]) {
       try {
         const r = await fetch(`/api/session?id=${encodeURIComponent(cur)}`).then((x) => x.json());
         if (Array.isArray(r.messages) && r.messages.length) {
-          sessionMsgs = { ...sessionMsgs, [cur]: rebuildFromSession(r.messages) };
+          await swapMsgsKeepScroll(cur, withRunningCompacts(cur, rebuildFromSession(r.messages)));
           syncCur();
         }
       } catch {
@@ -4858,6 +5239,16 @@
       const next = {};
       for (const id of r.running || []) if (id) next[id] = true;
       serverRunning = next;
+      // 刷新/重开后本页没有流，但服务端还在跑：当前会话也要算「运行中」——
+      // 停止按钮和「发送=排队」才和真实状态一致（刷新豁免后任务继续跑，
+      // 界面却显示空闲，2026-11-07 实锤）。没有 controller 也照样能停：
+      // stop() 走 /cancel 会话级停止。
+      const k = curKey();
+      const live = !!streams[k] || !!next[k];
+      if (live !== streaming) {
+        streaming = live;
+        controller = streams[k] ? streams[k].controller : null;
+      }
     } catch {
       /* 服务没起/断网：保持上次状态，下一跳再试 */
     }
@@ -4895,11 +5286,61 @@
   // 切到某会话：从按会话账本恢复用量；没账本的新会话清零（窗口保留——圆环常驻）
   function restoreUsage(key) {
     // 活数据（本页收到的 SSE 事件）最新；没有才落回服务端快照（重启/重开后的恢复路径），
-    // 并扶正为会话账本，后续切换不再反复读盘
+    // 并扶正为会话账本，后续切换不再反复读盘。
+    // 分母不跟历史快照走：会话文件里存的是上一轮启动时的窗口，用户改过上下文长度后
+    // 刷新/切回会显示旧值（真机 2026-11-07「圆环一直显示旧的」）。
     const u = usageBySession[key] || serverUsage[key];
+    const win = ctxWindow || (u ? u.ctx.window : ctxUsage.window) || 0;
     if (u && !usageBySession[key]) usageBySession = { ...usageBySession, [key]: u };
-    ctxUsage = u ? u.ctx : { projected: 0, pressure: null, window: ctxUsage.window, breakdown: null };
+    if (u && u.ctx.window !== win)
+      usageBySession = { ...usageBySession, [key]: { ...u, ctx: { ...u.ctx, window: win } } };
+    ctxUsage = u
+      ? { ...u.ctx, window: win }
+      : { projected: 0, pressure: null, window: win, breakdown: null };
     apiTotals = u ? u.api : { prompt: 0, cached: 0 };
+  }
+
+  // 刷新后重新附着正在跑的一轮（2026-11-07）：快照里存了最后收到的事件 seq，
+  // /api/chat/attach 从 seq 后面补发漏掉的片段、再接上直播。网络断/服务重启
+  // 会自动重连；服务端空闲后从会话文件重建对齐（事件流与落盘同源）。
+  async function attachLiveSession(id) {
+    for (let i = 0; i < 120; i++) {
+      if (!sessionMsgs[id]) return;
+      // 本轮最后一个回答气泡就是续播目标（loadSession 已把它标成 streaming）
+      let target = null;
+      const arr = sessionMsgs[id];
+      for (let j = arr.length - 1; j >= 0; j--) {
+        if (arr[j].role === 'assistant') { target = arr[j]; break; }
+      }
+      if (!target) break;
+      const resume = { session: id, asstId: target.id, after: chatSeq[id] || 0 };
+      const ok = await deliver(id, '', [], { resume });
+      if (resume.stale) break; // 同会话已开始新一轮：别往旧气泡上贴，走文件重载
+      let running = false;
+      try {
+        running = !!(await fetch(`/api/cancel?session=${encodeURIComponent(id)}`).then((r) => r.json())).running;
+      } catch {}
+      if (!running) break;
+      // 流断了但服务端还在跑：稍等再附着（after 已推进到收到的最后一条）
+      if (!ok) await new Promise((r) => setTimeout(r, 700));
+    }
+    chatSeq = { ...chatSeq, [id]: 0 };
+    try {
+      const r = await fetch(`/api/session?id=${encodeURIComponent(id)}`).then((x) => x.json());
+      if (Array.isArray(r.messages) && r.messages.length) {
+        await swapMsgsKeepScroll(id, withRunningCompacts(id, rebuildFromSession(r.messages)));
+        if (currentSessionId === id) syncCur();
+        loadSessions();
+      }
+      // 这一轮结束了：刷新前排队没发出去的消息该接着发；快照退役，别让下一次
+      // 刷新拿旧 seq 误附着（只看当前会话的快照，别清掉另一个会话刚写的）
+      if (currentSessionId === id) {
+        clearLiveStash();
+        try { sessionStorage.removeItem(LIVE_SID_KEY); } catch {}
+      }
+      const c = await fetch(`/api/cancel?session=${encodeURIComponent(id)}`).then((x) => x.json());
+      if (!c.running) drainOutbox(id);
+    } catch {}
   }
 
   // 打开会话：后端会在其所属项目与当前项目不同时先切过去（切会话 = 回到那个项目），
@@ -4945,16 +5386,35 @@
         .then((c) => {
           const stashed = readLiveStash(id);
           if (c.running && !streams[id]) {
-            // 刷新恢复：服务端文件此刻通常只有用户消息（助手内容还在流里），先把刷新前的
-            // 内存快照铺回去；跑完由 reconcileServerQueued 用落盘结果替换。
-            if (stashed && Array.isArray(stashed.msgs) && stashed.msgs.length) {
-              sessionMsgs = {
-                ...sessionMsgs,
-                [id]: stashed.msgs.map((m) => (m.streaming ? { ...m, streaming: false } : m)),
-              };
-              if (currentSessionId === id) syncCur();
+            // 挂着的引导铺回「已引导」标记（2026-11-08）：标记只活在前端内存，刷新就丢
+            // （真机：标记消失，几分钟后模型取走才由 steer 事件带回来）。只铺空位——
+            // 用户叉掉的不复活；模型取走后 pending_steers 变空，标记由带 seq 的 done 摘除。
+            if (!guided[id] && Array.isArray(c.pending_steers) && c.pending_steers.length) {
+              guided = { ...guided, [id]: c.pending_steers.map((t) => ({ text: t })) };
             }
-            reconcileServerQueued(id);
+            // 刷新恢复：服务端文件此刻通常只有用户消息（助手内容还在流里），先把刷新前的
+            // 内存快照铺回去；有 seq 就 attach 续播（补发漏掉的片段 + 接直播），
+            // 没有才退回「跑完再重载」的对账。
+            if (stashed && Array.isArray(stashed.msgs) && stashed.msgs.length) {
+              const msgs = stashed.msgs.map((m) => (m.streaming ? { ...m, streaming: false } : m));
+              let li = -1;
+              for (let j = msgs.length - 1; j >= 0; j--) {
+                if (msgs[j].role === 'assistant') { li = j; break; }
+              }
+              // 最后一条回答恢复成流式：attach 补发的事件继续 patch 它（工具行才不会
+              // 永远停在刷新前那条「执行中」）。没有 assistant 就退回对账。
+              if (li >= 0) msgs[li] = { ...msgs[li], streaming: true };
+              sessionMsgs = { ...sessionMsgs, [id]: msgs };
+              chatSeq = { ...chatSeq, [id]: stashed.seq || 0 };
+              if (currentSessionId === id) syncCur();
+              if (li >= 0 && (stashed.seq || 0) > 0) {
+                attachLiveSession(id);
+              } else {
+                reconcileServerQueued(id);
+              }
+            } else {
+              reconcileServerQueued(id);
+            }
           }
           // 刷新前排队、还没发出去的消息：会话文件里没有它们，铺回气泡并补发。
           // 服务端还在跑就先等对账（reconcile 收尾时会接上出队）。
@@ -4969,6 +5429,18 @@
         .catch(() => {});
       syncCur();
       restoreUsage(id); // 从按会话账本恢复（跑完的会话不重发事件，不恢复就显示 0）
+      // 空会话（回滚/删除成空）与「新建对话」同口径：没有消息就没有圆环占用。
+      // 服务端新回滚会广播 projected=0；这里再兜住旧快照留下的固定底（2026-11-07 用户拍板）
+      if (!(r.messages || []).length) {
+        const prevU = usageBySession[id];
+        const win = ctxWindow || (prevU ? prevU.ctx.window : ctxUsage.window) || 0;
+        const emptyCtx = { projected: 0, pressure: null, window: win, breakdown: null };
+        usageBySession = {
+          ...usageBySession,
+          [id]: { ctx: emptyCtx, api: prevU ? prevU.api : { prompt: 0, cached: 0 } },
+        };
+        ctxUsage = emptyCtx;
+      }
       dockCp = null;
       if (r.warning) await confirmAsk(r.warning, true);
       if (r.switched) {
@@ -5309,9 +5781,6 @@
   }
 
   // —— 多文件夹项目（2026-11-04，对齐 ZCode）——
-  function folderNameOf(p) {
-    return String(p || '').split(/[\\/]/).filter(Boolean).pop() || p || '';
-  }
   async function addWorkspaceFolder() {
     if (foldersBusy) return;
     foldersBusy = true;
@@ -5344,7 +5813,8 @@
     }
   }
   async function removeWorkspaceFolder(path) {
-    if (!(await confirmAsk(`从项目移除文件夹「${folderNameOf(path)}」？\n只移出项目，不删除磁盘上的文件。`))) return;
+    // 确认框用完整路径：副目录统一叫「副目录」，只有路径能分清删的是哪一个
+    if (!(await confirmAsk(`从项目移除这个副目录？\n${path}\n只移出项目，不删除磁盘上的文件。`))) return;
     foldersMsg = '';
     try {
       const r = await fetch('/api/workspace/folders', {
@@ -5545,7 +6015,7 @@
         out.push(asst);
       } else if (m.role === 'system') {
         // 通知/错误随会话落盘（display_only），重启/切回会话后气泡还在
-        out.push({ id: nextId(), role: 'system', content: contentText(m.content), ts: m.ts });
+        out.push({ id: nextId(), role: 'system', content: contentText(m.content), kind: m.kind, ts: m.ts });
       } else if (m.role === 'tool') {
         const asst = [...out].reverse().find(
           (x) => x.role === 'assistant' && (x.tools || []).some((t) => t.id === m.tool_call_id)
@@ -5827,6 +6297,7 @@
   // —— MCP 插件分区
   let mcpServers = [];
   let wasmPlugins = []; // WASM 工具插件清单（loadMcp 灌；此前漏声明，能力菜单一开就 ReferenceError）
+  let mcpLoading = false; // 能力菜单占位用：菜单先开、数据后台补（2026-11-07）
   // git 运行时状态（插件分区顶部卡片）：系统装的 / 内置包解压的 / 不可用
   let gitRuntime = null;
   // 021：沙箱自检（真拉起受限进程跑探针套件）——结果由沙箱插件的 action.run 桥拉走；
@@ -5868,6 +6339,7 @@
     }
   }
   async function loadMcp() {
+    mcpLoading = true;
     try {
       const r = await fetch('/api/mcp').then((r) => r.json());
       mcpServers = r.servers || [];
@@ -5876,6 +6348,7 @@
       mcpServers = [];
       wasmPlugins = [];
     }
+    mcpLoading = false;
   }
   async function mcpAction(action, name, server) {
     // 删除类先弹确认（技能/MCP/插件/定时任务等删除一律先确认）
@@ -6010,7 +6483,7 @@
   const UI_OPS = {
     open_panel: {
       kind: 'open_panel', title: '打开右侧边栏面板', risk: 'safe', internal: false,
-      args: 'name: 面板插件 id（trace=时间线/board=项目文件/usage=用量价格）',
+      args: 'name: 面板插件 id（trace=时间线/board=项目文件/usage=使用统计）',
       run(m) { rpOpenExtByName(m.name); },
     },
     close_panel: {
@@ -6206,6 +6679,59 @@
       args: 'keys: 变更键清单（仅通知用）',
       run() { loadExt(); loadSettings(); },
     },
+    // 会话用量快照更新（压缩收尾广播）：聊天流此时可能已死（用户中途刷新过），
+    // 流上的 context_usage 会丢——圆环直接按事件落新快照，不用再刷一次界面
+    // （真机 2026-11-07 实锤「压缩完成圆环要再刷新才同步」）。
+    usage_changed: {
+      kind: 'usage_changed', title: '（内部）会话用量快照更新', risk: 'safe', internal: true,
+      args: 'session: 会话 id, usage: 用量快照（与服务端会话文件同形）',
+      run(m) {
+        const id = m.session;
+        if (!id || !m.usage) return;
+        const u = usageFromServer(m.usage);
+        serverUsage = { ...serverUsage, [id]: u };
+        if (streams[id]) return; // 那条会话正在跑：活数据比快照新，别覆盖
+        usageBySession = { ...usageBySession, [id]: u };
+        if (id === curKey()) {
+          const win = ctxWindow || u.ctx.window || 0;
+          ctxUsage = { ...u.ctx, window: win };
+          apiTotals = u.api;
+        }
+      },
+    },
+    // 压缩标记三件套走全局总线（2026-11-08）：聊天流在压缩期间可能已死（用户中途
+    // 刷新过），started 只发死流 = 「正在压缩」全程不可见、done 靠文件重建才冒出来
+    // （真机实锤「压缩完才显示」）。总线路径让任何加载着该会话的页面都能即时铺标记；
+    // 与 SSE 同事件去重：started 按 id 查重，done/failed 的 settle 本就按 id 收敛。
+    compact_started: {
+      kind: 'compact_started', title: '（内部）压缩开始标记', risk: 'safe', internal: true,
+      args: 'session: 会话 id, id: 任务 id, text: 标记文案',
+      run(m) {
+        const id = m.session;
+        if (!id || !sessionMsgs[id]) return; // 没加载的会话：下次打开从文件重建
+        const mid = 'cm-' + m.id;
+        if ((sessionMsgs[id] || []).some((x) => x.id === mid)) return;
+        holdCompactScroll(() => pushMsg(id, { id: mid, role: 'system', kind: 'compact_marker', content: m.text || '————正在压缩上下文————', state: 'running', ts: Date.now() }));
+      },
+    },
+    compact_done: {
+      kind: 'compact_done', title: '（内部）压缩完成标记', risk: 'safe', internal: true,
+      args: 'session: 会话 id, id: 任务 id, text: 标记文案',
+      run(m) {
+        const id = m.session;
+        if (!id || !sessionMsgs[id]) return;
+        settleCompactMarker(id, m.id, m.text, 'done');
+      },
+    },
+    compact_failed: {
+      kind: 'compact_failed', title: '（内部）压缩失败标记', risk: 'safe', internal: true,
+      args: 'session: 会话 id, id: 任务 id, text: 标记文案',
+      run(m) {
+        const id = m.session;
+        if (!id || !sessionMsgs[id]) return;
+        settleCompactMarker(id, m.id, m.text || '————压缩失败，下轮结束后重试————', 'failed');
+      },
+    },
     // 顶层无头轮（定时任务/CLI 唤醒）跑完推来的同步动作：刷新侧栏会话列表，新建的会话
     // 即时出现，不必重启软件（2026-10-05 真机实测「重启才看得到」）。autoPick 传 false
     // ——后台刷新不许抢夺当前打开的会话。
@@ -6218,6 +6744,30 @@
         // 消息兜底），从新列表里取当前会话的标题对齐（本窗口自己改名走本地更新）。
         const cur = sessions.find((x) => x.id === currentSessionId);
         if (cur && cur.title && cur.title !== currentTitle) currentTitle = cur.title;
+      },
+    },
+    // 截断（回滚/编辑/删除）后服务端按当前请求视图重算的圆环（2026-11-07）：
+    // 旧实报锚点随被删消息作废，下一次请求的实报会重新校准。没有这条，圆环会
+    // 一直挂着截断前的旧值，直到下一轮实报回来才「跳变」——用户会误读成压缩。
+    // internal=true：不进 ops 清单（agent 的 fire_event 够不着，不能伪造圆环）。
+    context_usage: {
+      kind: 'context_usage', title: '（内部）圆环用量刷新', risk: 'safe', internal: true,
+      args: 'session: 会话 id；context_usage: { projected, window, breakdown }',
+      run(m) {
+        const skey = m.session;
+        const cu = m.context_usage;
+        if (!skey || !cu) return;
+        const ctx = {
+          projected: cu.projected || 0,
+          pressure: null,
+          window: ctxWindow || cu.window || 0,
+          breakdown: cu.breakdown || null,
+        };
+        usageBySession = {
+          ...usageBySession,
+          [skey]: { ctx, api: (usageBySession[skey] || {}).api || { prompt: 0, cached: 0 } },
+        };
+        if (skey === curKey()) ctxUsage = ctx;
       },
     },
 
@@ -6424,7 +6974,7 @@
         reply(!!r.ok, r.ok ? { ok: true, found: j.found } : j.error || '删除失败');
       },
     },
-    // —— 只读桥：「用量价格」插件（plugins/usage 试点）拉当前会话的用量统计 ——
+    // —— 只读桥：「使用统计」插件（plugins/usage 试点）拉当前会话的用量统计 ——
     'usage.session': {
       bridge: true, title: '读当前会话用量',
       async run({ reply, get, params }) {
@@ -6554,11 +7104,11 @@
       run({ reply, params }) {
         const patch = {};
         if (params.roles && typeof params.roles === 'object') {
-          // 白名单必须与 RolesSettings 的字段一一对应（summary/title/vision/video/audio/
+          // 白名单必须与 RolesSettings 的字段一一对应（summary/vision/video/audio/
           // embedding/budget/subagent）——漏一个键，插件每存一次就静默抹掉那条路由
           // （真机验收时漏了多模态三个，用户 settings.json 里的 vision 被冲掉，实测）。
           // PUT /api/settings 对 roles 是全量替换，所以这里先把现有 roles 合进来再发。
-          const allow = ['summary', 'title', 'vision', 'video', 'audio', 'embedding', 'budget', 'subagent'];
+          const allow = ['summary', 'vision', 'video', 'audio', 'embedding', 'budget', 'subagent'];
           const next = { ...roles };
           for (const k of allow) {
             if (params.roles[k] === null) delete next[k];
@@ -6657,8 +7207,39 @@
   let subagentLive = {};
   let subagentPanelOpen = false;
   let subagentHistory = [];
+  // chip 的「收起」按会话记（和电脑操作提示条同一口径）：只收起本对话，切到别的对话
+  // 不显示、切回来仍保持收起；这个对话里再有新派发就自动冒头。刷新后仍按 localStorage 保持。
+  const SUBAGENT_CHIP_HIDDEN_KEY = 'pawchSubagentChipHidden';
+  function loadSubagentChipHidden() {
+    try {
+      const a = JSON.parse(localStorage.getItem(SUBAGENT_CHIP_HIDDEN_KEY) || '[]');
+      return Array.isArray(a) ? a.filter((x) => typeof x === 'string') : [];
+    } catch {
+      return [];
+    }
+  }
+  let subagentChipHidden = loadSubagentChipHidden();
+  function saveSubagentChipHidden() {
+    try {
+      // 会话数封顶，防止 localStorage 无限长（按插入顺序丢最老的）
+      localStorage.setItem(SUBAGENT_CHIP_HIDDEN_KEY, JSON.stringify(subagentChipHidden.slice(-40)));
+    } catch {}
+  }
+  function dismissSubagentChip() {
+    const key = currentSessionId || '@new';
+    if (subagentChipHidden.includes(key)) return;
+    subagentChipHidden = [...subagentChipHidden, key].slice(-40);
+    saveSubagentChipHidden();
+  }
+  function revealSubagentChip(sid) {
+    if (!sid || !subagentChipHidden.includes(sid)) return;
+    subagentChipHidden = subagentChipHidden.filter((x) => x !== sid);
+    saveSubagentChipHidden();
+  }
 
   function subagentUpsert(m, status) {
+    // 新的派发 = 提示重新冒头（叉掉只是收起这次，不是永久关掉）
+    if ((status === 'queued' || status === 'running') && m.parent) revealSubagentChip(m.parent);
     const prev = subagentLive[m.dispatch] || {};
     // 整键替换（Svelte4 赋值才触发响应式；改属性不保险）
     subagentLive = {
@@ -6686,6 +7267,11 @@
   })();
   // 实时条只露排队中/执行中；终态不占常驻位（要回看走面板）
   $: subagentActive = subagentSessionLive.filter((d) => d.status === 'queued' || d.status === 'running');
+  // 常驻 chip：本对话派发过且全部结束；被叉掉（本会话）就不再显示
+  $: subagentChipVisible =
+    !subagentActive.length &&
+    subagentPanelRows.length > 0 &&
+    !subagentChipHidden.includes(currentSessionId || '@new');
 
   async function openSubagentPanel() {
     subagentPanelOpen = true;
@@ -6794,6 +7380,9 @@
           terminal_open: terminalOpen,
           settings_open: settingsOpen,
           theme: themeMode,
+          // 解析后的实际主题（dark/light）：壳 child webview 的画布底色跟它走
+          // （system 模式服务端解不了 OS 深浅色，必须前端给真值）
+          theme_actual: theme,
           tabs_open: rpTabs.length,
           active_tab: rpTab || '',
           // 用户手写 CSS（agent inject_css 前先读，才能做保留式追加）
@@ -6995,7 +7584,7 @@
     });
   }
 
-  /// 打开插件的指定页（manifest settings_entry，如「用量价格」插件的价格设置页）
+  /// 打开插件的指定页（manifest settings_entry，如「使用统计」插件的价格设置页）
   function openExtPage(e, page) {
     const wasOpenSame = extOpen && extCurrent && extCurrent.name === e.name;
     extCurrent = { ...e, entry: page };
@@ -7195,13 +7784,41 @@
   /// 只存当前标签页（sessionStorage），只认 10 分钟内、同一会话、且服务端仍 running。
   /// 排队待发的消息（outbox）一起存：服务端文件里没有它们，不存就永远发不出去了。
   const LIVE_STASH_KEY = 'pawchLiveStash';
+  /// 刷新认领标记：sessionStorage 跨刷新保留、关页签即清——正好区分「刷新」与
+  /// 「关页面」。断线取消开着时，刷新会断开 SSE；新页面在 30 秒宽限内凭它认领，
+  /// 本轮继续跑（2026-11-07 用户实锤「刷新把在跑的任务终止了」）。
+  const LIVE_SID_KEY = 'pawchLiveSid';
+  function reviveAfterReload() {
+    try {
+      const sid = sessionStorage.getItem(LIVE_SID_KEY);
+      if (!sid) return;
+      sessionStorage.removeItem(LIVE_SID_KEY);
+      fetch('/api/chat/revive', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session: sid }),
+      }).catch(() => {});
+    } catch {}
+  }
   function stashLiveState() {
     try {
       const key = curKey();
       // 草稿与文件预览的未保存修改跟「有没有流」无关：每次离开页面都落一次
       persistComposer(key);
       persistFileDrafts();
-      if (!streams[key]) return; // 没有在跑的流，消息快照不需要兜
+      // 有本页流，或「本页已收到过直播 seq + 最后一个回答还是流式」都算在跑：
+      // 重新附着期间没有 streams 登记，但快照/seq 必须继续兜，否则再刷一次就断链
+      //（连续快速刷新时 serverRunning 可能还没轮询到，不能拿它当条件）。
+      const liveHit = !!streams[key] || ((chatSeq[key] || 0) > 0 && (sessionMsgs[key] || []).some((m) => m.role === 'assistant' && m.streaming));
+      if (!liveHit) {
+        // 没有在跑的流：清掉可能残留的认领标记，别让下次打开误认领
+        try { sessionStorage.removeItem(LIVE_SID_KEY); } catch {}
+        return;
+      }
+      // 有流在跑：写下认领标记（会话 id 未知的 @new 没法认领，跳过）
+      try {
+        if (key !== '@new') sessionStorage.setItem(LIVE_SID_KEY, key);
+      } catch {}
       const msgs = sessionMsgs[key];
       if (!msgs || !msgs.length) return;
       const queued = (outbox[key] || []).map((it) => ({
@@ -7211,7 +7828,8 @@
         convs: it.convs || [],
         ts: it.ts || Date.now(),
       }));
-      const raw = JSON.stringify({ sid: currentSessionId || '', ts: Date.now(), msgs, outbox: queued });
+      // seq：本页最后收到的事件序号——刷新后 attach 从它后面补发，不重不漏
+      const raw = JSON.stringify({ sid: currentSessionId || '', ts: Date.now(), seq: chatSeq[key] || 0, msgs, outbox: queued });
       if (raw.length > 2_000_000) return; // 超配额就放弃（会话太大，宁可不兜）
       sessionStorage.setItem(LIVE_STASH_KEY, raw);
     } catch {}
@@ -7316,6 +7934,8 @@
   function setCurSession(id, skipComposer = false) {
     const prev = currentSessionId || '@new';
     const next = id || '@new';
+    // 子代理回看面板按对话归属：切走就收，不跨对话常驻（用户 2026-11-07）
+    if (prev !== next) subagentPanelOpen = false;
     if (!skipComposer && prev !== next) {
       persistComposer(prev);
       restoreComposer(next);
@@ -7580,7 +8200,7 @@
                   <!-- 多文件夹项目（2026-11-04）：只有当前项目能改文件夹（端点按当前工作区生效） -->
                   <button on:click|stopPropagation={() => { projMenuPath = null; foldersMsg = ''; foldersModal = true; }}>
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M3.5 7.2c0-1 .8-1.7 1.7-1.7h4l1.9 2.2h8.2c1 0 1.7.8 1.7 1.7v8.4c0 1-.8 1.7-1.7 1.7H5.2c-1 0-1.7-.8-1.7-1.7Z"/><path d="M3.5 10.5h17"/></svg>
-                    项目文件夹{workspaceFolders.length ? `（${workspaceFolders.length}）` : ''}
+                    项目文件夹
                   </button>
                 {/if}
                 <button on:click|stopPropagation={() => removeProject(row.path, row.name)}>
@@ -7743,7 +8363,7 @@
         <!-- 启动失败必须可见：服务未就绪时不许只留一个空对话（2026-10-27 实测） -->
         <div class="msg error-row startup-error">
           <div class="error-bubble">{startupError}</div>
-          <button class="btn ghost" on:click={() => location.reload()}>重试</button>
+          <button class="btn ghost" on:click={() => location.replace('/?t=' + Date.now())}>重试</button>
         </div>
       {/if}
       {#if messages.length === 0}
@@ -7818,13 +8438,11 @@
               {#if m.queued}
                 <div class="queued-row">
                   <span class="queued-badge">排队中 · 这一轮结束后自动发送</span>
-                  <button class="queued-send" on:click={() => sendNow(m.id, 'interrupt')} title="中断当前操作（工具/回答让位），新指令立即生效">立即发送</button>
+                  <button class="queued-send" on:click={() => sendNow(m.id, 'interrupt')} title="停止当前这一轮，这条消息作为新一轮重新开始">立即发送</button>
                   <button class="queued-send" on:click={() => sendNow(m.id, 'steer')} title="不打断：跑完当前这步就并入本轮。静默生效，不占对话气泡">引导</button>
                 </div>
               {:else if m.steered}
                 <div class="queued-row"><span class="queued-badge steered">已引导当前回答</span></div>
-              {:else if m.interrupted}
-                <div class="queued-row"><span class="queued-badge steered">已中断当前操作并立即发送</span></div>
               {/if}
             </div>
             {#if !msgSelectMode && !m.queued}
@@ -7954,6 +8572,7 @@
                             <!-- 直接读 toolFold（Svelte 只对模板里直接引用的变量建依赖；
                                  包进函数读不到变更——2026-10-26 真机实测过同款坑） -->
                             {@const tOpen = toolFold[`${m.id}:${it.toolIndex}`] === true}
+                            {@const previewPath = toolPreviewPath(it)}
                             <div class="tool-item">
                               <button
                                 class="tool-row"
@@ -7962,7 +8581,20 @@
                               >
                                 <span class="tool-ico" class:running={it.status === 'running'}>{@html tm.iconSvg}</span>
                                 <span class="tool-name">{tm.label}</span>
-                                {#if tm.subject}<span class="tool-subject" title={tm.subject}>{tm.subject}</span>{/if}
+                                {#if tm.subject}
+                                  {#if previewPath}
+                                    <!-- ZCode 式主语：文件名可点，侧栏开预览（截图/文件平时不摊内容） -->
+                                    <span
+                                      class="tool-subject linkable"
+                                      role="button"
+                                      tabindex="-1"
+                                      title="在侧栏预览：{previewPath}"
+                                      on:click|stopPropagation={() => openPreviewTab(previewPath)}
+                                    >{tm.subject}</span>
+                                  {:else}
+                                    <span class="tool-subject" title={tm.subject}>{tm.subject}</span>
+                                  {/if}
+                                {/if}
                                 <span class="tool-status {it.status}">
                                   {#if it.status === 'running'}<span class="tool-spin"></span>
                                   {:else if it.status === 'ok'}<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>
@@ -8014,11 +8646,13 @@
                   <div class="content" on:click={onContentClick}>{@html md(b.text)}</div>
                 {/if}
               {/each}
-              {#if shots.length}
-                <!-- browser 截图：过程块收起了也要看得见，图直接摊在回复末尾
-                     （点在图上开大图，复用 md-img 的点击预览） -->
+              {#if !m.streaming && shots.length}
+                <!-- browser 截图只在收尾摊开（最后一张=收尾验证图）；中途截图静默给
+                     模型自查，想看走工具行点主语开侧栏预览（2026-11-07 口径：
+                     「静默让模型自己看，最后收尾才展示，别两张一样的图刷屏」）。
+                     点在图上开大图，复用 md-img 的点击预览 -->
                 <div class="msg-shots">
-                  {#each shots as src}
+                  {#each [shots[shots.length - 1]] as src}
                     <div class="tool-shot" on:click={onContentClick}>
                       <img class="md-img" {src} alt="页面截图" loading="lazy" data-md-img="1" />
                     </div>
@@ -8045,6 +8679,9 @@
             {/if}
             </div>
           </div>
+        {:else if m.role === 'system' && m.kind === 'compact_marker'}
+          <!-- 静默压缩标记行（2026-11-07）：「正在压缩→压缩后」同位更新，全程唯一可见痕迹 -->
+          <div class="compact-divider" class:running={m.state === 'running'} class:failed={m.state === 'failed'}>{m.content}</div>
         {:else if m.role === 'error'}
           <!-- 报错行：与重启后落盘恢复的 [错误] 系统消息同款灰字（
                实时红气泡和重启后灰字两副面孔太突兀，统一成后者）。
@@ -8058,6 +8695,10 @@
         {/each}
         </div>
       {/each}
+      {#if tailCompactMarker}
+        <!-- 压缩标记作为最后一条：移出分块单独渲染，零高度浮在底部留白区（见样式注释） -->
+        <div class="compact-divider tail" class:running={tailCompactMarker.state === 'running'} class:failed={tailCompactMarker.state === 'failed'}>{tailCompactMarker.content}</div>
+      {/if}
     </div>
 
     {#if !chatPinned}
@@ -8095,10 +8736,15 @@
             </div>
           {/each}
         </div>
-      {:else if subagentPanelRows.length}
-        <!-- 本会话派发过子代理（都跑完了）：留一颗不占地的小 chip，想回看就点 -->
+      {:else if subagentChipVisible}
+        <!-- 本会话派发过子代理（都跑完了）：留一颗不占地的小 chip，想回看就点；
+             右边 × 收起本对话的提示（和电脑操作提示条同一口径：不跨对话、刷新仍收起，
+             这个对话再有新派发会自动冒头） -->
         <div class="subagent-chiprow">
-          <button class="subagent-chip" on:click={openSubagentPanel}>子代理 ×{subagentPanelRows.length}</button>
+          <span class="chip-pill">
+            <button class="subagent-chip" on:click={openSubagentPanel}>子代理 ×{subagentPanelRows.length}</button>
+            <button class="chip-x" title="收起本对话的子代理提示" aria-label="收起" on:click={dismissSubagentChip}>×</button>
+          </span>
         </div>
       {/if}
       <!-- 操作电脑实时条（第 4 轮；同子代理纪律：主区、输入框上方、不落侧边栏）。
@@ -8320,6 +8966,8 @@
                         <span class="menu-sym">/</span> {sk.name}
                       </button>
                     {/each}
+                  {:else if skillsLoading}
+                    <div class="bar-empty">技能清单加载中…</div>
                   {/if}
                   <div class="bar-group">MCP</div>
                   <!-- MCP 只列服务本体，工具不逐条刷屏——
@@ -8338,6 +8986,9 @@
                       </button>
                     {/each}
                   {/each}
+                  {#if !mcpServers.some((s) => s.online !== false && s.tools && s.tools.length) && !wasmPlugins.some((w) => (w.tools || []).length) && mcpLoading}
+                    <div class="bar-empty">MCP 工具加载中…</div>
+                  {/if}
                   <div class="bar-group">插件</div>
                   <!-- 全部插件平铺（不展开）：点哪个都往输入框插一个 /引用——带技能的插件
                        插它第一个技能名（模型按技能索引认得），纯面板插件插插件标题（模型按
@@ -8379,19 +9030,22 @@
             </button>
             <div class="bar-menu">
               <button
-                class="pill"
+                class="pill approval-pill"
                 class:danger={approvalEffective === 'full-access'}
                 on:click={() => (approvalMenuOpen = !approvalMenuOpen)}
                 title="审批档位（按会话记忆，运行中切换下一步即生效）：只读=写/执行逐次问 · 自动=可动工作区与电脑高危先问 · 完全访问=全免审本机直跑"
+                aria-label={`审批档位：${APPROVAL_LABELS[approvalEffective] || approvalEffective}`}
               >
-                <span class="pill-label">审批:</span> {APPROVAL_LABELS[approvalEffective] || approvalEffective}
-                <svg class="caret-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                <span class="approval-ico" aria-hidden="true">{@html approvalIcon(approvalEffective)}</span>
               </button>
               {#if approvalMenuOpen}
                 <div class="bar-dropdown">
                   {#each Object.entries(APPROVAL_LABELS) as [val, label]}
-                    <button class="bar-item" class:active={val === approvalEffective} on:click={() => pickApproval(val)}>
-                      {label}
+                    <button class="bar-item approval-item" class:active={val === approvalEffective} on:click={() => pickApproval(val)}>
+                      <span class="approval-opt">
+                        <span class="approval-ico" aria-hidden="true">{@html approvalIcon(val)}</span>
+                        <span>{label}</span>
+                      </span>
                     </button>
                   {/each}
                 </div>
@@ -8418,7 +9072,7 @@
                     <b>上下文容量</b>
                     <span>{fmtTok(ctxUsage.projected)}/{fmtTok(ctxUsage.window)}（{ctxPctText}）</span>
                   </div>
-                  <div class="ctx-bar"><div class="ctx-bar-fill" style:width={`${ctxPct}%`}></div></div>
+                  <div class="ctx-bar"><div class="ctx-bar-fill" style:width={`${ctxPct}%`} style:background={ctxColor}></div></div>
                   {#each ctxRows as row}
                     <div class="ctx-row">
                       <span class="ctx-dot" style:background={row.color}></span>
@@ -8429,6 +9083,26 @@
                   <div class="ctx-row cache-row">
                     <span class="ctx-label">平均缓存命中率</span>
                     <span class="ctx-val">{apiTotals.prompt ? ((apiTotals.cached / apiTotals.prompt) * 100).toFixed(1) + '%' : '—'}</span>
+                  </div>
+                  <div class="ctx-row cache-row compact-threshold-row">
+                    <span class="ctx-label">上下文压缩阈值</span>
+                    <span class="ctx-val threshold-val">
+                      <input
+                        class="compact-threshold-input"
+                        type="number"
+                        min="40"
+                        max="85"
+                        data-field="compactPercent"
+                        bind:value={compactPercent}
+                        title="上下文占到窗口这条线时，本轮结束后静默压缩；40–85，默认 85"
+                        on:change={() => {
+                          let v = Math.round(Number(compactPercent) || 85);
+                          if (v < 40 || v > 85) v = Math.min(85, Math.max(40, v));
+                          compactPercent = v;
+                          autoSave({ compact_percent: v }, 0);
+                        }}
+                      /><span class="pct-suffix">%</span>
+                    </span>
                   </div>
                   <!-- 口径说清：分子是「下一次请求」的预估（渠道实报锚点 + 之后的上下文增减，
                        裁剪会让它当场回落）；构成行是估算值按圆环百分比分摊（加总 = 圆环） -->
@@ -9304,15 +9978,15 @@
       </div>
       <div class="settings-body">
         <div class="settings-nav">
-          <button class:active={settingsTab === 'appearance'} on:click={() => pickSettingsTab('appearance')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="8.5"/><circle cx="9" cy="10" r="1.2" fill="currentColor"/><circle cx="12.5" cy="8.5" r="1.2" fill="currentColor"/><circle cx="15.5" cy="11" r="1.2" fill="currentColor"/></svg> 外观</button>
+          <button class:active={settingsTab === 'appearance'} on:click={() => pickSettingsTab('appearance')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="8.5"/><circle cx="9" cy="10" r="1.2" fill="currentColor"/><circle cx="12.5" cy="8.5" r="1.2" fill="currentColor"/><circle cx="15.5" cy="11" r="1.2" fill="currentColor"/></svg> 主题外观</button>
           <button class:active={settingsTab === 'model'} on:click={() => pickSettingsTab('model')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M9 7V3.5M15 7V3.5M7 7h10v4a5 5 0 0 1-10 0Z"/><path d="M12 16v5"/></svg> 模型配置</button>
           {#if features.roles}<button class:active={settingsTab === 'roles'} on:click={() => pickSettingsTab('roles')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="9" cy="8.5" r="3"/><path d="M3.5 19.5c.6-3 2.8-4.5 5.5-4.5s4.9 1.5 5.5 4.5"/><circle cx="17" cy="9.5" r="2.4"/><path d="M16 15.2c2.4.2 3.9 1.6 4.4 4"/></svg> 功能桥接</button>{/if}
-          <button class:active={settingsTab === 'memory'} on:click={() => pickSettingsTab('memory')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 4.5A7.5 7.5 0 0 0 4.5 12c0 2.4 1.1 4.2 2.8 5.5.4.3.7.9.7 1.5v1.5h9V19c0-.6.3-1.2.7-1.5 1.7-1.3 2.8-3.1 2.8-5.5A7.5 7.5 0 0 0 12 4.5Z"/></svg> 记忆</button>
-          <button class:active={settingsTab === 'skills'} on:click={() => pickSettingsTab('skills')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2.5 5.5 13.5H11l-1 8L18.5 10H13l1-7.5Z"/></svg> 技能</button>
-          <button class:active={settingsTab === 'mcp'} on:click={() => pickSettingsTab('mcp')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 7V3.5M15 7V3.5M7 7h10v4a5 5 0 0 1-10 0Z"/><path d="M12 16v5"/></svg> MCP</button>
+          <button class:active={settingsTab === 'memory'} on:click={() => pickSettingsTab('memory')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 4.5A7.5 7.5 0 0 0 4.5 12c0 2.4 1.1 4.2 2.8 5.5.4.3.7.9.7 1.5v1.5h9V19c0-.6.3-1.2.7-1.5 1.7-1.3 2.8-3.1 2.8-5.5A7.5 7.5 0 0 0 12 4.5Z"/></svg> 记忆约定</button>
+          <button class:active={settingsTab === 'skills'} on:click={() => pickSettingsTab('skills')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2.5 5.5 13.5H11l-1 8L18.5 10H13l1-7.5Z"/></svg> skill</button>
+          <button class:active={settingsTab === 'mcp'} on:click={() => pickSettingsTab('mcp')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 7V3.5M15 7V3.5M7 7h10v4a5 5 0 0 1-10 0Z"/><path d="M12 16v5"/></svg> mcp</button>
           <button class:active={settingsTab === 'ext'} on:click={() => pickSettingsTab('ext')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="3.5" y="4.5" width="17" height="15" rx="2.6"/><path d="M3.5 9.5h17"/><path d="M8 14h5" stroke-linecap="round"/></svg> 插件</button>
-          <button class:active={settingsTab === 'schedule'} on:click={() => pickSettingsTab('schedule')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg> 定时</button>
-          <button class:active={settingsTab === 'data'} on:click={() => pickSettingsTab('data')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="6" rx="7" ry="3"/><path d="M5 6v6c0 1.7 3.1 3 7 3s7-1.3 7-3V6"/><path d="M5 12v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6"/></svg> 数据</button>
+          <button class:active={settingsTab === 'schedule'} on:click={() => pickSettingsTab('schedule')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg> 定时任务</button>
+          <button class:active={settingsTab === 'data'} on:click={() => pickSettingsTab('data')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="6" rx="7" ry="3"/><path d="M5 6v6c0 1.7 3.1 3 7 3s7-1.3 7-3V6"/><path d="M5 12v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6"/></svg> 数据管理</button>
         </div>
         <div class="settings-content">
       <AppearanceTab
@@ -9360,7 +10034,7 @@
         {autoSave}
       />
       <RolesTab tab={settingsTab} rolesShown={features.roles} {configs} {configLabel} bind:roles {autoSave} />
-      <MemoryTab tab={settingsTab} showGalaxy={features.galaxy} on:openGalaxy={() => { settingsOpen = false; galaxyOpen = true; }} />
+      <MemoryTab tab={settingsTab} />
       <SkillsTab tab={settingsTab} skills={skillsData} loading={skillsLoading} confirm={confirmAsk} on:reload={loadSkills} />
       <McpTab tab={settingsTab} servers={mcpServers} on:action={(e) => mcpAction(e.detail.action, e.detail.name, e.detail.server)} on:reload={loadMcp} />
       <ExtTab
@@ -9469,6 +10143,7 @@
       <div class="modal-head">
         <b>子代理</b>
         <span class="subagent-modal-count">{subagentPanelRows.length} 次派发</span>
+        <button class="btn ghost" on:click={() => (subagentPanelOpen = false)}>关闭</button>
       </div>
       <div class="subagent-list">
         {#if !subagentPanelRows.length}
@@ -9497,7 +10172,6 @@
           </div>
         {/each}
       </div>
-      <div class="subagent-foot">子代理无人值守：需要审批的操作按拒绝处理；取消只停这一个，父任务停止键会级联停全部。</div>
     </div>
   </div>
 {/if}
@@ -9522,7 +10196,8 @@
           <div class="folders-row">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M3.5 7.2c0-1 .8-1.7 1.7-1.7h4l1.9 2.2h8.2c1 0 1.7.8 1.7 1.7v8.4c0 1-.8 1.7-1.7 1.7H5.2c-1 0-1.7-.8-1.7-1.7Z"/><path d="M3.5 10.5h17"/></svg>
             <div class="folders-info">
-              <b>{folderNameOf(f)}</b>
+              <!-- 统一叫「副目录」（用户 2026-11-07）：不加编号不加盘符；具体路径在下一行 -->
+              <b>副目录</b>
               <div class="folders-path">{f}</div>
             </div>
             <button class="row-btn" title="从项目移除此文件夹（不删磁盘文件）" on:click={() => removeWorkspaceFolder(f)}>
@@ -10352,7 +11027,8 @@
     justify-content: space-between;
     align-items: baseline;
     margin-bottom: 10px;
-    color: var(--tint-blue-fg);
+    /* 标题用正文色（2026-11-07 浅色实锤：原先整卡 tint-blue，浅色下全部文字染成亮蓝） */
+    color: var(--g7);
   }
   .ctx-card-head span {
     color: var(--g6);
@@ -10365,10 +11041,10 @@
     overflow: hidden;
     margin-bottom: 12px;
   }
+  /* 填充色随圆环 ctxColor（style:background 绑定）：常态与圆环同灰，压力高转警示色 */
   .ctx-bar-fill {
     height: 100%;
     border-radius: 4px;
-    background: var(--tint-blue-fg);
     transition: width 0.3s;
   }
   .ctx-row {
@@ -10376,7 +11052,7 @@
     align-items: center;
     gap: 8px;
     padding: 4px 0;
-    color: var(--tint-blue-fg);
+    color: var(--g7);
   }
   .ctx-dot {
     width: 8px;
@@ -12111,6 +12787,77 @@
        盒内文字仍是左对齐，两条并排看就是「一条居中一条左齐」（2026-11-01 真机实测） */
     text-align: center;
   }
+  /* 上下文压缩阈值行：圆环卡片里缓存命中率下面的小输入框 */
+  .compact-threshold-row .ctx-label {
+    flex: 1;
+  }
+  .compact-threshold-input {
+    width: 46px;
+    padding: 1px 5px;
+    font-size: 12px;
+    /* 数字右对齐贴着 % 后缀，与上面几行的数字列对齐（同款等宽数字） */
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    color: var(--g7);
+    background: var(--g1);
+    border: 1px solid var(--g3);
+    border-radius: 6px;
+    font-family: inherit;
+  }
+  .threshold-val {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+  }
+  .pct-suffix {
+    font-size: 12px;
+    color: var(--g5);
+  }
+  .compact-threshold-input:focus {
+    outline: none;
+    border-color: var(--brand);
+  }
+  /* 数字输入框右侧的步进按钮会顶住文字，隐藏后数字才真正贴右 */
+  .compact-threshold-input {
+    appearance: textfield;
+    -moz-appearance: textfield;
+  }
+  .compact-threshold-input::-webkit-outer-spin-button,
+  .compact-threshold-input::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+  /* 压缩标记行（2026-11-07）：整轮下方的分隔线；压缩中微弱呼吸感，完成后定格 */
+  .compact-divider {
+    margin: 10px auto 6px;
+    max-width: 92%;
+    text-align: center;
+    font-size: 12px;
+    color: var(--g5);
+    user-select: none;
+  }
+  /* 压缩标记行作为最后一条时（.tail，移出分块单独渲染）：零高度浮在底部留白区，
+     不占滚动高度——标记出现/落定曾把 scrollHeight 撑高，钉底跟随与 3s 运行态轮询
+     补滚把对话区往上顶一截（2026-11-08 用户实拍「压缩前会往上弹」）。
+     之后变成历史（后面来了新消息）就回到块内按普通行高占位。 */
+  .compact-divider.tail {
+    height: 0;
+    margin: 0;
+    padding: 0;
+    overflow: visible;
+    position: relative;
+    top: 8px; /* 纯视觉下移，不进布局 */
+  }
+  .compact-divider.running {
+    animation: compact-pulse 1.6s ease-in-out infinite;
+  }
+  .compact-divider.failed {
+    color: var(--warn, #c98a4b);
+  }
+  @keyframes compact-pulse {
+    0%, 100% { opacity: 0.45; }
+    50% { opacity: 0.9; }
+  }
   /* —— 一轮的元信息与过程块（2026-10-30 排布重做）——
      思考/工具不再各占一堆卡片：按真实顺序合成「过程」，完成收成一行。 */
   .turn-bar {
@@ -12364,6 +13111,15 @@
     font-size: 12px;
     color: var(--g5);
     font-family: Consolas, 'Cascadia Code', monospace;
+  }
+  /* 可点主语（ZCode 式）：悬停亮起+下划线，提示「点一下侧栏预览」 */
+  .tool-subject.linkable {
+    cursor: pointer;
+  }
+  .tool-subject.linkable:hover {
+    color: var(--g8);
+    text-decoration: underline;
+    text-underline-offset: 2px;
   }
   .tool-status {
     display: grid;
@@ -13475,12 +14231,6 @@
     color: var(--tint-blue-fg);
     border-color: var(--tint-blue-fg);
   }
-  .subagent-foot {
-    margin-top: 10px;
-    font-size: 11px;
-    color: var(--g5);
-    line-height: 1.6;
-  }
   /* —— 操作电脑（2026-10-20 第 4 轮；同子代理纪律：主区、不落侧边栏）—— */
   .computer-strip {
     display: flex;
@@ -13818,6 +14568,31 @@
   .pill.danger {
     color: var(--tint-red-fg);
   }
+  /* 审批档收起态：只留一枚图标（档位名称只在展开菜单里显示） */
+  .approval-pill {
+    padding: 4px 7px;
+  }
+  .approval-ico {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    flex: none;
+  }
+  .approval-ico svg {
+    width: 15px;
+    height: 15px;
+    display: block;
+  }
+  .approval-item {
+    align-items: center;
+  }
+  .approval-opt {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+  }
   .model-pill {
     font-family: Consolas, monospace;
   }
@@ -14070,6 +14845,12 @@
     font-size: 11px;
     color: var(--g5);
     user-select: none;
+  }
+  /* 能力菜单的加载占位：菜单先开、数据后台补（点了必须有反应，2026-11-07） */
+  .bar-empty {
+    padding: 4px 10px 6px;
+    font-size: 12px;
+    color: var(--g5);
   }
   /* @ 弹窗的 对话/文件 页签 */
   .ctx-tabs {

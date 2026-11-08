@@ -67,6 +67,12 @@ pub struct UsageRecord {
     /// ok（成功）| error（失败）| cancelled（取消）
     pub status: String,
     pub latency_ms: u64,
+    /// 首包延迟毫秒（请求发出 → 第一个分片到达）；None = 无计时（非流式/取消早于首包/旧记录）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttft_ms: Option<u64>,
+    /// 输出耗时毫秒（正文首 → 流结束，正文跨度缺失回落思考跨度）；None = 无计时
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gen_ms: Option<u64>,
     /// 失败原因（截断；绝不含 key）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -91,6 +97,8 @@ impl UsageRecord {
             cached_tokens: 0,
             status: "ok".to_string(),
             latency_ms: 0,
+            ttft_ms: None,
+            gen_ms: None,
             error: None,
             cost_usd: None,
         }
@@ -370,6 +378,10 @@ pub struct Agg {
     pub unpriced_requests: u64,
     pub p50_ms: u64,
     pub p95_ms: u64,
+    /// 平均首包延迟毫秒（成功调用；无计时的记录不参与）；None = 一条计时都没有
+    pub avg_ttft_ms: Option<u64>,
+    /// 平均输出速度 tok/s（成功调用的 completion 合计 / 输出耗时合计）；None = 没有可算的记录
+    pub avg_out_tps: Option<f64>,
     pub sessions: usize,
 }
 
@@ -402,6 +414,12 @@ struct Acc {
     cost_usd: f64,
     unpriced: u64,
     latencies: Vec<u64>,
+    /// 首包延迟合计与样本数（只算成功调用；算平均用）
+    ttft_sum_ms: u64,
+    ttft_n: u64,
+    /// 输出耗时合计毫秒与参与速度计算的 completion 合计（输出速度 = 后者/前者）
+    gen_sum_ms: u64,
+    speed_comp_tokens: u64,
     sessions: HashSet<String>,
 }
 
@@ -421,6 +439,19 @@ impl Acc {
             None => self.unpriced += 1,
         }
         self.latencies.push(r.latency_ms);
+        // 计时口径：只算成功调用（取消/失败的首包与速度不成统计口径）
+        if r.status == "ok"
+            && let Some(t) = r.ttft_ms
+        {
+            self.ttft_sum_ms += t;
+            self.ttft_n += 1;
+            if let Some(g) = r.gen_ms
+                && g > 0
+            {
+                self.gen_sum_ms += g;
+                self.speed_comp_tokens += r.completion_tokens;
+            }
+        }
         if !r.session_id.is_empty() {
             self.sessions.insert(r.session_id.clone());
         }
@@ -441,6 +472,9 @@ impl Acc {
             unpriced_requests: self.unpriced,
             p50_ms: percentile(&lat, 0.5),
             p95_ms: percentile(&lat, 0.95),
+            avg_ttft_ms: (self.ttft_n > 0).then(|| self.ttft_sum_ms / self.ttft_n),
+            avg_out_tps: (self.gen_sum_ms > 0)
+                .then(|| self.speed_comp_tokens as f64 / (self.gen_sum_ms as f64 / 1000.0)),
             sessions: self.sessions.len(),
         }
     }
@@ -479,9 +513,9 @@ pub fn report(group: &str, range: &str, session: &str) -> Report {
         if !session.is_empty() && r.session_id != session {
             continue;
         }
-        // 会话口径（面板「本次对话用量」）只算对话本身：标题/摘要是记账杂项，
+        // 会话口径（面板「本次对话用量」）只算对话本身：标题/摘要/压缩是记账杂项，
         // 不是对话消耗（2026-10-01 真机实测）；全局报表不传 session 时仍含全部用途
-        if !session.is_empty() && (r.purpose == "title" || r.purpose == "summary") {
+        if !session.is_empty() && matches!(r.purpose.as_str(), "title" | "summary" | "compact") {
             continue;
         }
         if let Some(f) = from {

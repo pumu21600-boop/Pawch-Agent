@@ -290,15 +290,6 @@ pub const SCHEMA: &[SchemaEntry] = &[
         desc: "配置名或 id（未设回落主力渠道）",
     },
     SchemaEntry {
-        path: "roles.title",
-        label: "标题生成专用配置",
-        ty: "config_name",
-        enum_values: &[],
-        default: None,
-        risk: "normal",
-        desc: "配置名或 id（未设回落主力渠道）",
-    },
-    SchemaEntry {
         path: "roles.vision",
         label: "视觉理解专用配置",
         ty: "config_name",
@@ -356,10 +347,10 @@ pub const SCHEMA: &[SchemaEntry] = &[
         path: "roles.subagent_mode",
         label: "子代理派发模型",
         ty: "string",
-        enum_values: &["parent", "custom", "ask"],
+        enum_values: &["parent", "custom"],
         default: Some("parent"),
         risk: "normal",
-        desc: "parent=跟随父对话（子代理用父任务当前正在用的渠道/模型）；custom=用 roles.subagent 专用配置；ask=派发前先问用户要用哪个模型",
+        desc: "parent=跟随父对话（子代理用父任务当前正在用的渠道/模型）；custom=用 roles.subagent 专用配置",
     },
     SchemaEntry {
         path: "roles.fallbacks",
@@ -369,6 +360,15 @@ pub const SCHEMA: &[SchemaEntry] = &[
         default: None,
         risk: "normal",
         desc: "按序降级的配置名/ id 列表",
+    },
+    SchemaEntry {
+        path: "compact_percent",
+        label: "上下文压缩线",
+        ty: "integer",
+        enum_values: &[],
+        default: Some("缺省 85；0=恢复默认"),
+        risk: "normal",
+        desc: "窗口百分比 40–85；达到阈值在本轮收尾后静默压缩",
     },
 ];
 
@@ -477,14 +477,14 @@ pub(crate) fn apply_entry_value(s: &mut Settings, path: &str, v: &Value) -> Resu
                 "base_url" => "base_url（渠道地址变更：模型与模型列表会清空，需重新拉取）",
                 _ => path,
             };
-            let (url_changed, _, _) = crate::server::settings::apply_settings_update(s, &upd);
+            let (url_changed, _, _) = crate::server::settings::apply_settings_update(s, &upd)?;
             if path == "model" && url_changed {
                 // 与「同补辰 base_url+model」老语义对齐：model 分支本来就允许多 apply 一遍
                 let again = crate::server::settings::SettingsUpdate {
                     model: upd.model.clone(),
                     ..Default::default()
                 };
-                crate::server::settings::apply_settings_update(s, &again);
+                crate::server::settings::apply_settings_update(s, &again)?;
             }
             let mut out = extra_note.to_string();
             if url_changed && path == "base_url" {
@@ -541,6 +541,20 @@ pub(crate) fn apply_entry_value(s: &mut Settings, path: &str, v: &Value) -> Resu
                 .map_err(|e| format!("{p} 写不进去: {e}"))?;
             Ok(p.to_string())
         }
+        "compact_percent" => {
+            let Some(n) = v.as_u64() else {
+                return Err("compact_percent 需要整数（0=恢复默认，40–85 生效）".into());
+            };
+            let n = n.min(u8::MAX as u64) as u8;
+            if n == 0 {
+                s.compact_percent = None;
+            } else if (40..=85).contains(&n) {
+                s.compact_percent = Some(n);
+            } else {
+                return Err(format!("compact_percent={n} 不在 40–85（0=恢复默认）"));
+            }
+            Ok("compact_percent".into())
+        }
         p if p.starts_with("roles.") => {
             let key = &p["roles.".len()..];
             let cur: &mut Option<crate::config::settings::RolesSettings> = &mut s.roles;
@@ -571,13 +585,29 @@ fn apply_role_field(
     };
     match key {
         "summary" => put(&mut r.summary),
-        "title" => put(&mut r.title),
         "vision" => put(&mut r.vision),
         "video" => put(&mut r.video),
         "audio" => put(&mut r.audio),
         "embedding" => put(&mut r.embedding),
         "budget" => put(&mut r.budget),
         "subagent" => put(&mut r.subagent),
+        // 子代理模式（parent=跟随主渠道 / custom=用 roles.subagent 指定模型）：
+        // schema 把 roles.subagent_mode 列为可改路径，这里必须认——不然模型按工具描述
+        // 去改会整条 patch 报错（审计 2026-11-08：schema 有入口、应用层不认的老洞）
+        "subagent_mode" => {
+            let s = v
+                .as_str()
+                .ok_or_else(|| "roles.subagent_mode 需要字符串（parent / custom）".to_string())?
+                .trim()
+                .to_string();
+            match s.as_str() {
+                // 空串 = 清除回落 parent；不认识的值也按 parent 处理（与读盘迁移同口径）
+                "" | "parent" => r.subagent_mode = None,
+                "custom" => r.subagent_mode = Some("custom".into()),
+                other => return Err(format!("roles.subagent_mode 只能是 parent / custom（现在是「{other}」）")),
+            }
+            Ok(())
+        }
         "fallbacks" => {
             r.fallbacks = v
                 .as_array()
@@ -589,7 +619,7 @@ fn apply_role_field(
             Ok(())
         }
         other => Err(format!(
-            "未知 roles 字段 {other}（合法：summary/title/vision/video/audio/embedding/budget/subagent/fallbacks）"
+            "未知 roles 字段 {other}（合法：summary/vision/video/audio/embedding/budget/subagent/subagent_mode/fallbacks）"
         )),
     }
 }
@@ -694,12 +724,24 @@ mod tests {
             .iter()
             .filter_map(|e| e.path.strip_prefix("roles."))
             .collect();
-        for k in ["summary", "title", "vision", "video", "audio", "embedding", "budget", "subagent", "fallbacks"] {
+        for k in ["summary", "vision", "video", "audio", "embedding", "budget", "subagent", "fallbacks"] {
             assert!(roles.contains(k), "roles.{k} 不在 schema 表内");
         }
         // 整表键要在表内（FeatureSettings::set 的键白名单由运行时兜底）。
         assert!(SCHEMA.iter().any(|e| e.path == "features"));
         assert!(SCHEMA.iter().any(|e| e.path == "mcp_servers"));
         assert!(SCHEMA.iter().any(|e| e.path == "schedules"));
+    }
+
+    #[test]
+    fn compact_percent_roundtrip_and_bounds() {
+        let mut s = crate::config::settings::Settings::default();
+        assert_eq!(apply_entry_value(&mut s, "compact_percent", &serde_json::json!(60)).unwrap(), "compact_percent");
+        assert_eq!(s.compact_percent, Some(60));
+        assert!(apply_entry_value(&mut s, "compact_percent", &serde_json::json!(30)).is_err(), "低于 40 拒收");
+        assert!(apply_entry_value(&mut s, "compact_percent", &serde_json::json!(90)).is_err(), "高于 85 拒收");
+        assert!(apply_entry_value(&mut s, "compact_percent", &serde_json::json!("六十")).is_err(), "类型不对必须报错");
+        apply_entry_value(&mut s, "compact_percent", &serde_json::json!(0)).unwrap();
+        assert_eq!(s.compact_percent, None, "0 = 恢复默认 85");
     }
 }

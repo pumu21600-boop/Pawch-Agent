@@ -3,7 +3,7 @@
 //! 架构设计（彻底重构）：
 //! 1. **单一真理源**：废除顶层冗余镜像字段与位置元组手抄；每套配置独立自治。
 //! 2. **Config 为一等实体**：包含渠道信息、模型选择、DPAPI 专属密钥、采样与思考参数、模型多模态能力标记。
-//! 3. **RolesSettings 角色路由**：支持主力模型、会话摘要、标题生成及多模态视觉/视频/音频解析路由。
+//! 3. **RolesSettings 角色路由**：支持主力模型、会话摘要及多模态视觉/视频/音频解析路由。
 //! 4. **DPAPI 密钥隔离**：按配置独立加密保存（CryptProtectData），不入日志、不出内存。
 //!
 //! ## 配置面地图（收敛：三类五面，写入口各一）
@@ -73,9 +73,6 @@ pub struct RolesSettings {
     /// 滚动摘要专用配置名或 id（未设回落主力渠道）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
-    /// 会话标题生成专用配置名或 id
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
     /// 视觉/图片理解专用配置名或 id（多模态旁路代理）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision: Option<String>,
@@ -97,8 +94,8 @@ pub struct RolesSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent: Option<String>,
     /// 子代理默认派发模型：parent=跟随父对话（默认，用父任务
-    /// 当前轮正在跑的渠道/模型）、custom=用下方 subagent 专用配置、ask=派发前先问用户
-    /// （模型收到引导后带 model 参数重派）。派发时的显式 model 参数永远优先。
+    /// 当前轮正在跑的渠道/模型）、custom=用下方 subagent 专用配置。
+    /// 派发时的显式 model 参数永远优先。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_mode: Option<String>,
     /// 降级备用配置名列表
@@ -179,7 +176,7 @@ impl FeatureSettings {
     }
 }
 
-/// 成本台账设置（插件化后由「用量价格」插件的价格设置页维护）。
+/// 成本台账设置（插件化后由「使用统计」插件的价格设置页维护）。
 /// 单价一律以**美元 / 1M tokens** 规范存储（台账与硬闸的口径）；界面按 `currency` 显示，
 /// 人民币值按 `usd_cny_rate` 折算——切币种只换展示，不动历史账。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -424,6 +421,11 @@ pub struct Settings {
     /// 都重建组件，× 不落盘就会「明明叉掉了又回来」（2026-10-05 真机实测）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub schedule_dismissed: Vec<String>,
+
+    /// 上下文压缩线（% 窗口，40–85；缺省 85）。达到阈值在本轮收尾后静默压缩——
+    /// 可调阈值让用户自己把控上下文节奏：日常等于不压缩，撞线才付一次压缩成本。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_percent: Option<u8>,
 
     // —— 历史迁移源（仅在反序列化旧版 settings.json 时读入，序列化时不写出） ——
     #[serde(default, skip_serializing)]
@@ -693,6 +695,16 @@ impl Settings {
             return;
         }
         self.disabled_plugins.push("computer".to_string());
+    }
+
+    /// 子代理「派发前询问」档下线：旧设置里的 `subagent_mode=ask`
+    /// 一次性归回「跟随主渠道」（缺省/None），等下次保存自然落盘。
+    fn migrate_subagent_ask_mode(&mut self) {
+        if let Some(r) = self.roles.as_mut()
+            && r.subagent_mode.as_deref() == Some("ask")
+        {
+            r.subagent_mode = None;
+        }
     }
 
     /// 确保 configs 非空且有激活项；缺名的补「配置 N」。
@@ -991,6 +1003,8 @@ pub(crate) fn settings_from_text(text: &str) -> Result<Settings, serde_json::Err
     s.migrate_url_keys_to_configs();
     // 2026-11-04：电脑操作闸并入插件列表，旧 features.computer=false 一次性迁到停用名单
     s.migrate_computer_gate_to_plugin();
+    // 2026-11-07：子代理「派发前询问」档下线，旧 ask 设置归回跟随主渠道
+    s.migrate_subagent_ask_mode();
     // 确保存在有效激活配置
     s.ensure_active_config();
     Ok(s)
@@ -1059,7 +1073,8 @@ fn parse_settings(text: &str) -> Result<Settings, serde_json::Error> {
 
 /// 「本该是数字/布尔却写成字符串/null」的已知字段名（保守清单：只收语义明确的键，
 /// `thinking` 这类合法字符串字段绝不在内）。
-const NUMERIC_SETTING_KEYS: [&str; 14] = [
+const NUMERIC_SETTING_KEYS: [&str; 15] = [
+    "compact_percent",
     "context_length",
     "max_output_tokens",
     "max_tokens",

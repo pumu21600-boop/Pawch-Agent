@@ -398,7 +398,11 @@ pub enum ChatOutcome {
     /// 半截落地后**继续本轮**（下一个决策点取走打断指令），与 Cancelled（终止
     /// 整轮）的本质区别。
     Interrupted(AssistantTurn),
-    Cancelled,
+    /// 取消（停止/立即发送的停轮）：半截内容一并带出（tool_calls 同 Interrupted 规则
+    /// 丢弃）——被打断那轮的执行过程是真实发生过的工作，调用方落地落盘，回滚/重启
+    /// 才不会把它蒸发（真机 2026-11-08：立即发送后回退，上一轮执行过程整段消失——
+    /// 它只活在内存里，从未落过盘）。None = 还没流出任何内容（请求前/等响应中被取消）。
+    Cancelled(Option<AssistantTurn>),
 }
 
 impl Gateway {
@@ -697,7 +701,7 @@ impl Gateway {
         Ok(ids)
     }
 
-    /// 非流式单轮补全（滚动摘要 /  标题生成 / 媒体旁路用）：返回 choices[0].message.content。
+    /// 非流式单轮补全（滚动摘要 / 媒体旁路用）：返回 choices[0].message.content。
     /// 不查取消标志（摘要失败由调用方降级），超时走客户端全局 600s。
     /// 与流式同一道计量（台账 + 花费硬闸），ctx.purpose 区分用途。
     pub async fn complete(
@@ -800,6 +804,19 @@ impl Gateway {
         // 台账：usage 三路分计量（渠道不回 usage 时记 0，请求与延迟照记）
         let (p, c, k) = usage_triple(&data);
         record_usage(ctx, base_url, params.provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::ok((p, c, k)));
+        // aux 响应一行摘要（2026-11-08）：以前请求有日志、响应全盲——「摘要为空」只能
+        // 干猜上游回了什么。finish_reason + 计量落一条，一眼定位「截断/空回/拒答」。
+        observability::event(
+            EventType::State,
+            json!({
+                "kind": "gateway.response",
+                "purpose": ctx.purpose,
+                "status": status.as_u16(),
+                "finish_reason": data.pointer("/choices/0/finish_reason").and_then(Value::as_str).unwrap_or(""),
+                "prompt_tokens": p,
+                "completion_tokens": c,
+            }),
+        );
         // 取正文：Anthropic content[] 拼 text 块（思考走独立块不混正文）；OpenAI choices[0].message.content
         let raw = match compat.protocol {
             Protocol::AnthropicMessages => data
@@ -943,7 +960,7 @@ impl Gateway {
         // 每轮模型决策前先查取消标志
         if cancel.is_set() {
             observability::event(EventType::State, json!({ "kind": "cancel", "phase": "before_request" }));
-            return Ok(ChatOutcome::Cancelled);
+            return Ok(ChatOutcome::Cancelled(None));
         }
 
         let compat = compat::resolve(
@@ -1012,7 +1029,7 @@ impl Gateway {
                 json!({ "kind": "cancel", "phase": "awaiting_response", "url": redact_url(&url) }),
             );
             record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("cancelled", "用户取消".into()));
-            return Ok(ChatOutcome::Cancelled);
+            return Ok(ChatOutcome::Cancelled(None));
         };
         let mut response = match sent {
             Ok(r) => r,
@@ -1044,7 +1061,7 @@ impl Gateway {
             .await;
             let Some(sent) = sent else {
                 record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("cancelled", "用户取消".into()));
-                return Ok(ChatOutcome::Cancelled);
+                return Ok(ChatOutcome::Cancelled(None));
             };
             response = match sent {
                 Ok(r) => r,
@@ -1090,7 +1107,7 @@ impl Gateway {
             .await;
             let Some(sent) = sent else {
                 record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("cancelled", "用户取消".into()));
-                return Ok(ChatOutcome::Cancelled);
+                return Ok(ChatOutcome::Cancelled(None));
             };
             response = match sent {
                 Ok(r) => r,
@@ -1201,8 +1218,12 @@ impl Gateway {
                         EventType::State,
                         json!({ "kind": "cancel", "phase": "streaming", "chunks": agg.chunk_count }),
                     );
-                    record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err_with("cancelled", "用户取消".into(), partial_tokens(&agg.turn)));
-                    return Ok(ChatOutcome::Cancelled);
+                    // 先 finish 再记录：输出耗时需要 finished_at（首包不需要）
+                    agg.finish();
+                    record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err_with("cancelled", "用户取消".into(), partial_tokens(&agg.turn)).timed(&agg.turn, started));
+                    let mut turn = agg.turn;
+                    turn.tool_calls.clear();
+                    return Ok(ChatOutcome::Cancelled(Some(turn)));
                 }
                 () = interrupt.cancelled() => {
                     // 「立即发送」：流式让位——半截内容带出（tool_calls 丢弃），调用方
@@ -1211,8 +1232,8 @@ impl Gateway {
                         EventType::State,
                         json!({ "kind": "interrupt", "phase": "streaming", "chunks": agg.chunk_count }),
                     );
-                    record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::ok(partial_tokens(&agg.turn)));
                     agg.finish();
+                    record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::ok(partial_tokens(&agg.turn)).timed(&agg.turn, started));
                     let mut turn = agg.turn;
                     turn.tool_calls.clear();
                     return Ok(ChatOutcome::Interrupted(turn));
@@ -1325,8 +1346,12 @@ impl Gateway {
                         EventType::State,
                         json!({ "kind": "cancel", "phase": "streaming", "chunks": agg.chunk_count }),
                     );
-                    record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err_with("cancelled", "用户取消".into(), partial_tokens(&agg.turn)));
-                    return Ok(ChatOutcome::Cancelled);
+                    // 先 finish 再记录：输出耗时需要 finished_at（首包不需要）
+                    agg.finish();
+                    record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err_with("cancelled", "用户取消".into(), partial_tokens(&agg.turn)).timed(&agg.turn, started));
+                    let mut turn = agg.turn;
+                    turn.tool_calls.clear();
+                    return Ok(ChatOutcome::Cancelled(Some(turn)));
                 }
                 // 200 流里夹带的错误（中转/队列服务的 finish_reason=error + error 对象）：
                 // 旧逻辑当普通分片吞掉，最终空回答、界面转圈后没动静。这里直接上抛，
@@ -1427,7 +1452,8 @@ impl Gateway {
                  可能是中转代理在 data: 行前后注入了文本，或流被截断。请重试或更换渠道。"
             );
         }
-        // 台账：成功调用记 usage 三路（渠道不回 usage 时 token 记 0，请求与延迟照记）
+        // 台账：成功调用记 usage 三路（渠道不回 usage 时 token 记 0，请求与延迟照记）；
+        // 首包延迟/输出耗时一并落账（使用统计面板的平均首 token 延迟与输出速度）
         record_usage(
             ctx,
             base_url,
@@ -1438,7 +1464,8 @@ impl Gateway {
                 turn.prompt_tokens.unwrap_or(0),
                 turn.completion_tokens.unwrap_or(0),
                 turn.cached_tokens.unwrap_or(0),
-            )),
+            ))
+            .timed(&turn, started),
         );
         observability::event(
             EventType::State,

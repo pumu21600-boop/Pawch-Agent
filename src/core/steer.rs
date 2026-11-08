@@ -1,6 +1,6 @@
-//! 运行中收到的用户消息（steering / 排队 / 打断，2026-10-22 三级分家）
+//! 运行中收到的用户消息（排队 / 引导，2026-10-22 分家；「立即发送」2026-11-07 改语义）
 //!
-//! 同一会话已有一轮在跑时，新来的用户消息**不拒收**，按三种模式进本会话的队列：
+//! 同一会话已有一轮在跑时，新来的用户消息**不拒收**，按模式进本会话的队列：
 //!
 //! - **排队（Queued，默认）**：等这一轮结束再作为下一轮发出去（服务层收尾取走）。
 //!   网页端默认走这条：消息先显示成「排队中」，本轮跑完自动发。
@@ -9,14 +9,12 @@
 //!   每步决策前，以及最终回答落地后（补流式输出期间到达的——决策点只在模型调用
 //!   之前，不补取就会漏掉最后窗口、被收尾 drain_all 捡去当 followup 另起一轮，
 //!   2026-09-27 真机实测）。
-//! - **打断（Interrupt，「立即发送」）**：置位本会话的打断信号
-//!   （一个 [CancelFlag]——审批等待/工具执行/流式输出三个等待点 select! 到它当场
-//!   让位：挂起的审批按拒绝放行、跑着的工具按「已中断」回喂、流式回答半截落地），
-//!   消息本身仍走引导路径并入本轮——打断不是停（停止才终止整轮），是「放下手里的、
-//!   马上听我的」。信号在决策点取走打断消息时复位；若打断到达时没有任何在等的
-//!   等待点（恰在缝隙里），信号置而复清，退化为一次引导，无害。
+//! - **打断（Interrupt，旧「立即发送」）**：2026-11-07 起 chat 端点**不再产生**这种
+//!   条目——「立即发送」改为「停掉当前轮 + 这条消息作为新一轮」（排队保消息 +
+//!   [SteerQueue::mark_restart] + 取消原轮，被停那轮的收尾取到标记就按 followup 开新轮）。
+//!   枚举与并入路径保留给兼容（旧测试/潜在调用方），当前无生产者。
 //!
-//! 三种情况都**不**产生并发双轮：同一会话同时仍然只有一轮在跑（会话文件单写者、
+//! 各种情况都**不**产生并发双轮：同一会话同时仍然只有一轮在跑（会话文件单写者、
 //! 取消入口不被顶掉），这条不变量由 [super::cancel::CancelRegistry] 保证。
 
 use std::collections::HashMap;
@@ -33,7 +31,9 @@ pub enum SteerMode {
     Queued,
     /// 引导：并入本轮，下一个决策点生效，不打断
     Steer,
-    /// 打断（「立即发送」）：置打断信号让等待点让位，消息并入本轮
+    /// 打断（旧「立即发送」并入语义）：置打断信号让等待点让位，消息并入本轮。
+    /// 2026-11-07 起 chat 端点不再产生（「立即发送」= 停轮重启，走 Queued +
+    /// mark_restart）；枚举保留给兼容路径。
     Interrupt,
 }
 
@@ -48,12 +48,38 @@ pub struct SteerMsg {
     pub mode: SteerMode,
 }
 
+impl SteerMsg {
+    /// 落进会话/推给前端的 user 消息——**三态标记的唯一出口**。
+    /// 引导 = steered（前端渲染「已引导」静默行）；打断 = interrupted（正常气泡）；
+    /// 排队 = 什么都不标（它本来就是「本轮结束后作为新消息发出去」的那条，标成
+    /// 已引导会在界面上和真正引导过的那条重复——2026-11-07 真机：排队后点「引导」
+    /// 出现两条「已引导」同文，一条还真的被当成新一轮发了出去）。
+    pub fn to_message(&self) -> Value {
+        let mut m = json!({ "role": "user", "content": self.content.clone(), "ts": now_ms() });
+        match self.mode {
+            SteerMode::Steer => m["steered"] = json!(true),
+            SteerMode::Interrupt => m["interrupted"] = json!(true),
+            SteerMode::Queued => {}
+        }
+        m
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 #[derive(Default)]
 pub struct SteerQueue {
     inner: Mutex<HashMap<String, Vec<SteerMsg>>>,
-    /// 每会话的打断信号（「立即发送」置位；决策点取走打断消息时复位；收尾 drain_all 清除）。
-    /// 与取消信号（CancelRegistry）平行传播：取消终止整轮，打断让位后本轮继续。
+    /// 每会话的打断信号（旧「立即发送」并入语义用；2026-11-07 起 chat 端点不再
+    /// 产生 Interrupt 条目，字段保留给兼容路径）。
     interrupts: Mutex<HashMap<String, Arc<CancelFlag>>>,
+    /// 每会话的「停轮重启」标记（「立即发送」置位；被停那轮的收尾取走，取走即清）。
+    restarts: Mutex<std::collections::HashSet<String>>,
 }
 
 impl SteerQueue {
@@ -80,10 +106,81 @@ impl SteerQueue {
         v.len()
     }
 
+    /// 把一条**已排队**的消息原地升级成引导（同会话、同文本的第一条 Queued）。
+    /// 前端在「排队中」气泡上点「引导」时走这里：改档，而不是再排一条
+    /// 新的——否则原来那条排队消息会在本轮收尾时被排水成下一轮，同一句话既显示
+    /// 「已引导」又被自动重发一遍（2026-11-07 真机）。
+    /// 「立即发送」不走升级（它的新语义是停轮重启，见 chat 端点）：用 [Self::has_queued]
+    /// 判重后按需入队即可。
+    /// 找不到（没排过 / 已被取走 / 文本不同）返回 false，调用方按新消息正常入队。
+    pub fn promote(&self, session_id: &str, text: &str, mode: SteerMode) -> bool {
+        if mode != SteerMode::Steer {
+            return false;
+        }
+        let mut m = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        match m.get_mut(session_id) {
+            Some(v) => v
+                .iter_mut()
+                .find(|s| s.mode == SteerMode::Queued && s.text == text)
+                .map(|s| {
+                    s.mode = mode;
+                })
+                .is_some(),
+            None => false,
+        }
+    }
+
+    /// 队列里是否已有同文本的排队条目（「立即发送」的原地判定：有就别再排一条，
+    /// 否则原条目收尾被排水时同一句话会发两遍）。
+    pub fn has_queued(&self, session_id: &str, text: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session_id)
+            .map(|v| v.iter().any(|s| s.mode == SteerMode::Queued && s.text == text))
+            .unwrap_or(false)
+    }
+
+    /// 「立即发送」的重启标记（2026-11-07 语义变更）：中断请求置位，被停的那一轮
+    /// 收尾时取走——取到 = 这一轮停下后用队列里的消息开新一轮；没取到（用户点的是
+    /// 「停止」）= 队列一并作废。**取走即清**：标记绝不能留到下一轮，否则之后一次
+    /// 普通的「停止」会把用户想丢的排队消息当成新一轮跑掉。
+    pub fn mark_restart(&self, session_id: &str) {
+        self.restarts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session_id.to_string());
+    }
+
+    /// 取走（并清除）重启标记。
+    pub fn take_restart(&self, session_id: &str) -> bool {
+        self.restarts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(session_id)
+    }
+
     /// 本会话的打断信号（取或建；等待方 select! 它，push(Interrupt) 置位它）。
     pub fn interrupt_flag(&self, session_id: &str) -> Arc<CancelFlag> {
         let mut m = self.interrupts.lock().unwrap_or_else(|e| e.into_inner());
         m.entry(session_id.to_string()).or_insert_with(|| Arc::new(CancelFlag::new())).clone()
+    }
+
+    /// 本会话挂着的引导消息文本（**只读不动队列**）。GET /api/cancel 带出去给前端
+    /// 恢复「已引导」标记用：标记只活在前端内存，刷新就丢——服务端队列在模型取走
+    /// 之前是唯一权威，取走后由会话文件里的 steered 行接力。
+    pub fn steer_texts(&self, session_id: &str) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session_id)
+            .map(|v| {
+                v.iter()
+                    .filter(|s| s.mode == SteerMode::Steer)
+                    .map(|s| s.text.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// 本会话当前积压条数（防线用：超过上限说明客户端在循环重发，拒收新消息）。
@@ -209,6 +306,67 @@ mod tests {
         let left = q.drain_all("s");
         assert_eq!(left.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(), vec!["排队一", "排队二"]);
         assert!(q.drain_all("s").is_empty());
+    }
+
+    #[test]
+    fn promote_upgrades_queued_in_place() {
+        let q = SteerQueue::new();
+        q.push("s", "把配色改成暖色".into(), SteerMode::Queued);
+        // 「排队中」气泡上点引导 → 原地升级，不许再多出一条
+        assert!(q.promote("s", "把配色改成暖色", SteerMode::Steer));
+        assert_eq!(q.pending("s"), 1, "升级不能增加条数（否则收尾会再发一遍）");
+        let now = q.drain_immediate("s");
+        assert_eq!(now.len(), 1, "升级后的条目应能被决策点当引导取走");
+        assert_eq!(now[0].mode, SteerMode::Steer);
+        assert!(q.drain_all("s").is_empty(), "升级后队列里不许残留同文本的排队副本");
+        // 文本对不上 / 队列里没有：不动，调用方按新消息入队
+        assert!(!q.promote("s", "不存在的一句", SteerMode::Steer));
+        assert!(!q.promote("s", "把配色改成暖色", SteerMode::Queued), "Queued 不能升级成 Queued");
+    }
+
+    #[test]
+    fn interrupt_queued_dedups_and_restart_flag_is_taken_once() {
+        let q = SteerQueue::new();
+        q.push("s", "停下先改这个".into(), SteerMode::Queued);
+        // 「立即发送」的原地判定：队列里已有同文本排队条目 → 别再排一条
+        assert!(q.has_queued("s", "停下先改这个"));
+        assert!(!q.has_queued("s", "另一句"));
+        assert_eq!(q.pending("s"), 1, "判重命中时不得新增条目");
+        // 重启标记：置位 → 取走一次为 true，再取为 false（不能留给下一轮的「停止」）
+        q.mark_restart("s");
+        assert!(q.take_restart("s"));
+        assert!(!q.take_restart("s"), "标记取走即清");
+        assert!(!q.take_restart("别的会话"));
+    }
+
+    #[test]
+    fn steer_texts_read_only_lists_pending_steers() {
+        let q = SteerQueue::new();
+        assert!(q.steer_texts("s").is_empty(), "没登记过的会话取到空表");
+        q.push("s", "排队一".into(), SteerMode::Queued);
+        q.push("s", "引导一".into(), SteerMode::Steer);
+        q.push("s", "引导二".into(), SteerMode::Steer);
+        // 只列引导，排队不打进标记；探针不消费——drain_immediate 还能全量取走
+        assert_eq!(q.steer_texts("s"), vec!["引导一".to_string(), "引导二".to_string()]);
+        assert_eq!(q.pending("s"), 3);
+        let now = q.drain_immediate("s");
+        assert_eq!(now.len(), 2, "引导被模型取走");
+        assert!(q.steer_texts("s").is_empty(), "取走后探针为空，前端标记交给会话文件接力");
+    }
+
+    #[test]
+    fn to_message_marks_only_immediate_modes() {
+        let make = |mode| SteerMsg { text: "x".into(), content: json!("x"), mode };
+        let s = make(SteerMode::Steer).to_message();
+        assert_eq!(s["steered"], json!(true), "引导 → 已引导行");
+        assert!(s.get("interrupted").is_none());
+        let i = make(SteerMode::Interrupt).to_message();
+        assert_eq!(i["interrupted"], json!(true), "打断 → 正常气泡");
+        assert!(i.get("steered").is_none());
+        let q = make(SteerMode::Queued).to_message();
+        assert!(q.get("steered").is_none() && q.get("interrupted").is_none(), "排队 = 普通用户消息，不许标已引导");
+        assert_eq!(q["role"], json!("user"));
+        assert!(q["ts"].as_u64().unwrap_or(0) > 0);
     }
 
     /// 打断信号生命周期（2026-10-22「立即发送」）：push 置位 → 等待点 select! 让位 →

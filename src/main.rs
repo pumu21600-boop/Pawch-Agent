@@ -5,6 +5,7 @@
 mod artifacts;
 mod browser;
 mod bootstrap;
+mod compact;
 mod computer;
 mod config;
 mod context;
@@ -153,7 +154,7 @@ async fn main() -> anyhow::Result<()> {
     crate::plugin::ui::set_disabled(&user_settings.disabled_plugins); // 生态轮：同名单贯通插件技能根
     crate::skills::set_disabled(&user_settings.disabled_skills); // 2026-10-02：技能启停名单贯通（index_prompt/composer 过滤）
     crate::hooks::install(config.hooks.clone()); //  027：钩子四挂点（config.toml [hooks]）
-    // 成本台账：价格表来自 settings.json（由「用量价格」插件的价格设置页维护），
+    // 成本台账：价格表来自 settings.json（由「使用统计」插件的价格设置页维护），
     // 初始化台账时扫一遍装入累计花费（费用已冻结在记录里，直接求和），最后装花费硬闸。
     usage::install_prices(&user_settings.cost.prices);
     usage::init(&log_dir.join("usage"));
@@ -269,6 +270,7 @@ async fn main() -> anyhow::Result<()> {
         },
         // 2026-10-08：settings 写互斥（读-改-写整条链路持锁，见字段注释）
         settings_write: Arc::new(std::sync::Mutex::new(())),
+        compact_fail_streak: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         agent_cfg: Arc::new(config.agent),
         sandbox_cfg: Arc::new(config.sandbox),
         context_cfg: Arc::new(config.context),

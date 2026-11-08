@@ -51,6 +51,10 @@ pub(super) async fn list_schedules(State(state): State<AppState>) -> Json<Value>
                 "on_approval": if t.on_approval.is_empty() { "deny".to_string() } else { t.on_approval.clone() },
                 "enabled": t.enabled,
                 "timeout_secs": t.timeout_secs,
+                // 这三个字段必须回显：保存是整条覆盖，清单漏了哪个，编辑→保存就把哪个清空
+                "config_id": t.config_id,
+                "model": t.model,
+                "budget_tokens": t.budget_tokens,
                 "created_ts": t.created_ts,
                 "last_run_ts": t.last_run_ts,
                 "last_manual_ts": t.last_manual_ts,

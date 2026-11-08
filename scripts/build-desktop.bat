@@ -5,6 +5,15 @@ rem "invalid character ' ' in crate name"), so the build output stays
 rem pawch-agent-desktop.exe and we move it afterwards. Keep it ASCII-only.
 rem Usage: scripts\build-desktop.bat   (stop the shell first, the exe is locked while running)
 setlocal
+rem VS 2022 dev environment for link.exe/cl.exe - Git Bash's coreutils link.exe
+rem hijacks MSVC link.exe ("missing operand after BOM"); same fix as build-release.bat.
+rem No vswhere on this machine, path hardcoded.
+set "VCVARS=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+if not exist "%VCVARS%" (
+  echo [build-desktop] vcvars64.bat not found - update the path in this script
+  exit /b 1
+)
+call "%VCVARS%" >nul
 cd /d %~dp0..
 set "OUT=desktop\target\release\Pawch Agent.exe"
 if exist "%OUT%" del "%OUT%"

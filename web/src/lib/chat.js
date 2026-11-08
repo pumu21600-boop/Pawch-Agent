@@ -286,6 +286,29 @@ export function mergeAssistantRun(list) {
   return out;
 }
 
+/// 目标消息在会话文件里的「第几条 user 消息」序数（0 基）——回滚/单条删除/编辑重发
+/// 按它向服务端定位截断点（删文件里第 N 条 user 及其后）。前提：视图与文件的 user
+/// 行一一对应——
+/// - 排队气泡没进文件 → 排除；
+/// - 引导行在文件里是真 user：实时视图的 steered 用户行数 1；重建视图里它被
+///   [mergeAssistantRun] 透明化成 assistant 的 {type:'steer'} part（2026-10-31 展示层
+///   拍板，不占行位）→ **part 也要数回来**。漏数 = 序数整体少 1，回滚把前一步连带
+///   滚掉（真机 2026-11-08 两次实锤：一次回滚冲掉两轮问答）。
+/// 新增「文件有、视图无行」的消息形态时，这里必须同步计入。
+export function fileUserIndexOf(list, id) {
+  const at = list.findIndex((x) => x && x.id === id);
+  if (at < 0) return 0;
+  let n = 0;
+  for (let k = 0; k < at; k++) {
+    const x = list[k];
+    if (x.role === 'user' && !x.queued) n++;
+    else if (x.role === 'assistant') {
+      for (const p of x.parts || []) if (p && p.type === 'steer') n++;
+    }
+  }
+  return n;
+}
+
 /// 工具结果回填到历史 parts（按 tool_call_id 精确匹配）
 export function attachToolPreview(parts, toolCallId, preview) {
   if (!parts || !toolCallId) return parts || [];
@@ -425,8 +448,14 @@ export function buildBlocks(parts) {
       if (p.text) blocks.push({ kind: 'content', text: p.text });
       proc = null;
     } else if (p.type === 'steer') {
-      if (proc) { blocks.push(proc); proc = null; }
-      blocks.push({ kind: 'steer', text: p.text });
+      // 引导标记**留在当前过程块内**（与完成态 buildCompletedView 同口径：折叠进
+      // items，展开可见、收起随块折叠）——不劈出独立块：流式期间它挂在过程块外
+      // 看着像掉队的消息（真机 2026-11-08「引导条抛出去」）。
+      if (!proc) {
+        proc = { kind: 'process', items: [] };
+        blocks.push(proc);
+      }
+      proc.items.push(p);
     } else {
       if (!proc) {
         proc = { kind: 'process', items: [] };
@@ -564,7 +593,7 @@ const SUBJECT_KEYS = [
   'name',
 ];
 
-function parseArgs(args) {
+export function parseArgs(args) {
   if (args && typeof args === 'object') return args;
   if (typeof args !== 'string' || !args.trim()) return null;
   try {
@@ -579,11 +608,41 @@ function cleanSubject(v) {
   return String(v).replace(/\s+/g, ' ').trim();
 }
 
+// 半截 JSON 主语提取：流式参数从名字到达到流完还有好几秒，完整 JSON.parse 一直
+// 失败，行上只剩一截原始 JSON 碎片冻在 110 字上（真机 2026-11-07「一直执行中，
+// 请求和结果最后闪现」）。按主语键从参数串里抽值，让行尽早显示干净的主语（如
+// 路径）并随流补全：先认已闭引号的完整值；都没有就认**正在写**的值（没闭引号），
+// 主语跟着流一个字一个字长出来——「请求内容也是流式的」。
+function partialSubject(raw) {
+  if (!raw) return null;
+  for (const k of SUBJECT_KEYS) {
+    const m = raw.match(new RegExp('"' + k + '"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"'));
+    if (m && m[1].trim()) {
+      let v;
+      try { v = JSON.parse('"' + m[1] + '"'); } catch { v = m[1]; }
+      return cleanSubject(v);
+    }
+  }
+  // 值还在流（引号没闭）：抓到哪算哪，下一片 SSE 会更长
+  for (const k of SUBJECT_KEYS) {
+    const m = raw.match(new RegExp('"' + k + '"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)$'));
+    if (m && m[1].trim()) {
+      let v;
+      try { v = JSON.parse('"' + m[1] + '"'); } catch { v = m[1]; }
+      return cleanSubject(v);
+    }
+  }
+  return null;
+}
+
 function subjectOf(args) {
   const o = parseArgs(args);
   if (!o) {
-    const raw = typeof args === 'string' ? cleanSubject(args) : '';
-    return raw.length > 110 ? raw.slice(0, 110) + '…' : raw;
+    const raw = typeof args === 'string' ? args : '';
+    const partial = partialSubject(raw);
+    if (partial) return partial.length > 110 ? partial.slice(0, 110) + '…' : partial;
+    const fallback = cleanSubject(raw);
+    return fallback.length > 110 ? fallback.slice(0, 110) + '…' : fallback;
   }
   for (const k of SUBJECT_KEYS) {
     const v = o[k];

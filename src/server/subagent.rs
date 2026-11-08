@@ -139,40 +139,13 @@ struct SubagentArgs {
     #[serde(default)]
     model: String,
     #[serde(default)]
-    approval_mode: String,
-    #[serde(default)]
-    on_approval: String,
-    #[serde(default)]
     timeout_secs: u64,
 }
 
-/// 子代理审批档钳制：只准更严，不许借子代理升权（返回 生效档, 降级原因）。
-///
-/// 白名单式档位排序——认不出的名字返回 `None` 按「非法」处理（跟随父档 + 事件）。
-/// 早先这里 `_ => 1` 把任何拼错/编造的档位（如 "yolo"）当成 auto 放行，模型传错
-/// 字得不到任何反馈（2026-10-20 修，与 on_approval 的处理方式对齐）。
-fn clamp_child_mode(parent_mode: &str, requested: &str) -> (String, Option<&'static str>) {
-    let rank = |m: &str| -> Option<u8> {
-        match m {
-            // 0 = 只读侧（sandbox/suggest 是 2026-10-03 并三档前的旧名）
-            "read-only" | "sandbox" | "suggest" => Some(0),
-            "auto" | "auto-edit" | "full-auto" => Some(1),
-            "full-access" | "local" => Some(2),
-            _ => None,
-        }
-    };
-    // 父档为空/认不出时按 auto 计——config 默认档即 auto
-    let parent_rank = rank(parent_mode).unwrap_or(1);
-    let requested = requested.trim();
-    if requested.is_empty() {
-        return (parent_mode.to_string(), None);
-    }
-    match rank(requested) {
-        Some(r) if r > parent_rank => (parent_mode.to_string(), Some("above_parent")),
-        Some(_) => (requested.to_string(), None),
-        None => (parent_mode.to_string(), Some("unknown_mode")),
-    }
-}
+// 子代理审批档位一律跟随主对话当前档（2026-11-07 用户拍板）：模型在派发参数里
+// 自选档位的入口已移除——模型常出于谨慎传 read-only，导致主对话明明是「完全访问」，
+// 子代理的复合 shell 却被审批卡住。无人值守仍没有用户点审批，命中审批的操作按
+// 拒绝回喂（最严的 undo_checkpoint 红线也一样）。
 
 /// 某父任务当前活跃的子代理数。
 fn running_for(parent: &str) -> usize {
@@ -315,8 +288,8 @@ impl SubagentDispatcher {
         if self.limits.max_concurrent == 0 {
             return "派发失败：子代理并行未启用（config.toml [subagent] max_concurrent = 0）。".to_string();
         }
-        // 派发模型模式：显式 model 参数永远优先；ask 模式在
-        // 排队/建会话**之前**拦下（不占并发名额、不留派发记录），引导模型先问用户。
+        // 派发模型模式：显式 model 参数永远优先；parent=跟随父对话，custom=专用配置
+        // （旧设置里可能残留的 ask 档已下线，按 parent 走）。
         let dispatch_mode = {
             let s = self.state.settings.read().unwrap_or_else(|e| e.into_inner());
             s.roles
@@ -325,13 +298,6 @@ impl SubagentDispatcher {
                 .unwrap_or("parent")
                 .to_string()
         };
-        if dispatch_mode == "ask" && args.model.trim().is_empty() {
-            observability::event(
-                EventType::State,
-                json!({ "kind": "subagent.rejected", "parent": parent, "reason": "ask_mode" }),
-            );
-            return "派发暂停：当前「子代理派发模型」设置为「派发前询问」。请先用一句话问用户这次子代理要用哪个模型，等用户答复后把模型名写进 model 参数重新派发（用户说沿用当前对话的模型，就带 model 参数填当前对话正在用的模型名）。".to_string();
-        }
         // 派发 id 提前发号：排队/spawned/done/取消全生命周期共用（前端实时条按它聚合）
         let dispatch_id = uuid::Uuid::new_v4().simple().to_string();
         let label = if args.label.trim().is_empty() {
@@ -421,9 +387,8 @@ impl SubagentDispatcher {
         );
 
         // 模型解析（草案第 5 节 + 2026-10-25 定稿）：派发级 model 覆盖 >
-        // subagent_mode 三档（parent=父任务当前轮的三元组，空则激活配置兜底；
-        // custom=roles.subagent 席位 B3 链；ask 已在前面的闸口引导重派，走到这里
-        // 必然带显式 model）
+        // subagent_mode 两档（parent=父任务当前轮的三元组，空则激活配置兜底；
+        // custom=roles.subagent 席位 B3 链）
         let (mut model, mut base_url, mut api_key) = (String::new(), String::new(), String::new());
         if !args.model.trim().is_empty() {
             // 请求级覆盖：只换模型，渠道仍走激活配置（与 /api/chat 请求级覆盖同义）
@@ -484,16 +449,15 @@ impl SubagentDispatcher {
 
         // 派发指令 = 子代理的唯一上文（看不到父会话历史——草案第 2 节）
         let message = format!(
-            "【子代理任务{}】{task}\n\n（你是被主任务派发的子代理：独立完成上面的任务，用中文给出最终结论。你看不到主任务的对话历史，任务描述要自带全部必要信息。需要审批的操作默认按拒绝处理——请以只读方式完成，或明确在结论里说明「需要写权限」让主任务自己动手。）",
+            "【子代理任务{}】{task}\n\n（你是被主任务派发的子代理：独立完成上面的任务，用中文给出最终结论。你看不到主任务的对话历史，任务描述要自带全部必要信息。审批档位跟随主任务；无人值守，命中审批的操作会被拒绝——优先用不需要审批的方式完成，确实需要被拒时在结论里说明「需要某项操作」让主任务自己动手。）",
             if args.label.trim().is_empty() { String::new() } else { format!("：{label}") }
         );
 
-        // 审批策略钳制（2026-10-08 修）：无人值守会话没有 UI 来回答审批。模型自选
-        // on_approval=approve = 自己批准自己（连 undo_checkpoint 红线都被 auto_approve
-        // 吸收）；approval_mode 传 full-access 同理是自抬权。策略：
-        // ① on_approval 一律 deny（子代理没有用户在场，放行高危必须用户明示）；
-        // ② 档位不得高于父会话当前档——只允许更严，不允许借子代理升权。
-        let parent_mode = self
+        // 审批档位：一律跟随主对话当前档（2026-11-07 用户拍板）。不再接受模型在派发
+        // 参数里自选档位——模型常出于谨慎传 read-only，导致主对话明明是「完全访问」，
+        // 子代理的复合 shell 却被审批卡住（真机：被拒后改用只读命令才跑完）。
+        // 无人值守仍没有用户点审批：命中审批的操作按拒绝回喂（undo_checkpoint 红线也一样）。
+        let child_mode = self
             .state
             .session_approval
             .read()
@@ -501,24 +465,6 @@ impl SubagentDispatcher {
             .and_then(|m| m.get(parent).cloned())
             .or_else(|| self.state.approval_mode.read().ok().map(|m| m.clone()))
             .unwrap_or_default();
-        // 白名单式档位排序：认不出的名字返回 None，调用方按「非法」处理。
-        // 早先这里 `_ => 1` 把任何拼错/编造的档位（如 "yolo"）当成 auto 放行，
-        // 模型传错字得不到任何反馈（2026-10-20 修，与下方 on_approval 的行为对齐）。
-        let requested_mode = args.approval_mode.trim();
-        let (child_mode, mode_clamp) = clamp_child_mode(&parent_mode, requested_mode);
-        if mode_clamp.is_some() || (!args.on_approval.trim().is_empty() && !args.on_approval.eq_ignore_ascii_case("deny")) {
-            observability::event(
-                EventType::State,
-                json!({
-                    "kind": "subagent.approval_clamped",
-                    "parent": parent,
-                    "reason": mode_clamp,
-                    "requested_on_approval": args.on_approval,
-                    "requested_mode": requested_mode,
-                    "effective_mode": child_mode,
-                }),
-            );
-        }
 
         let result = crate::server::run_headless_inner(
             self.state.clone(),
@@ -657,29 +603,6 @@ mod tests {
         clear_all();
     }
 
-    /// 审批档钳制：只准更严；非法档位跟随父档并给出原因（不再静默当 auto）。
-    #[test]
-    fn approval_mode_clamped_or_rejected() {
-        // 缺省 → 跟随父档，无降级
-        assert_eq!(clamp_child_mode("auto", ""), ("auto".into(), None));
-        assert_eq!(clamp_child_mode("read-only", "  "), ("read-only".into(), None));
-        // 合法且不高于父档 → 原样生效
-        assert_eq!(clamp_child_mode("auto", "read-only"), ("read-only".into(), None));
-        assert_eq!(clamp_child_mode("full-access", "auto"), ("auto".into(), None));
-        assert_eq!(clamp_child_mode("auto", "auto"), ("auto".into(), None));
-        // 旧名照旧认（2026-10-03 并三档前的值）
-        assert_eq!(clamp_child_mode("auto", "suggest"), ("suggest".into(), None));
-        // 高于父档 → 压回父档，原因 above_parent
-        assert_eq!(clamp_child_mode("auto", "full-access"), ("auto".into(), Some("above_parent")));
-        assert_eq!(clamp_child_mode("read-only", "auto"), ("read-only".into(), Some("above_parent")));
-        // 非法档位：不猜、不放行，跟随父档，原因 unknown_mode（旧实现静默当 auto）
-        assert_eq!(clamp_child_mode("read-only", "yolo"), ("read-only".into(), Some("unknown_mode")));
-        assert_eq!(clamp_child_mode("auto", "Auto"), ("auto".into(), Some("unknown_mode")), "大小写不对也是非法，不猜");
-        // 父档为空（config 默认 auto）→ 按 auto 计
-        assert_eq!(clamp_child_mode("", "read-only"), ("read-only".into(), None));
-        assert_eq!(clamp_child_mode("", "full-access"), ("".into(), Some("above_parent")));
-    }
-
     /// token 并入：水印式增量（调用方只认自己没计过的那部分）。
     #[test]
     fn token_attribution_accumulates() {
@@ -716,7 +639,6 @@ mod tests {
         let a: SubagentArgs = serde_json::from_str(r#"{"task":"调研"}"#).unwrap();
         assert_eq!(a.task, "调研");
         assert!(a.model.is_empty());
-        assert!(a.on_approval.is_empty());
         assert_eq!(a.timeout_secs, 0);
         assert!(serde_json::from_str::<SubagentArgs>(r#"{"label":"x"}"#).is_err(), "缺 task 必须报错");
     }

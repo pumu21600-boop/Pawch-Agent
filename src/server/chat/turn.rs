@@ -322,7 +322,6 @@ fn selfop_policy(state: &AppState) -> String {
 pub(crate) struct TurnChannels {
     pub(crate) primary: gateway::Channel,
     pub(crate) summary: Option<gateway::Channel>,
-    pub(crate) title: Option<gateway::Channel>,
     pub(crate) fallbacks: Vec<gateway::Channel>,
     /// 预算降级渠道（[roles] budget；超 token 预算后剩余步骤改走它）
     pub(crate) downgrade: Option<gateway::Channel>,
@@ -371,24 +370,13 @@ pub(crate) fn assemble_turn_channels(
     let summary_name = roles
         .and_then(|r| r.summary.as_deref())
         .or_else(|| cfg_roles.and_then(|c| c.summary.as_deref()));
-    let title_name = roles
-        .and_then(|r| r.title.as_deref())
-        .or_else(|| cfg_roles.and_then(|c| c.title.as_deref()));
     let summary = summary_name.and_then(|n| find_channel(s, n));
-    let title = title_name.and_then(|n| find_channel(s, n));
     let mut notices = Vec::new();
     if let Some(n) = summary_name
         && summary.is_none()
     {
         notices.push(format!(
             "角色「会话摘要」配置的渠道「{n}」解析失败（配置名不存在或地址为空），已回落主渠道代跑"
-        ));
-    }
-    if let Some(n) = title_name
-        && title.is_none()
-    {
-        notices.push(format!(
-            "角色「标题生成」配置的渠道「{n}」解析失败（配置名不存在或地址为空），已回落主渠道代跑"
         ));
     }
     // / 降级链：优先 settings.roles.fallbacks，未设回落 [gateway].fallback_configs
@@ -437,7 +425,8 @@ pub(crate) fn assemble_turn_channels(
     if state.gateway.take_thinking_degraded_notice(&base_url, &model) {
         notices.push("该端点此前拒绝了思考参数，已自动关闭思考下发（对话正常进行）".to_string());
     }
-    TurnChannels { primary, summary, title, fallbacks, downgrade, vision, notices }
+    // 标题不再在这里生成：会话落盘时用首条用户消息前 10 字（2026-11-06）。
+    TurnChannels { primary, summary, fallbacks, downgrade, vision, notices }
 }
 
 /// 检查模型是否具备指定模态的输入能力：只认用户手动勾选的能力标记，

@@ -12,11 +12,13 @@
     --ok: #7bc96f;
     color-scheme: dark;
   }
+  /* 根元素也跟随主题：画布 color-scheme/兜底底色只认 html（body 被微调成透明时深色画布会露底） */
+  html.light { color-scheme: light; background: #fffefc; }
   body.light {
-    scrollbar-color: var(--line2, #b3bac4) transparent;
-    --bg: #ffffff; --fg: #1a1a1c; --dim: #6b6b74; --line: #e4e4e8;
-    --hover: #f2f2f5; --btn-line: #d4d4da; --warn: #b25e09; --err: #cf222e; --link: #0b62d0;
-    --ok: #1a7f37;
+    scrollbar-color: var(--line2, #d9d3c9) transparent;
+    --bg: #fffefc; --fg: #1f1d1a; --dim: #87827a; --line: #e7e2da;
+    --hover: #f3f0eb; --btn-line: #d9d3c9; --warn: #b25e09; --err: #b3261e; --link: #a46851;
+    --ok: #1e7a3f;
     color-scheme: light;
   }
   * { box-sizing: border-box; }
@@ -54,6 +56,7 @@ let booted = false;
 window.addEventListener('message', (ev) => {
   const d = ev.data || {};
   if (d.type === 'pawch:init') {
+    document.documentElement.classList.toggle('light', ((d.payload || {}).theme) === 'light'); // 画布跟主题（只认根元素）
     document.body.classList.toggle('light', ((d.payload || {}).theme) === 'light');
     if (!booted) { booted = true; boot(); }
   }
@@ -85,17 +88,18 @@ parent.postMessage({ type: 'pawch:hello' }, '*');
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
-// 七类辅助调用：名字、管什么、关掉后怎么退化（退路是真事，不是文案）。
-// 字段名须与后端 RolesSettings 一一对应（含 vision/video/audio 多模态三路）
+// 辅助调用路由：名字、管什么、关掉后怎么退化（退路是真事，不是文案）。
+// 字段名须与后端 RolesSettings 一一对应（含 vision/video/audio 多模态三路）。
+// 「标题」已下线（标题=首条消息前 10 字，不走模型）；「子代理」只在主设置页
+// 选「指定模型」档时生效，跟随时这里配了也不参与派发。
 const ROUTES = [
   { key: 'summary', name: '摘要', desc: '滚动摘要：长对话压成记忆' },
-  { key: 'title', name: '标题', desc: '会话标题自动生成' },
   { key: 'embedding', name: '嵌入', desc: '记忆库语义检索的向量；未配 = 退本地哈希向量' },
   { key: 'vision', name: '图片理解', desc: '图片/截图附件走专用渠道；未配 = 附件退回占位文本' },
   { key: 'video', name: '视频理解', desc: '视频附件；未配 = 退回占位文本' },
   { key: 'audio', name: '音频理解', desc: '音频附件；未配 = 退回占位文本' },
   { key: 'budget', name: '预算降级', desc: '单任务 token 超预算后，剩余步骤改走它' },
-  { key: 'subagent', name: '子代理', desc: '子代理专用渠道（主会话旗舰、子代理跑量）' },
+  { key: 'subagent', name: '子代理', desc: '子代理专用渠道；仅主设置页选「指定模型」档时生效' },
 ];
 
 async function boot() { await refresh(); }

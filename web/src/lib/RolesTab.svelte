@@ -51,6 +51,19 @@
     return [{ value, label: c ? `${configLabel(c)} · ${model}` : String(value) }, ...opts];
   }
   const roleValue = (k) => normValue(roles[k]);
+
+  // 子代理二选一：跟随主渠道 / 指定模型（按渠道分组，和其他功能桥接同一个二级菜单）。
+  // 指定模型 = 旧的 subagent_mode=custom + roles.subagent；不再单独占一行。
+  // 旧设置里残留的 subagent_mode=ask 按「跟随主渠道」显示（该档已下线）。
+  function subagentValue(r) {
+    if (r?.subagent_mode === 'custom' && r?.subagent) return normValue(r.subagent);
+    return 'parent';
+  }
+  // 当前选中的是不是「指定模型」值（parent 是模式项，不该拿去分组里找）
+  const subagentModel = (r) => {
+    const v = subagentValue(r);
+    return v === 'parent' ? null : v;
+  };
 </script>
 
 {#if tab === 'roles' && rolesShown}
@@ -68,21 +81,6 @@
           ]}
           on:change={(e) => {
             roles = { ...roles, summary: e.detail };
-            autoSave({ roles }, 0);
-          }}
-        />
-      </div>
-      <div class="role-item">
-        <span class="role-name">标题生成</span>
-        <Select
-          value={roleValue('title')}
-          title="标题生成角色"
-          options={[
-            { value: null, label: '未配置：由主力渠道代跑标题' },
-            ...withCurrent(roleValue('title'), groups(configs)),
-          ]}
-          on:change={(e) => {
-            roles = { ...roles, title: e.detail };
             autoSave({ roles }, 0);
           }}
         />
@@ -169,32 +167,19 @@
         />
       </div>
       <div class="role-item">
-        <span class="role-name">子代理派发模型</span>
+        <span class="role-name">子代理</span>
         <Select
-          value={roles.subagent_mode ?? 'parent'}
-          title="子代理默认用哪个模型跑任务"
+          value={subagentValue(roles)}
+          title="子代理派发模型：跟随主渠道 / 指定模型"
           options={[
-            { value: 'parent', label: '跟随父对话' },
-            { value: 'custom', label: '自己设置（用下方专用配置）' },
-            { value: 'ask', label: '派发前询问' },
+            { value: 'parent', label: '跟随主渠道' },
+            // 指定模型：和其他功能桥接一样按渠道分组（点渠道展开模型），不再挤在一个平铺组里
+            ...withCurrent(subagentModel(roles), groups(configs)),
           ]}
           on:change={(e) => {
-            roles = { ...roles, subagent_mode: e.detail === 'parent' ? null : e.detail };
-            autoSave({ roles }, 0);
-          }}
-        />
-      </div>
-      <div class="role-item">
-        <span class="role-name">子代理专用配置</span>
-        <Select
-          value={roleValue('subagent')}
-          title="子代理专用渠道（派发模型选「自己设置」时生效）"
-          options={[
-            { value: null, label: '未配置：由主力渠道代跑' },
-            ...withCurrent(roleValue('subagent'), groups(configs)),
-          ]}
-          on:change={(e) => {
-            roles = { ...roles, subagent: e.detail };
+            const v = e.detail;
+            if (v === 'parent') roles = { ...roles, subagent_mode: null };
+            else roles = { ...roles, subagent_mode: 'custom', subagent: v };
             autoSave({ roles }, 0);
           }}
         />

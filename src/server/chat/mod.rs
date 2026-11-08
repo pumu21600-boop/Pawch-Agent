@@ -7,10 +7,14 @@ use super::subagent;
 use crate::core::steer::SteerMode;
 mod cancel;
 mod identity;
+mod live;
 mod media;
 mod turn;
 
 pub(crate) use cancel::*;
+// 截断后圆环重算（sessions.rs）复用同一套渠道装配：思考计不计入的判定必须跟
+// 下一轮真正的请求同一把尺子，不能各写一份。
+pub(crate) use turn::assemble_turn_channels;
 pub(crate) use identity::clear_cache as clear_identity_cache;
 pub(crate) use media::*;
 pub(crate) use turn::*;
@@ -49,6 +53,11 @@ pub struct ChatRequest {
     /// 消息并入本轮继续。与 steer 的区别就是「打断 vs 不打断」；都不带 = 排队。
     #[serde(default)]
     pub interrupt: bool,
+    /// 2026-11-07：这条是「排队中」气泡的原地升级——服务端把同文本的那条 Queued
+    /// 改成 steer/interrupt，而不是再排一条新消息（否则原条目收尾被排水重发一遍）。
+    /// 找不到排队项时按普通引导/打断入队（降级，不丢消息）。
+    #[serde(default)]
+    pub promote: bool,
     /// B1：Plan 档（true=只读+先出计划；请求级字段，前端随会话持久化到 localStorage）
     #[serde(default)]
     pub plan_mode: bool,
@@ -298,10 +307,11 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
             )
                 .into_response();
         }
-        // 027 + 2026-10-22 三级分家：缺省 = 排队（这一轮跑完自动接着发）；
+        // 027 + 2026-10-22 分家；「立即发送」2026-11-07 改语义（用户拍板）：
+        // 缺省 = 排队（这一轮跑完自动接着发）；
         // steer=true = 引导（并入本轮，不打断，模型下一个决策点看到）；
-        // interrupt=true = 立即发送（打断信号置位：审批/工具/流式三个等待点让位，
-        // 消息并入本轮继续——打断不是停，是「放下手里的、马上听我的」）。
+        // interrupt=true = 立即发送 = **停掉正在跑的这一轮，这条消息作为新一轮发出**
+        // （原语义「打断让位 + 并入原轮继续」废止——立即发送就该重新开始一轮）。
         let mode = if req.interrupt {
             SteerMode::Interrupt
         } else if req.steer {
@@ -309,17 +319,41 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
         } else {
             SteerMode::Queued
         };
-        let immediate = mode != SteerMode::Queued;
-        // 2026-11-03：引导/立即发送支持附件。媒体流水线在这里（读请求时）一次性
-        // 构好 content——原生支持就内联内容块，文档/不支持的媒体落盘 + 文本通知；
-        // 核心循环只负责把 content 原样并进本轮，不再二次处理。
-        let content = if attachments.is_empty() {
-            json!(text.clone())
+        // 「排队中」气泡上点引导 = **原地升级**那条排队消息（2026-11-07）：
+        // 同文本的 Queued 条目改档，不再排一条新的——否则原条目本轮收尾被排水，
+        // 同一句话既显示「已引导」又被当成新一轮发出去。
+        // 「立即发送」不走升级（语义是停轮重启）：队列里已有同文本排队条目就直接用
+        // 它（它本来就是新一轮的那条消息），没有才入队——仍按 Queued 入队。
+        let promoted = req.promote && mode == SteerMode::Steer && state.steer.promote(&session_id, &text, mode);
+        let already_queued = mode == SteerMode::Interrupt && state.steer.has_queued(&session_id, &text);
+        let pending = if promoted || already_queued {
+            state.steer.pending(&session_id)
         } else {
-            let fallback = if text.is_empty() { "请查看附带的媒体文件" } else { text.as_str() };
-            steer_content_with_attachments(fallback, &attachments, &active_cfg.capabilities).await
+            // 2026-11-03：引导/立即发送支持附件。媒体流水线在这里（读请求时）一次性
+            // 构好 content——原生支持就内联内容块，文档/不支持的媒体落盘 + 文本通知；
+            // 核心循环只负责把 content 原样并进本轮，不再二次处理。
+            let content = if attachments.is_empty() {
+                json!(text.clone())
+            } else {
+                let fallback = if text.is_empty() { "请查看附带的媒体文件" } else { text.as_str() };
+                steer_content_with_attachments(fallback, &attachments, &active_cfg.capabilities).await
+            };
+            state.steer.push_content(&session_id, text, content, mode)
         };
-        let pending = state.steer.push_content(&session_id, text, content, mode);
+        // 「立即发送」且确实有一轮在跑：停轮 + 置重启标记。被停那轮的取消收尾取到
+        // 标记，就按 followup 把队列里的消息当新一轮跑掉（= 用户要的「重新开始一轮」）。
+        // cancel 落空（本轮恰好在缝隙里结束了）不置标记：消息已在队列里，M2 重抢 /
+        // 正常收尾都会把它跑掉，标记绝不能残留到之后的「停止」。
+        if mode == SteerMode::Interrupt {
+            let hit = state.cancel.cancel(&session_id);
+            if hit {
+                state.steer.mark_restart(&session_id);
+            }
+            observability::event(
+                EventType::State,
+                json!({ "kind": "chat.interrupt_restart", "session": session_id, "hit_running": hit, "pending": pending }),
+            );
+        }
         observability::event(
             EventType::State,
             json!({
@@ -332,7 +366,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
         let (stx, srx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
         let notice = match mode {
             SteerMode::Interrupt => {
-                "已中断当前操作并并入本轮：新指令立即生效".to_string()
+                "已停止当前这一轮：这条消息将作为新的一轮开始".to_string()
             }
             SteerMode::Steer => {
                 "已引导：不打断当前操作，跑完这步就并入（本条不进对话气泡，静默生效）".to_string()
@@ -342,19 +376,23 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                     .to_string()
             }
         };
-        let flag = if immediate { "steered" } else { "queued" };
+        let flag = match mode {
+            SteerMode::Interrupt => "interrupted",
+            SteerMode::Steer => "steered",
+            SteerMode::Queued => "queued",
+        };
         // M2 收口：入队的这一刻，上一轮可能刚好收尾（它的收尾 drain 已经跑过）——
         // 那样这条就没人取了。再抢一次占位：抢到 = 确实已结束 → 本次请求直接把队列
         // 里的消息跑掉（不让消息悬在队列里等下一次活动）；抢不到 = 真的还在跑，照常回执。
         if let Some(f) = state.cancel.try_begin(&session_id) {
+            // 竞态窗口里「立即发送」可能刚置过重启标记：这里消息直接由本轮跑掉，
+            // 标记就地作废（不能留给之后一次普通的「停止」）
+            state.steer.take_restart(&session_id);
             let extra = state.steer.drain_all(&session_id);
             let snap = session.get(&session_id).map(|s| s.messages).unwrap_or_default();
             let mut merged = if snap.is_empty() { history.clone() } else { snap };
             for s in &extra {
-                merged.push(match s.mode {
-                    SteerMode::Interrupt => json!({ "role": "user", "content": s.content.clone(), "interrupted": true, "ts": now_ms() }),
-                    _ => json!({ "role": "user", "content": s.content.clone(), "steered": true, "ts": now_ms() }),
-                });
+                merged.push(s.to_message());
             }
             observability::event(
                 EventType::State,
@@ -364,8 +402,22 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
             run_flag = Some(f);
         } else {
             let _ = stx.send(Ok(json_event(json!({ "session": session_id.clone() }))));
-            let _ = stx.send(Ok(json_event(json!({ flag: true, "notice": notice }))));
-            let _ = stx.send(Ok(json_event(json!({ "done": true }))));
+            if mode == SteerMode::Interrupt {
+                // 「立即发送」= 停轮重启：回执**纯静默**（用户拍板「什么都不用显示」）。
+                // 不发 notice（前端会显示成 [通知] 气泡）、不发 done（会误摘正在跑那轮
+                // 的流登记）。这条 SSE 只是给前端的 deliver 一个正常结束的响应；
+                // 界面上的变化全由被停那轮的 restarted + 紧接着的 turn 事件驱动。
+                let _ = stx.send(Ok(json_event(json!({ "interrupted": true }))));
+            } else {
+                let _ = stx.send(Ok(json_event(json!({ flag: true, "notice": notice }))));
+                // 引导回执**不发 done**（2026-11-08 真机）：done 会让前端把「这一轮结束
+                // 了」当真，误摘正在跑那轮的流登记——停止按钮闪没（完成态），3 秒后
+                // 「运行中」轮询又翻回未完成态。打断分支同理由早已静默，这里补齐。
+                // 排队回执保留 done：它登记的是自己的流（ownsTurn），摘掉是正确收尾。
+                if mode == SteerMode::Queued {
+                    let _ = stx.send(Ok(json_event(json!({ "done": true }))));
+                }
+            }
             return Sse::new(UnboundedReceiverStream::new(srx)).into_response();
         }
     }
@@ -382,8 +434,15 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
         )
             .into_response();
     };
-    // 滚动摘要：从会话文件带出旧摘要继续压
-    let prior_summary = session.get(&session_id).and_then(|f| f.summary);
+    // 刷新重新附着（2026-11-07）：本轮事件同时写一份带 seq 的直播尾巴；页面刷新后
+    // 用 /api/chat/attach 补发漏掉的片段、再接上直播（否则界面冻在最后一个工具调用）。
+    let live_turn = live::begin(&session_id);
+    let live_guard = live::LiveGuard::new(&session_id, live_turn.clone());
+    // 静默压缩视图（2026-11-07）：会话文件里的 compact 记录 → 请求侧「摘要 + 尾段」
+    let compact_view = session
+        .get(&session_id)
+        .and_then(|f| f.compact.clone())
+        .map(|r| crate::compact::CompactView::from_record(&r));
     // 子代理派发器：主对话任务才挂（子代理自己的无头轮不挂——v1 不支持嵌套）。
     // 在 spawn 前构建：dispatcher 持 AppState 克隆，任务里随 LoopChannels 带进核心循环。
     let subagents: Option<Arc<dyn crate::core::subagent::SubagentRunner>> =
@@ -411,7 +470,10 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
     }
 
     // 审计 07：SSE 断线感知——send 失败即对端没了（关网页/断网/刷新）。
-    // cancel_on_disconnect 开 → 看门狗取消本轮；关（默认）→ 任务跑完，刷新可续聊。
+    // cancel_on_disconnect 开 → 看门狗先给宽限，真走了才取消本轮；关（默认）→ 任务跑完。
+    // 刷新豁免：刷新也会断开 SSE，但页面几秒后就回来认领（/api/chat/revive），
+    // 宽限期内认领了就不取消（2026-11-07 用户实锤「刷新把在跑的任务终止了」）。
+    const RELOAD_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
     let peer_gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // 任务结束标志（看门狗退出用；None = 本功能关着）。2026-10-08 修（M2）：
     // 任务正常跑完后 tx 随任务 drop、不再有 send，peer_gone 永远为 false →
@@ -440,8 +502,30 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                     break; // 本轮已结束：不收尾（flag 可能属于新一轮）
                 }
                 if watch_gone.load(std::sync::atomic::Ordering::Relaxed) {
-                    watch_reg.cancel(&watch_sid);
-                    break;
+                    // 断线了：先给刷新回来的页面一个宽限窗口。期间只要认领
+                    // （/api/chat/revive）就放过本轮；真关页面/断网才取消。
+                    let deadline = tokio::time::Instant::now() + RELOAD_GRACE;
+                    loop {
+                        if watch_done.load(std::sync::atomic::Ordering::Relaxed) {
+                            return; // 本轮自己跑完了（flag 可能已属于新一轮）
+                        }
+                        if watch_reg.is_revived(&watch_sid) {
+                            observability::event(
+                                EventType::State,
+                                json!({ "kind": "chat.revived", "session": watch_sid }),
+                            );
+                            return;
+                        }
+                        if tokio::time::Instant::now() >= deadline {
+                            watch_reg.cancel(&watch_sid);
+                            observability::event(
+                                EventType::State,
+                                json!({ "kind": "chat.disconnect_cancelled", "session": watch_sid }),
+                            );
+                            return;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    }
                 }
             }
         });
@@ -451,6 +535,9 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
     let guard_tx = tx.clone();
     let guard_session = session_id.clone();
     tokio::spawn(async move {
+        // 本轮结束（任何出口）自动摘直播槽
+        let _live_guard = live_guard;
+        let live_for_guard = live_turn.clone();
         // 取消登记在 handler 入口已占位。守卫必须在**任务体第一行**就接管——放在
         // 任务体内部的话，之前任何一处 panic 都会带着仍然登记着的会话一起 unwind，
         // 留下「永远在跑」的僵尸（2026-10-30 真机 panic 自检实测）。
@@ -458,11 +545,17 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
         run_turn_guarded(
             &guard_session,
             |payload| {
+                // panic 兜底的 error/done 也要进直播，否则重新附着的页面收不到收尾。
+                // 用返回的带 seq 副本发原 SSE，两边序号一致。
+                let payload = live::publish(&live_for_guard, payload);
                 let _ = guard_tx.send(Ok(json_event(payload)));
             },
             async move {
         // 非 move 闭包：按引用捕获 tx / peer_gone——ChatGate 后面还要 tx.clone()
         let send = |payload: Value| {
+            // 原 SSE + 刷新重附着共用同一份事件（attach 按 seq 补发）：
+            // 用带 seq 的副本发原 SSE，前端才知道自己看到哪儿了
+            let payload = live::publish(&live_turn, payload);
             if tx.send(Ok(json_event(payload))).is_err() {
                 peer_gone.store(true, std::sync::atomic::Ordering::Relaxed);
             }
@@ -484,9 +577,9 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
         // 初始守卫在 spawn 外层创建（见上），这里直接接管，保证任务体任何位置 panic 都注销。
         let mut run = initial_run;
         let mut cancel = run.flag.clone();
-        // 摘要槽：Summary 事件写入，Snapshot 落盘时随会话持久化
-        let summary_slot: Arc<std::sync::Mutex<Option<String>>> =
-            Arc::new(std::sync::Mutex::new(prior_summary.clone()));
+        // 收尾压缩触发要用的「最后一次圆环占用」（ContextUsage 事件持续刷新）
+        let last_usage: Arc<std::sync::Mutex<(u64, u64, u64)>> =
+            Arc::new(std::sync::Mutex::new((0, 0, 0))); // (projected, tools_schema, system)
         // 025：本任务最新一次会话快照（消息全量，不含 system）——迟到的追加消息
         // 要接着再跑一轮时，用它当上下文，而不是重新问客户端要历史。
         let last_snapshot: Arc<std::sync::Mutex<Vec<Value>>> =
@@ -572,8 +665,6 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
 
         // 多模态媒体理解流水线：感知媒体附件与视觉/视频/音频解析能力
         let mut history = history;
-        // 025：续跑一轮时摘要可能被上一轮更新（见收尾处的重新赋值）
-        let mut prior_summary = prior_summary;
         // 新会话第一轮：项目现状 brief 并进首条 user 消息（不进系统提示，保缓存前缀）
         let brief = first_turn_brief(&state, &session_id).await;
         inject_brief_into_first_user(&mut history, &brief);
@@ -938,8 +1029,6 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                 // 续跑一轮时这些值复用（Channel 是克隆廉价的连接参数快照）
                 &agent::LoopChannels {
                     primary: ch.primary.clone(),
-                    summary: ch.summary.clone(),
-                    title: ch.title.clone(),
                     fallbacks: ch.fallbacks.clone(),
                     // 预算降级渠道 + 共享超预算标志（见上方 budget_fired）
                     downgrade: ch.downgrade.clone(),
@@ -961,7 +1050,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                 &ctx_cfg,
                 &rec_cfg,
                 &mem,
-                prior_summary.clone(),
+                compact_view.clone(),
                 req.plan_mode,
                 &ChatGate {
                     mode: state.approval_mode.clone(),
@@ -1009,6 +1098,10 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                         if let Err(e) = session.update_usage(&session_id, snap) {
                             observability::debug(&format!("用量快照落盘失败: {e}"));
                         }
+                        // 收尾压缩触发的输入：最后一次圆环占用 + 工具 Schema + 系统提示占用
+                        // （会话文件不存 system，压缩后的估价只能从这里带入）
+                        *last_usage.lock().unwrap_or_else(|e| e.into_inner()) =
+                            (projected, breakdown.tools_schema, breakdown.system);
                         send(json!({
                             "context_usage": {
                                 "pressure": pressure,
@@ -1066,8 +1159,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                         // （2026-11-01 真机实测：好多条消息的来源配置都是一条横杆）
                         stamp_stats_config(&mut messages, &active_cfg.name);
                         *last_snapshot.lock().unwrap_or_else(|e| e.into_inner()) = messages.clone();
-                        let cur_summary = summary_slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                        match session.save(&session_id, &messages, cur_summary.as_deref()) {
+                        match session.save(&session_id, &messages, None) {
                             Ok(()) => observability::event(
                                 EventType::State,
                                 json!({ "kind": "session.saved", "session": session_id, "messages": messages.len() }),
@@ -1078,24 +1170,9 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                             ),
                         }
                     }
-                    // 滚动摘要：存槽里，下一次 Snapshot 落盘时随会话一起写 summary 字段
-                    AgentEvent::Summary(s) => {
-                        *summary_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
-                        send(json!({ "summary": true }))
-                    }
                     // 改动统计条：撤销按钮恢复到任务起点基线
                     AgentEvent::Checkpoint { id, files_changed, additions, deletions } => {
                         send(json!({ "checkpoint": { "id": id, "files": files_changed, "additions": additions, "deletions": deletions } }))
-                    }
-                    // TITLE 角色：标题已生成 → 改会话文件并转前端
-                    AgentEvent::Title(t) => {
-                        match session.rename(&session_id, &t) {
-                            Ok(()) => send(json!({ "title": t })),
-                            Err(e) => observability::event(
-                                EventType::Error,
-                                json!({ "message": format!("会话改名失败: {e}") }),
-                            ),
-                        }
                     }
                     // B3：Plan 档结构化计划 → 前端计划卡（SSE 增字段；JSONL 由 agent 层记 plan.proposed）
                     AgentEvent::PlanProposal { goal, steps, files } => {
@@ -1117,12 +1194,24 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
         match outcome {
             Ok(LoopOutcome::Done) => {}
             Ok(LoopOutcome::Cancelled) => {
-                send(json!({ "cancelled": true }));
-                // 用户点了停止：排队的消息一并作废（「停」= 这一轮和还没轮上的话都别跑了）。
-                // 先注销占位再清队列（M2 同一顺序）：此后到达的消息会走正常路径自己跑，不会悬空。
-                drop(run);
-                steer_queue.drain_all(&session_id);
-                break;
+                // 「立即发送」（2026-11-07 语义变更）= 停掉这一轮 + 队列里的消息作为
+                // 新一轮：取到重启标记就不清队列，落到下面与正常收尾同一套 followup。
+                if steer_queue.take_restart(&session_id) {
+                    // 不是「用户点了停止」：不推 cancelled（前端会显示「已停止」），
+                    // 只收掉正在流式的那条回答气泡；紧接着的 turn 事件会开新一轮。
+                    send(json!({ "restarted": true }));
+                    observability::event(
+                        EventType::State,
+                        json!({ "kind": "chat.restart_after_cancel", "session": session_id }),
+                    );
+                } else {
+                    send(json!({ "cancelled": true }));
+                    // 用户点了停止：排队的消息一并作废（「停」= 这一轮和还没轮上的话都别跑了）。
+                    // 先注销占位再清队列（M2 同一顺序）：此后到达的消息会走正常路径自己跑，不会悬空。
+                    drop(run);
+                    steer_queue.drain_all(&session_id);
+                    break;
+                }
             }
             Err(e) => {
                 // 出错也继续走下面的收尾：已排队的追加消息是用户发出去的话，不能因上一轮
@@ -1134,8 +1223,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                 {
                     let mut snap = last_snapshot.lock().unwrap_or_else(|e| e.into_inner());
                     snap.push(json!({ "role": "system", "content": format!("[错误] {e}"), "display_only": true }));
-                    let cur_summary = summary_slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                    if let Err(se) = session.save(&session_id, &snap, cur_summary.as_deref()) {
+                    if let Err(se) = session.save(&session_id, &snap, None) {
                         observability::event(
                             EventType::Error,
                             json!({ "message": format!("会话落盘失败: {se}") }),
@@ -1148,13 +1236,44 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
         // 就会出现（消息在收尾 drain 之后到达 → 队列里没人消费）。先注销后，这一瞬之后
         // 到达的消息会走正常路径自己起一轮（而不是排队等人取）。
         drop(run);
+        // 竞态窗口里「立即发送」可能刚置过重启标记但本轮已正常结束/出错：消息反正
+        // 会被下面的 drain 当 followup 跑掉，标记就地作废（不能留给下一轮的「停止」，
+        // 否则用户之后一次普通的「停止」会把想丢的排队消息当成新一轮跑掉）。
+        steer_queue.take_restart(&session_id);
         // 025/027：一轮跑完后还剩的排队消息（缺省模式，或最后一个决策点之后才到的——
-        // 含错过补取窗口的引导/打断）→ 用最后一轮快照当上下文，紧接着再跑一轮
+        // 含错过补取窗口的引导）→ 用最后一轮快照当上下文，紧接着再跑一轮
         // （同一个 SSE 流）：「进了队列的消息一定被处理」。带 mode：followup 的
-        // 消息也按 引导=steered 静默 / 打断=interrupted 气泡 打标记，与决策点并入同款。
+        // 消息按 引导=steered 静默 / 排队=普通消息 呈现（规则见 SteerMsg::to_message）。
         let extra = steer_queue.drain_all(&session_id);
         if extra.is_empty() {
             send(json!({ "done": true }));
+            // 收尾静默压缩（2026-11-07）：done 已发（回答完成态），压缩在后台跑。
+            // 持一份 tx 克隆让 SSE 流保持到压缩结束——实时行「正在压缩→压缩后」同流更新；
+            // 页面已关时发送失败只影响实时行，结果照常落盘 + sessions_changed 广播。
+            {
+                let (projected, tools_schema, system) =
+                    *last_usage.lock().unwrap_or_else(|e| e.into_inner());
+                let compact_tx = tx.clone();
+                let emit: Option<crate::server::compact::SseEmit> = Some(Arc::new(move |v: Value| {
+                    let _ = compact_tx.send(Ok(crate::server::json_event(v)));
+                }));
+                crate::server::compact::maybe_start(
+                    &state,
+                    crate::server::compact::CompactTrigger {
+                        session_id: session_id.clone(),
+                        gateway: gateway.clone(),
+                        primary: ch.primary.clone(),
+                        summary_role: ch.summary.clone(),
+                        emit,
+                        pre_tokens: projected,
+                        tools_schema_tokens: tools_schema,
+                        system_tokens: system,
+                        max_tool_result_chars: ctx_cfg.max_tool_result_chars,
+                        // 与圆环同一把尺子：渠道 context_length 覆盖全局后的本轮窗口
+                        window: ctx_cfg.budget_tokens,
+                    },
+                );
+            }
             break;
         }
         // 还有排队的消息 → 抢回占位自己续跑；抢不到说明已有别的请求起来了，
@@ -1177,19 +1296,11 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
             EventType::State,
             json!({ "kind": "steer", "phase": "followup", "session": session_id, "count": extra.len() }),
         );
-        let turn_msgs: Vec<Value> = extra
-            .iter()
-            .map(|s| match s.mode {
-                SteerMode::Interrupt => json!({ "role": "user", "content": s.content.clone(), "interrupted": true, "ts": now_ms() }),
-                _ => json!({ "role": "user", "content": s.content.clone(), "steered": true, "ts": now_ms() }),
-            })
-            .collect();
+        let turn_msgs: Vec<Value> = extra.iter().map(|s| s.to_message()).collect();
         // 通知前端：这些排队消息现在开始跑了（气泡从「排队中」转成正式消息、开新回答气泡）
         send(json!({ "turn": { "messages": turn_msgs } }));
         next.extend(turn_msgs);
         history = next;
-        // 滚动摘要跟着上一轮走（跑的过程中 Summary 事件更新过槽）
-        prior_summary = summary_slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
         }
         // 钩子（027）：任务结束挂点（Done / Cancelled / 出错都算结束；含续跑轮）
         crate::hooks::session_end(&session_id).await;

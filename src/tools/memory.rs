@@ -432,6 +432,7 @@ mod tests {
             steer: Arc::new(crate::core::steer::SteerQueue::new()),
             settings: Arc::new(RwLock::new(crate::config::settings::Settings::default())),
             settings_write: Arc::new(Mutex::new(())),
+            compact_fail_streak: Arc::new(Mutex::new(std::collections::HashMap::new())),
             agent_cfg: Arc::new(AgentConfig::default()),
             sandbox_cfg: Arc::new(SandboxConfig::default()),
             context_cfg: Arc::new(ContextConfig::default()),
@@ -477,7 +478,7 @@ mod tests {
         let (hits, meta) = crate::server::memory::search_hits(&state, "插件删除", 10).await;
         assert!(!hits.is_empty(), "应命中插件删除会话: {meta}");
         assert_eq!(hits[0].id, a);
-        assert_eq!(hits[0].title, "插件删除能力要不要做？上次说等确认", "标题取首条用户消息: {:?}", hits[0]);
+        assert_eq!(hits[0].title, "插件删除能力要不要做", "标题取首条用户消息前 10 字: {:?}", hits[0]);
         assert!(!hits[0].workspace.is_empty(), "要能说清哪个工作区");
         assert_eq!(meta["total"], 2, "同步后索引应含两条会话");
 

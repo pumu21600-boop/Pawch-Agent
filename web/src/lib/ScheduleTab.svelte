@@ -43,11 +43,10 @@
   let schedLoading = false;
   // 渠道配置候选（执行模型选择；GET /api/settings 的 configs，含 id/label/model/models）
   let schedConfigs = [];
-  // 编辑器：null = 关；isNew = 新建（id 空）。档位/高危策略语义同审批四档
+  // 编辑器：null = 关；isNew = 新建（id 空）。档位三档语义见 SCHED_MODES
   let schedEditor = null;
   // 高级选项（会话/审批/超时）默认折叠；编辑老任务时若与默认不同则自动展开，不藏已配置的东西
   let schedAdvOpen = false;
-  const SCHED_ADV_DEFAULT = { session_mode: 'new', session_id: '', approval_mode: 'auto', on_approval: 'deny', timeout_secs: 1800 };
   // cron 人话预览（输入即查，250ms 防抖；解析失败由界面提示）
   let schedCronText = '';
   let schedCronTimer = null;
@@ -59,20 +58,28 @@
     clearTimeout(schedReloadTimer);
   });
   let schedCronPending = false;
-  // 三档（2026-10-05 真机实测：sandbox 档 10-03 就取消了，这里一直挂着四档旧表；
-  // 与输入框上方的全局档位菜单同一套口径，跟随全局语义）
+  // 三档（2026-11-08 与「高危」下拉合并成一个：无人值守没有人点允许，高危策略由
+  // 档位推导——只读/自动命中审批一律拒绝并回喂，完全访问全免审，
+  // 后端 schedule::unattended_on_approval；标签不带括号说明，用户拍板）
   const SCHED_MODES = [
-    { value: 'read-only', label: '只读（写/执行逐次询问）' },
-    { value: 'auto', label: '自动（可动工作区，高危先问）' },
-    { value: 'full-access', label: '完全访问（全免审，本机直跑）' },
+    { value: 'read-only', label: '只读' },
+    { value: 'auto', label: '自动' },
+    { value: 'full-access', label: '完全访问' },
   ];
+  // 老任务档位归一（旧档名/空串 → 三档之一，映射与后端 normalize_mode 一致）
+  function normApprovalMode(v) {
+    const s = String(v || '').trim();
+    if (s === 'suggest' || s === 'sandbox') return 'read-only';
+    if (s === '' || s === 'auto-edit' || s === 'full-auto') return 'auto';
+    if (s === 'read-only' || s === 'auto' || s === 'full-access') return s;
+    return 'auto';
+  }
   function schedAdvNonDefault(t) {
     const n = (v, d) => (v == null || v === '' ? d : v);
     return (
       n(t.session_mode, 'new') !== 'new' ||
       !!(t.session_id && t.session_id.trim()) ||
-      n(t.approval_mode, 'auto') !== 'auto' ||
-      n(t.on_approval, 'deny') !== 'deny' ||
+      normApprovalMode(t.approval_mode) !== 'auto' ||
       !!(t.config_id && t.config_id.trim()) ||
       !!(t.model && t.model.trim()) ||
       (Number(t.timeout_secs) || 1800) !== 1800
@@ -86,28 +93,37 @@
   // 的变量，函数体里读的 schedConfigs/workspace/recentWorkspaces 换了不重算）——
   // 真机实测：列表还在加载时开编辑器，供应商下拉永远只有「跟随当前激活配置」一项。
   // 改走响应式声明：$: 语句跟踪函数体依赖，源数据一换选项就重算。
-  $: configOpts = configOptions();
   $: wsOpts = wsOptions();
-  function configOptions() {
+  // —— 模型二级菜单（与功能桥接同款）：首项跟随当前激活配置，下面按渠道分组、
+  // 点渠道展开它名下的模型。值编码成 "配置id::模型"，选中时拆回 config_id/model
+  // 两个字段存（后端字段不动，落库值与旧任务一致）。
+  function schedModelsOf(c) {
+    return (c.models && c.models.length ? c.models : [c.model]).filter(Boolean);
+  }
+  // 编辑回显：config_id+model → 复合值。老任务只存了配置 id 的规范成「id::该配置
+  // 当前模型」（RolesTab normValue 同款），否则会跟分组里同一条模型各显示一遍
+  function schedModelValue(e) {
+    if (!e || !e.config_id) return '';
+    const c = schedConfigs.find((x) => x.id === e.config_id);
+    const m = String(e.model || '').trim() || (c ? String(c.model || schedModelsOf(c)[0] || '').trim() : '');
+    return m ? `${e.config_id}::${m}` : e.config_id;
+  }
+  $: schedModelOpts = (() => {
     const opts = [{ value: '', label: '跟随当前激活配置' }];
     for (const c of schedConfigs) {
-      opts.push({ value: c.id, label: c.name }); // 只显示供应商名；模型是下一个下拉的事（2026-10-05 真机实测）
+      const items = schedModelsOf(c).map((m) => ({ value: `${c.id}::${m}`, label: m }));
+      if (items.length) opts.push({ group: c.name, items });
+    }
+    // 当前值不在任何分组里（配置被删）时补一条回显项，别让下拉空着
+    const cur = schedEditor ? schedModelValue(schedEditor) : '';
+    if (cur && !opts.some((o) => o.group && o.items.some((it) => it.value === cur))) {
+      const model = String((schedEditor && schedEditor.model) || '').trim();
+      opts.splice(1, 0, { value: cur, label: model ? `配置已不在 · ${model}` : cur });
     }
     return opts;
-  }
-  // configId 由模板直接传参：Svelte4 只跟踪表达式里直接引用的变量，包进函数体
-  // 读 schedEditor.config_id 不建依赖（toolFold 同款坑，真机实测过），选供应商时
-  // 模型下拉不会重算——2026-10-05 真机实测「选了 bai 要出 bai 的三个模型」。
-  function modelOptions(configId) {
-    const cfg = schedConfigs.find((c) => c.id === (configId || ''));
-    const opts = [{ value: '', label: '默认（该配置的模型）' }];
-    for (const m of cfg?.models || []) opts.push({ value: m, label: m });
-    // 配置当前模型不在清单里（手填的）也给一个可选项
-    if (cfg?.model && !(cfg.models || []).includes(cfg.model)) {
-      opts.push({ value: cfg.model, label: `${cfg.model}（当前）` });
-    }
-    return opts;
-  }
+  })();
+  // 选中值同样走 $: 声明——模板里调函数读不到函数体里的 schedConfigs（同上面那个坑）
+  $: schedModelCur = schedEditor ? schedModelValue(schedEditor) : '';
   function wsOptions() {
     const seen = new Set();
     const opts = [{ value: '', label: '跟随当前工作区' }];
@@ -180,7 +196,6 @@
       session_id: '',
       workspace: '',
       approval_mode: 'auto',
-      on_approval: 'deny',
       enabled: true,
       timeout_secs: '',
       budget_tokens: '',
@@ -194,7 +209,7 @@
     schedMsg = '';
     schedAdvOpen = schedAdvNonDefault(t);
     // 超时回显为空 + 占位符，不显示突兀的 0；保存时留空按 1800 发（见 saveSchedule）
-    schedEditor = { ...t, isNew: false, timeout_secs: Number(t.timeout_secs) || '', memory_days: t.memory_days || '', budget_tokens: t.budget_tokens ? Number(t.budget_tokens) : '', config_id: t.config_id || '', model: t.model || '' };
+    schedEditor = { ...t, isNew: false, timeout_secs: Number(t.timeout_secs) || '', memory_days: t.memory_days || '', budget_tokens: t.budget_tokens ? Number(t.budget_tokens) : '', approval_mode: normApprovalMode(t.approval_mode), config_id: t.config_id || '', model: t.model || '' };
     previewCron();
   }
   async function saveSchedule() {
@@ -213,7 +228,6 @@
       session_id: e.session_id,
       workspace: e.workspace || '',
       approval_mode: e.approval_mode,
-      on_approval: e.on_approval,
       enabled: e.enabled !== false,
       // 留空 = 1800（与服务端 DEFAULT_TIMEOUT_SECS 对齐，显式发值不靠「0 走默认」隐式契约，F10）
       timeout_secs: Number(e.timeout_secs) || 1800,
@@ -355,23 +369,18 @@
             </div>
             <div class="field">
               <label>模型</label>
-              <div class="sub-row">
-                <Select
-                  value={schedEditor.config_id || ''}
-                  title="供应商（执行配置）"
-                  options={configOpts}
-                  on:change={(e) => {
-                    schedEditor.config_id = e.detail;
-                    schedEditor.model = ''; // 换配置清掉模型覆盖，回落到该配置默认
-                  }}
-                />
-                <Select
-                  value={schedEditor.model || ''}
-                  title="模型（默认=该配置的模型）"
-                  options={modelOptions(schedEditor.config_id || '')}
-                  on:change={(e) => (schedEditor.model = e.detail)}
-                />
-              </div>
+              <!-- 与功能桥接同款二级菜单：点渠道展开模型；值 = 配置id::模型，拆回两字段存 -->
+              <Select
+                value={schedModelCur}
+                title="执行模型：留空跟随当前激活配置；点渠道名展开后选模型"
+                options={schedModelOpts}
+                on:change={(e) => {
+                  const v = String(e.detail || '');
+                  const i = v.indexOf('::');
+                  schedEditor.config_id = i < 0 ? v : v.slice(0, i);
+                  schedEditor.model = i < 0 ? '' : v.slice(i + 2);
+                }}
+              />
             </div>
             <div class="sub-row">
               <button class="btn ghost" on:click={() => (schedAdvOpen = !schedAdvOpen)}>{schedAdvOpen ? '收起高级选项' : '高级选项'}</button>
@@ -392,20 +401,12 @@
                 {/if}
               </div>
               <div class="sub-row">
+                <!-- 高危策略不再单独选（2026-11-08 合并）：由档位推导——只读/自动命中审批拒绝、完全访问全免审 -->
                 <Select
                   value={schedEditor.approval_mode}
                   title="审批档位"
                   options={SCHED_MODES}
                   on:change={(e) => (schedEditor.approval_mode = e.detail)}
-                />
-                <Select
-                  value={schedEditor.on_approval}
-                  title="高危操作"
-                  options={[
-                    { value: 'deny', label: '高危：拒绝' },
-                    { value: 'approve', label: '高危：放行' },
-                  ]}
-                  on:change={(e) => (schedEditor.on_approval = e.detail)}
                 />
                 <input placeholder="超时（秒）" type="number" bind:value={schedEditor.timeout_secs} style="max-width:110px" />
                 <input

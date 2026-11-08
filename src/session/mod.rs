@@ -114,6 +114,10 @@ pub struct SessionFile {
     /// 用量快照（重启后恢复圆环/缓存行；旧文件缺省 None）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<SessionUsage>,
+    /// 压缩记录（2026-11-07 静默压缩）：请求视图 = 摘要消息 + tail_start 起的历史。
+    /// 会话文件始终存**完整历史**，压缩只影响请求侧；标记行随消息落盘（display_only）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact: Option<crate::compact::CompactRecord>,
 }
 
 /// 列表条目（不携带消息体）。
@@ -152,6 +156,8 @@ fn is_placeholder_title(t: &str) -> bool {
     t == PLACEHOLDER_TITLE || t == LEGACY_PLACEHOLDER_TITLE
 }
 
+/// 标题 = 首条用户消息的前 10 字（2026-11-06 起不再调模型生成标题）。
+/// 换行/连续空白折成单空格，侧栏单行显示不会出现半个空行。
 fn first_user_title(messages: &[Value]) -> String {
     messages
         .iter()
@@ -168,10 +174,11 @@ fn first_user_title(messages: &[Value]) -> String {
                     break;
                 }
             }
+            let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
             if s.is_empty() {
                 "媒体理解对话".to_string()
             } else {
-                s.chars().take(30).collect::<String>()
+                s.chars().take(10).collect::<String>()
             }
         })
         .unwrap_or_else(|| PLACEHOLDER_TITLE.to_string())
@@ -259,21 +266,69 @@ impl SessionManager {
         self.dir.join(format!("{id}.json"))
     }
 
+    /// 压缩完整记录目录：`<日志目录>/transcripts/<会话id>-<序号>.md`。
+    /// 摘要把细节压薄了，原文在这里兜底（模型可按摘要消息里带的路径回读）。
+    pub fn transcripts_dir(&self) -> PathBuf {
+        self.dir.parent().unwrap_or(Path::new(".")).join("transcripts")
+    }
+
+    /// 压缩完成落盘：写 compact 记录 + 在触发轮最后一条消息后插入完成标记行 +
+    /// 更新 summary（新会话 brief 继续有料）。锚点消息已不在（回滚/删除）→
+    /// 返回 Ok(false)：结果作废不落盘，等下一轮重新压。
+    pub fn apply_compaction(
+        &self,
+        id: &str,
+        record: crate::compact::CompactRecord,
+        marker: Value,
+    ) -> anyhow::Result<bool> {
+        if !safe_id(id) {
+            anyhow::bail!("非法 session id");
+        }
+        let lock = self.session_lock(id);
+        let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(mut f) = self.get(id) else { return Ok(false) };
+        // 旧标记行先清掉：一条会话只有一条压缩记录，标记行永远代表**最近一次**
+        // 压缩的边界。原先按内容去重（同文=已插过）——两次压缩后 token 取整相同
+        // （如两次都报 17k）时新边界标记被吞，前端按文件重建后底部那行直接消失
+        // （真机 2026-11-07：压缩提示弹出→消失，刷新才在历史中部看到上一次的旧行）。
+        f.messages.retain(|m| m.get("kind").and_then(Value::as_str) != Some("compact_marker"));
+        let Some(after_idx) =
+            f.messages.iter().position(|m| m.get("id").and_then(Value::as_str) == Some(&record.after_id))
+        else {
+            return Ok(false);
+        };
+        if !f.messages.iter().any(|m| m.get("id").and_then(Value::as_str) == Some(&record.tail_start_id)) {
+            return Ok(false);
+        }
+        f.compact = Some(record);
+        f.summary = f.compact.as_ref().map(|c| c.summary.clone());
+        let insert_at = (after_idx + 1).min(f.messages.len());
+        f.messages.insert(insert_at, marker);
+        f.updated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        self.write(&f)?;
+        Ok(true)
+    }
+
     /// 新建对话 id（不落盘；首条消息时 save 才建文件）。
     pub fn new_id(&self) -> String {
         uuid::Uuid::new_v4().to_string()
     }
 
     /// 新建一条空会话并立即落盘：点「新会话」就在侧栏当前项目下留一条，
-    /// 不用等首条消息。同一工作区已存在空会话时直接复用，避免连点堆出一排空会话。
+    /// 不用等首条消息。同一工作区已有**没动过的**空会话（占位标题、无用量快照）
+    /// 时直接复用，避免连点堆出一排空会话。
+    /// 回滚成空的旧对话不算：标题还是原来的、用量快照也在，复用它会让「新建对话」
+    /// 落回原对话（2026-11-07 用户实报「标题还是一开始的」）。
     pub fn create_empty(&self, workspace: &str, title: &str) -> anyhow::Result<SessionFile> {
-        if let Some(m) = self
+        if let Some(f) = self
             .list()
             .into_iter()
-            .find(|m| m.count == 0 && m.workspace == workspace)
-            && let Some(f) = self.get(&m.id) {
-                return Ok(f);
-            }
+            .filter(|m| m.count == 0 && m.workspace == workspace)
+            .filter_map(|m| self.get(&m.id))
+            .find(|f| is_placeholder_title(&f.title) && f.usage.is_none())
+        {
+            return Ok(f);
+        }
         std::fs::create_dir_all(&self.dir).with_context(|| format!("建会话目录失败: {}", self.dir.display()))?;
         let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
         let f = SessionFile {
@@ -287,6 +342,7 @@ impl SessionManager {
             pinned: false,
             archived: false,
             usage: None,
+                compact: None,
         };
         self.write(&f)?;
         Ok(f)
@@ -316,14 +372,22 @@ impl SessionManager {
         let path = self.path(id);
         let existed = path.exists();
         // 用量快照随文件保留：save 由消息侧高频调用，不能把 update_usage 写的快照抹掉
-        let (title, created_at, old_summary, workspace, pinned, old_usage) = match self.get(id) {
+        let (title, created_at, old_summary, workspace, pinned, old_usage, old_compact) = match self.get(id) {
             Some(old) => (
-                old.title,
+                // 空会话先落盘（标题=占位），首条消息到了就把标题补成前 10 字并持久化；
+                // 不再靠 list() 的显示兜底，打开会话的顶栏也能拿到同一个标题。
+                // 空标题（老会话/被清空）同样在下次保存时自愈。
+                if is_placeholder_title(&old.title) || old.title.trim().is_empty() {
+                    first_user_title(messages)
+                } else {
+                    old.title
+                },
                 old.created_at,
                 old.summary,
                 old.workspace,
                 old.pinned,
                 old.usage,
+                old.compact,
             ),
             None if !existed => (
                 first_user_title(messages),
@@ -331,6 +395,7 @@ impl SessionManager {
                 None,
                 crate::tools::workspace_root().display().to_string(),
                 false,
+                None,
                 None,
             ),
             None => {
@@ -340,19 +405,45 @@ impl SessionManager {
                 );
             }
         };
-        let file = SessionFile {
+        let mut file = SessionFile {
             id: id.to_string(),
             title,
             created_at,
             updated_at: now,
-            messages: messages.to_vec(),
+            // 缺 id 的消息补 uuid：压缩边界/标记行锚点都按 id 定位（老会话首次重存即升级）
+            messages: Self::ensure_ids(messages.to_vec()),
             summary: summary.map(|s| s.to_string()).or(old_summary),
             workspace,
             pinned,
             archived: false,
             usage: old_usage,
+            compact: old_compact,
         };
+        // 快照覆写保护（2026-11-07）：运行中的轮次拿的是压缩前的全量历史，它的快照
+        // 不含压缩标记行——记录还在而标记丢了时按记录补回，别让「压缩后上下文」行
+        // 在下一轮落盘时无声消失。
+        if file.compact.is_some()
+            && !file.messages.iter().any(|m| m.get("kind").and_then(Value::as_str) == Some("compact_marker"))
+            && let Some(rec) = file.compact.clone()
+            && let Some(i) =
+                file.messages.iter().position(|m| m.get("id").and_then(Value::as_str) == Some(&rec.after_id))
+        {
+            let at = (i + 1).min(file.messages.len());
+            file.messages.insert(at, crate::compact::marker_message(&crate::compact::done_marker_text(rec.post_tokens)));
+        }
         self.write(&file)
+    }
+
+    /// 给缺 id 的消息补 uuid。压缩边界（tail_start/after）按消息 id 定位，
+    /// 老会话首次重存即升级；content 之外的界面字段不动。
+    fn ensure_ids(mut msgs: Vec<Value>) -> Vec<Value> {
+        for m in &mut msgs {
+            let missing = m.get("id").and_then(Value::as_str).map(str::is_empty).unwrap_or(true);
+            if missing && let Some(obj) = m.as_object_mut() {
+                obj.insert("id".into(), serde_json::json!(uuid::Uuid::new_v4().to_string()));
+            }
+        }
+        msgs
     }
 
     /// 只更新用量快照（读-改-写，其余字段以盘上为准）。ContextUsage/ApiUsage 事件时调；
@@ -391,9 +482,9 @@ impl SessionManager {
     }
 
     /// 全部会话元信息：置顶优先，其余按更新时间新→旧（归档项一并返回，由前端过滤）。
-    /// 标题兜底（2026-10-02 真机实测「@对话列表全显示新会话」）：标题模型没跑成的
-    /// 会话 title 停在占位标题，列表里一片同名不可辨。占位/空标题时回落首条
-    /// 用户消息前 20 字；一条消息都没有的显示「新对话」。
+    /// 标题兜底（2026-10-02 真机实测「@对话列表全显示新会话」）：占位/空标题时回落
+    /// 首条用户消息前 10 字（与落盘口径同一个函数）；一条消息都没有的显示「新对话」。
+    /// 2026-11-06 起标题在首条消息落盘时就写进会话文件，这里只剩存量旧会话的兜底。
     /// 占位判定要同时认「新对话」（2026-10-30 起的统一叫法）与「新会话」（旧占位，
     /// 盘上存量会话还是这个值）——只认新值的话，老空会话会带着旧名一路显示下去。
     pub fn list(&self) -> Vec<SessionMeta> {
@@ -435,6 +526,16 @@ impl SessionManager {
         // 产物账本跟着会话走：会话文件删了，归属记录也不留（best-effort）
         if let Some(logs) = self.dir.parent() {
             crate::artifacts::clear_in(logs, id);
+        }
+        // 压缩完整记录跟着会话走（best-effort）
+        let tdir = self.transcripts_dir();
+        if let Ok(rd) = std::fs::read_dir(&tdir) {
+            let prefix = format!("{id}-");
+            for e in rd.flatten() {
+                if e.file_name().to_string_lossy().starts_with(&prefix) {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
         }
         match std::fs::remove_file(self.path(id)) {
             Ok(()) => Ok(()),
@@ -660,6 +761,8 @@ impl SessionManager {
             archived: false,
             // 分叉不带用量快照：台账记录归属原会话 id，分叉从零攒自己的账
             usage: None,
+            // 压缩记录跟着走：消息连同 id 一起复制，边界锚点在分叉里仍然有效
+            compact: f.compact,
         };
         self.write(&file)?;
         Ok(new_id)
@@ -844,7 +947,7 @@ mod tests {
         m.save(&b, &[json!({"role":"user","content":"第二条会话"})], None).unwrap();
         let list = m.list();
         assert_eq!(list.len(), 2);
-        assert!(list.iter().any(|s| s.id == a && s.title.contains("会话A")));
+        assert!(list.iter().any(|s| s.id == a && s.title.starts_with("帮我修编译错误")), "标题取首句前 10 字");
         assert!(list.iter().any(|s| s.id == b));
 
         // 更新 A：标题与 created_at 保留，消息数变化；摘要随存
@@ -859,7 +962,7 @@ mod tests {
         .unwrap();
         let fa = m.get(&a).unwrap();
         assert_eq!(fa.messages.len(), 2);
-        assert_eq!(fa.title, "帮我修编译错误，这是会话A的开头");
+        assert_eq!(fa.title, "帮我修编译错误，这是", "标题 = 首句前 10 字且后续保存不改写");
         assert!(fa.summary.as_deref().unwrap_or("").contains("main.rs"), " 摘要应持久化");
         // summary 传 None 时保留旧值
         m.save(&a, &fa.messages, None).unwrap();
@@ -898,8 +1001,158 @@ mod tests {
 
         // 有消息的会话不再被当作可复用空会话
         m.save(&f.id, &[json!({"role":"user","content":"开始干活"})], None).unwrap();
+        assert_eq!(m.get(&f.id).unwrap().title, "开始干活", "首条消息到了标题要落盘（打开会话的顶栏也靠它）");
         let f4 = m.create_empty(ws, PLACEHOLDER_TITLE).unwrap();
         assert_ne!(f4.id, f.id, "有消息的会话不该被复用");
+    }
+
+    /// 2026-11-07 用户实报：回滚成空的旧对话不能被「新建对话」复用——
+    /// 复用会让标题还是一开始的，圆环被清零但会话根本没换。
+    #[test]
+    fn create_empty_does_not_reuse_rolled_back_session() {
+        let (_d, m) = mgr("empty-rollback");
+        let ws = "C:\\ws\\rollback";
+        let f = m.create_empty(ws, PLACEHOLDER_TITLE).unwrap();
+        m.save(&f.id, &[json!({"role":"user","content":"你好"})], None).unwrap();
+        let mut usage = SessionUsage::default();
+        usage.apply_context(None, 13_000, 150_000, &crate::context::Breakdown::default());
+        m.update_usage(&f.id, usage).unwrap();
+        // 回滚到空：标题与用量快照都留在会话文件里
+        m.save(&f.id, &[], None).unwrap();
+        assert_eq!(m.get(&f.id).unwrap().title, "你好");
+        let f2 = m.create_empty(ws, PLACEHOLDER_TITLE).unwrap();
+        assert_ne!(f2.id, f.id, "回滚空会话有真实标题/用量，不是可复用的「新对话」");
+        assert_eq!(f2.title, PLACEHOLDER_TITLE);
+    }
+
+    /// 静默压缩（2026-11-07）：apply_compaction 写记录+标记行+summary；锚点没了作废；
+    /// 快照覆写不丢记录，标记行被冲掉时按记录补回。
+    #[test]
+    fn compaction_apply_and_persistence() {
+        let _ = crate::observability::init(
+            &std::env::temp_dir().join("agent-test-logs"),
+            "sessions.jsonl",
+            format!("session-test-{}", uuid::Uuid::new_v4()),
+        );
+        let (_d, m) = mgr("compact-apply");
+        let f = m.create_empty("C:\\ws\\compact", PLACEHOLDER_TITLE).unwrap();
+        m.save(
+            &f.id,
+            &[
+                json!({"role":"user","content":"第一个问题"}),
+                json!({"role":"assistant","content":"第一个回答"}),
+                json!({"role":"user","content":"第二个问题"}),
+                json!({"role":"assistant","content":"第二个回答"}),
+            ],
+            None,
+        )
+        .unwrap();
+        let saved = m.get(&f.id).unwrap();
+        let ids: Vec<String> = saved.messages.iter().map(|x| x.get("id").and_then(Value::as_str).unwrap_or("").to_string()).collect();
+        assert!(ids.iter().all(|s| !s.is_empty()), "save 必须补齐消息 id");
+        let (tail_start, after) = (&ids[2], &ids[3]);
+
+        let record = crate::compact::CompactRecord {
+            summary: "任务目标：压缩测试".into(),
+            summarized_last_id: ids[1].clone(),
+            tail_start_id: tail_start.clone(),
+            after_id: after.clone(),
+            pre_tokens: 900_000,
+            post_tokens: 40_000,
+            transcript_path: "C:\\logs\\transcripts\\x-001.md".into(),
+            created_at: "2026-11-07T00:00:00Z".into(),
+        };
+        let marker = crate::compact::marker_message(&crate::compact::done_marker_text(40_000));
+        assert!(m.apply_compaction(&f.id, record, marker).unwrap(), "首次应用应成功");
+
+        let got = m.get(&f.id).unwrap();
+        assert_eq!(got.compact.as_ref().unwrap().post_tokens, 40_000);
+        assert_eq!(got.summary.as_deref(), Some("任务目标：压缩测试"), "summary 同步给新会话 brief");
+        // 标记行插在触发轮最后一条之后
+        let marker_idx = got.messages.iter().position(|x| x.get("kind").and_then(Value::as_str) == Some("compact_marker")).unwrap();
+        assert_eq!(marker_idx, 4, "标记行在最后一条消息后面");
+        assert!(got.messages[marker_idx]["content"].as_str().unwrap().starts_with("————压缩后上下文 40k————"));
+
+        // 快照覆写保护：下一轮整卷重写（不含标记行）→ 记录保留、标记补回
+        let mut next_round = got.messages.iter().filter(|x| x.get("kind").and_then(Value::as_str) != Some("compact_marker")).cloned().collect::<Vec<_>>();
+        next_round.push(json!({"role":"user","content":"第三个问题","id": ids[0].clone() + "-n"}));
+        m.save(&f.id, &next_round, None).unwrap();
+        let after_save = m.get(&f.id).unwrap();
+        assert!(after_save.compact.is_some(), "记录不能被快照冲掉");
+        assert!(after_save.messages.iter().any(|x| x.get("kind").and_then(Value::as_str) == Some("compact_marker")), "标记行要被补回");
+
+        // 回滚把锚点消息删掉 → 应用作废
+        let trimmed: Vec<Value> = after_save.messages[..2].to_vec();
+        m.save(&f.id, &trimmed, None).unwrap();
+        let record2 = crate::compact::CompactRecord {
+            summary: "s".into(), summarized_last_id: ids[1].clone(), tail_start_id: tail_start.clone(),
+            after_id: after.clone(), pre_tokens: 1, post_tokens: 1, transcript_path: "t".into(), created_at: "x".into(),
+        };
+        assert!(!m.apply_compaction(&f.id, record2, crate::compact::marker_message("————压缩后上下文 1k————")).unwrap(), "锚点不在 = 作废");
+    }
+
+    /// 二次压缩且完成文案取整相同（两次都报 17k）：标记行必须挪到**新**边界，
+    /// 不能按内容去重把新标记吞掉（真机 2026-11-07：底部「正在压缩」行被重建冲掉、
+    /// 刷新后只在历史中部看到上一次的旧行）。
+    #[test]
+    fn second_compaction_moves_marker_even_with_same_text() {
+        let (_d, m) = mgr("compact-remark-same-text");
+        let f = m.create_empty("C:\\ws\\compact2", PLACEHOLDER_TITLE).unwrap();
+        let ids: Vec<String> = (0..4).map(|i| format!("{}-{}", f.id, i)).collect();
+        let msgs = vec![
+            json!({"role":"user","content":"q1","id": ids[0]}),
+            json!({"role":"assistant","content":"a1","id": ids[1]}),
+            json!({"role":"user","content":"q2","id": ids[2]}),
+            json!({"role":"assistant","content":"a2","id": ids[3]}),
+        ];
+        m.save(&f.id, &msgs, None).unwrap();
+        let rec = |after: &str, tail: &str| crate::compact::CompactRecord {
+            summary: "s".into(),
+            summarized_last_id: ids[1].clone(),
+            tail_start_id: tail.into(),
+            after_id: after.into(),
+            pre_tokens: 1,
+            post_tokens: 17_000,
+            transcript_path: "t".into(),
+            created_at: "x".into(),
+        };
+        // 第一次：边界在 a2（idx 3）之后
+        assert!(m.apply_compaction(&f.id, rec(&ids[3], &ids[2]), crate::compact::marker_message(&crate::compact::done_marker_text(17_000))).unwrap());
+        let got = m.get(&f.id).unwrap();
+        assert_eq!(got.messages.last().unwrap()["kind"], json!("compact_marker"), "首次标记在末尾");
+        // 第二次：同文标记（17k→17k），新边界在尾部新增的 a4 之后
+        let mut more = got.messages.iter().filter(|x| x.get("kind").and_then(Value::as_str) != Some("compact_marker")).cloned().collect::<Vec<_>>();
+        more.push(json!({"role":"user","content":"q3","id":"q3"}));
+        more.push(json!({"role":"assistant","content":"a3","id":"a3"}));
+        m.save(&f.id, &more, None).unwrap();
+        assert!(m.apply_compaction(&f.id, rec("a3", "q3"), crate::compact::marker_message(&crate::compact::done_marker_text(17_000))).unwrap());
+        let got2 = m.get(&f.id).unwrap();
+        let markers: Vec<usize> = got2
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, x)| x.get("kind").and_then(Value::as_str) == Some("compact_marker"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(markers, vec![got2.messages.len() - 1], "旧标记清掉、新标记只在末尾（新边界）");
+    }
+
+    /// 标题 = 首条用户消息前 10 字：换行折成空格，长消息截断；媒体投影块剥掉。
+    #[test]
+    fn first_message_becomes_persisted_title() {
+        let (_d, m) = mgr("title-prefix");
+        let f = m.create_empty("C:\\ws\\title", PLACEHOLDER_TITLE).unwrap();
+        let long = format!("第一行\n第二行 {}", "很长".repeat(40));
+        m.save(&f.id, &[json!({"role":"user","content":long})], None).unwrap();
+        let title = m.get(&f.id).unwrap().title;
+        assert!(title.starts_with("第一行 第二行"), "换行折成单空格: {title}");
+        assert_eq!(title.chars().count(), 10, "按字符截到 10: {title}");
+        assert!(!title.contains('\n'));
+
+        // 媒体投影块剥掉后再取正文
+        let f2 = m.create_empty("C:\\ws\\title2", PLACEHOLDER_TITLE).unwrap();
+        m.save(&f2.id, &[json!({"role":"user","content":"[Audio understanding] 帮我听这段录音"})], None).unwrap();
+        assert_eq!(m.get(&f2.id).unwrap().title, "帮我听这段录音");
     }
 
     /// 旧占位「新会话」的存量会话仍按占位处理，显示回落首条消息 / 「新对话」。
@@ -1047,7 +1300,7 @@ mod tests {
         .unwrap();
 
         let brief = m.project_brief(&fresh, Some((2, 15, 4))).expect("应生成项目现状");
-        assert!(brief.contains("把登录接口改成 JWT"), "带上一条会话标题: {brief}");
+        assert!(brief.contains("把登录接口改成"), "带上一条会话标题（首句前 10 字）: {brief}");
         assert!(brief.contains("待补刷新逻辑"), "带上一条会话摘要: {brief}");
         assert!(brief.contains("2 个文件改动"), "带未提交改动量: {brief}");
         assert!(brief.contains(&ws), "带项目目录: {brief}");
@@ -1178,6 +1431,7 @@ mod concurrency_tests {
             pinned: false,
             archived: false,
             usage: None,
+                compact: None,
         };
         // 4 条消息里只有 2 条进转写，但一条都没丢 → 不该报 omitted
         let (kept, omitted) = transcript(&f, 16_000, 2_500);

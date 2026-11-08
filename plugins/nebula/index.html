@@ -11,10 +11,12 @@
     --hover: #262320; --btn-line: #454039; --warn: #e8a33d; --err: #e5534b; --link: #6ea8fe; --ok: #7bc96f;
     color-scheme: dark;
   }
+  /* 根元素也跟随主题：画布 color-scheme/兜底底色只认 html（body 被微调成透明时深色画布会露底） */
+  html.light { color-scheme: light; background: #fffefc; }
   body.light {
-    scrollbar-color: var(--line2, #b3bac4) transparent;
-    --bg: #ffffff; --fg: #1a1a1c; --dim: #6b6b74; --line: #e4e4e8;
-    --hover: #f2f2f5; --btn-line: #d4d4da; --warn: #b25e09; --err: #cf222e; --link: #0b62d0; --ok: #1a7f37;
+    scrollbar-color: var(--line2, #d9d3c9) transparent;
+    --bg: #fffefc; --fg: #1f1d1a; --dim: #87827a; --line: #e7e2da;
+    --hover: #f3f0eb; --btn-line: #d9d3c9; --warn: #b25e09; --err: #b3261e; --link: #a46851; --ok: #1e7a3f;
     color-scheme: light;
   }
   * { box-sizing: border-box; }
@@ -54,6 +56,7 @@ let booted = false;
 window.addEventListener('message', (ev) => {
   const d = ev.data || {};
   if (d.type === 'pawch:init') {
+    document.documentElement.classList.toggle('light', ((d.payload || {}).theme) === 'light'); // 画布跟主题（只认根元素）
     document.body.classList.toggle('light', ((d.payload || {}).theme) === 'light');
     if (!booted) { booted = true; boot(); }
   }

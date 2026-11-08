@@ -1,12 +1,5 @@
 <script>
-  import { createEventDispatcher } from 'svelte';
-
-  const dispatch = createEventDispatcher();
   export let tab = '';
-  // 星云入口显隐（App 侧 features.galaxy；关掉只藏入口，记忆功能本体不受影响）
-  export let showGalaxy = true;
-  // 「打开记忆库」:关设置 + 开星云(两个状态都在 App 侧)
-  const openGalaxy = () => dispatch('openGalaxy');
 
   // —— 记忆分区（约定文件编辑 + 自动记忆）——
   // 系统约定 prompts/system.md、全局约定 ~/.pawch-agent/AGENTS.md（旧名 ~/.agent 兼容一个版本）、项目约定 工作区根 AGENTS.md、
@@ -88,18 +81,11 @@
           <div class="field">
             <label>记忆存储（自动记录）</label>
             <div class="mem-stats">
-              <div>· 约定目录 <code>{memData.user_global_dir}</code> · 登记目录 <code>{memData.install_state_dir}</code> · {memData.projects_registered} 个项目</div>
-              <div>· 项目目录 <code>{memData.project_dir}</code> · events.log {memData.events_lines} 行</div>
+              <div>· 全局记忆（所有项目共用）：<code>{memData.user_global_dir}</code></div>
+              <div>· 项目记忆（跟着当前项目走）：<code>{memData.project_dir}</code></div>
+              <div>· 已覆盖 {memData.projects_registered} 个项目，agent 会自动积累，无需手动整理</div>
             </div>
           </div>
-          {#if showGalaxy}
-          <div class="field">
-            <label>记忆库</label>
-            <div class="sub-row">
-              <button class="btn" on:click={openGalaxy}>打开记忆库</button>
-            </div>
-          </div>
-          {/if}
           <div class="field">
             <label>约定文件</label>
             <div class="chips">

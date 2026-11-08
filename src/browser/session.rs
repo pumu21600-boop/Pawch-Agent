@@ -231,7 +231,9 @@ pub(crate) async fn shell_create_target(session: &BrowserSession) -> Result<(Str
     // （服务重启后壳不重启时就有）target 还在列表里，只排除自己的 tab 会认领到将死的
     // 旧 target，连上就断
     let known = all_page_target_ids(session.port).await;
-    shell::create(&label, "about:blank", x, y, w, h, false);
+    // 画布底色跟应用主题：系统深色时 WebView2 默认画布是黑的，浅色主题下
+    // 空白页（about:blank）会衬出一块黑（2026-11-07 用户实锤）
+    shell::create(&label, "about:blank", (x, y, w, h), false, shell::themed_webview_bg());
     match wait_new_page_target(session.port, &known, Duration::from_secs(8)).await {
         Ok((id, ws)) => Ok((id, ws, Some(label))),
         Err(e) => {

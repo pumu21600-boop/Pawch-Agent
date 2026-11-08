@@ -231,9 +231,6 @@ pub struct RolesConfig {
     /// 滚动摘要（SUMMARY）
     #[serde(default)]
     pub summary: Option<String>,
-    /// 会话标题生成（TITLE_GENERATION）
-    #[serde(default)]
-    pub title: Option<String>,
     /// 向量嵌入（EMBEDDING，记忆库语义检索消费；未配置时用本地哈希向量）
     #[serde(default)]
     pub embedding: Option<String>,

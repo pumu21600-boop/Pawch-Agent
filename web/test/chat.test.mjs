@@ -28,6 +28,7 @@ import {
   filesTouchedInMessages,
   attachAskToToolPart,
   settleAskOnParts,
+  fileUserIndexOf,
 } from '../src/lib/chat.js';
 
 test('审批记录挂在最后一个同名工具段上，决定回填按 id 命中', () => {
@@ -328,12 +329,14 @@ test('steer 分块：完成态跟随过程折叠（徽标+行内原位），流�
   );
   assert.equal(done[0].items.filter((p) => p.type === 'steer').length, 1, '摘要徽标按这个计数');
   assert.equal(done[1].text, '标题已改，全部完成。');
-  // 流式仍按真实顺序展开、引导隔断
+  // 流式与完成态同口径（2026-11-08）：引导留在过程块内，不劈独立块挂轮尾
   const live = buildBlocks(parts);
   assert.deepEqual(
     live.map((b) => b.kind),
-    ['process', 'content', 'steer', 'process', 'content']
+    ['process', 'content', 'process', 'content']
   );
+  assert.equal(live[2].items[0].type, 'steer', '引导标记在第二段过程块的原位');
+  assert.equal(live[2].items[1].name, 'edit_file');
   // 开头就是引导 / 只有引导没正文：进过程块渲染
   const lead = buildCompletedView([{ type: 'steer', text: '先想好' }, { type: 'content', text: '答' }]);
   assert.deepEqual(lead.map((b) => b.kind), ['process', 'content']);
@@ -361,8 +364,7 @@ test('partsFromStoredMessage：思考 → 正文 → 工具，工具 index 从 0
   assert.equal(parts[2].id, 't1');
 });
 
-test('toolMeta：不把原始 JSON 糊到脸上，路径/命令进 subject', () => {
-  const w = toolMeta('write_file', '{"path":"src/main.js","content":"<!DOCTYPE html>"}');
+test('toolMeta：不把原始 JSON 糊到脸上，路径/命令进 subject', () => {  const w = toolMeta('write_file', '{"path":"src/main.js","content":"<!DOCTYPE html>"}');
   assert.equal(w.label, 'write_file');
   assert.equal(w.subject, 'src/main.js');
   const s = toolMeta('shell', '{"command":"node --version\\n&& echo hi"}');
@@ -378,6 +380,21 @@ test('toolMeta：不把原始 JSON 糊到脸上，路径/命令进 subject', () 
   const raw = toolMeta('shell', 'npm run build -- --watch');
   assert.equal(raw.label, 'shell');
   assert.equal(raw.subject, 'npm run build -- --watch');
+});
+
+test('toolMeta：半截 JSON 也抽出主语（流式参数期行上先显示请求，2026-11-07）', () => {
+  // 名字已到、参数流到一半：path 已闭引号 → 立即显示路径，不再糊原始 JSON 碎片
+  const growing = toolMeta('write_file', '{"path": "慢写测试.txt", "content": "测试内容行。\\n测试内');
+  assert.equal(growing.subject, '慢写测试.txt');
+  // 值还在流（引号没闭）：抓到哪显示哪——主语跟着流长出来
+  const openValue = toolMeta('write_file', '{"path": "慢写测');
+  assert.equal(openValue.subject, '慢写测');
+  // 连键都没写完：同样回落，不崩
+  const tiny = toolMeta('write_file', '{"pat');
+  assert.equal(tiny.subject, '{"pat');
+  // 转义值正常解码
+  const escaped = toolMeta('write_file', '{"path": "a\\"b\\\\c.txt", "content": "');
+  assert.equal(escaped.subject, 'a"b\\c.txt');
 });
 
 test('prettyArgs：合法 JSON 展开，非法原样，超长截断', () => {
@@ -516,4 +533,46 @@ test('toolMeta：label 恒等于英文调用名，图标仍按族映射（2026-1
   // ask 的问题文本进 subject
   const a = toolMeta('ask', '{"question":"选哪个？","options":[]}');
   assert.equal(a.subject, '选哪个？');
+});
+
+test('fileUserIndexOf：排队排除、引导行/引导 part 计入（回滚序数的命根）', () => {
+  const u = (id, extra = {}) => ({ id, role: 'user', content: id, ...extra });
+  const a = (id, parts = []) => ({ id, role: 'assistant', parts });
+
+  // 文件形状：u1, steered(引导), u2 —— 视图里引导被合并层折成 u1 回答的 steer part
+  const rebuilt = [
+    u('u1'),
+    a('a1', [{ type: 'steer', text: '引导插话' }, { type: 'tool', name: 'shell' }]),
+    u('u2'),
+  ];
+  // 重建视图：u2 之前 = u1(1) + steer part(1) = 文件里的第 2 条（0 基）
+  assert.equal(fileUserIndexOf(rebuilt, 'u2'), 2, 'steer part 必须计数，否则序数少 1');
+  assert.equal(fileUserIndexOf(rebuilt, 'a1'), 1, '目标在引导前 = 只数 u1');
+
+  // 实时视图：引导是真行（d.steer 补行）——同样计入
+  const live = [u('u1'), u('s1', { steered: true }), a('a1'), u('u2')];
+  assert.equal(fileUserIndexOf(live, 'u2'), 2, '实时引导行也要计数');
+  assert.equal(fileUserIndexOf(live, 's1'), 1);
+
+  // 排队气泡没进文件 → 排除
+  const withQueued = [u('u1'), u('q1', { queued: true }), u('u2')];
+  assert.equal(fileUserIndexOf(withQueued, 'u2'), 1, '排队气泡不计入');
+
+  // 目标不存在 = 0（调用方按原语义处理）
+  assert.equal(fileUserIndexOf(rebuilt, '不存在'), 0);
+  // 空数组兜底
+  assert.equal(fileUserIndexOf([], 'x'), 0);
+});
+
+test('fileUserIndexOf 与 mergeAssistantRun 闭环：合并产物直接喂序数不丢引导', () => {
+  const u = (id, extra = {}) => ({ id, role: 'user', content: id, ...extra });
+  const a = (id, parts = []) => ({ id, role: 'assistant', parts, content: '', thinking: '', tools: [] });
+  // 文件：u1 → assistant → steered → assistant → u2（引导在轮中并入）
+  const fileShape = [u('u1'), a('a1'), u('s1', { steered: true }), a('a2'), u('u2')];
+  const view = mergeAssistantRun(fileShape.map((m) => ({ ...m, parts: m.parts || [] })));
+  // 合并后引导不再是行（透明化），但序数必须仍等于文件语义：u2 之前 u1+引导 = 2 条 user
+  assert.equal(fileUserIndexOf(view, 'u2'), 2, '合并后的 steer part 计回序数（u1+引导=文件里第 2 条）');
+  // 引导标记落在 a1 的 parts 尾部（边界处）
+  const steerPart = view.find((x) => x.role === 'assistant' && (x.parts || []).some((p) => p.type === 'steer'));
+  assert.ok(steerPart, '合并产物里有 steer part');
 });

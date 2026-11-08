@@ -129,13 +129,15 @@ pub(crate) fn apply_patch(s: &mut Settings, p: &SettingsPatch) -> Result<Vec<Str
         capabilities: p.capabilities.clone(),
         ..Default::default()
     };
-    let (url_changed, _, _) = crate::server::settings::apply_settings_update(s, &upd);
+    // compact_percent 越界等非法值现在会带错误返回（不再静默跳过），如实报给模型
+    let (url_changed, _, _) = crate::server::settings::apply_settings_update(s, &upd)?;
+
     if url_changed {
         changed.push("base_url（渠道地址变更：模型与模型列表已清空，需重新拉取）".into());
     }
     if p.model.is_some() {
         let upd_model = SettingsUpdate { model: p.model.clone(), ..Default::default() };
-        let _ = crate::server::settings::apply_settings_update(s, &upd_model);
+        crate::server::settings::apply_settings_update(s, &upd_model)?;
         changed.push(format!("model → {}", p.model.as_deref().unwrap_or("")));
     }
     if p.name.is_some() {

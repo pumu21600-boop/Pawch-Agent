@@ -1,0 +1,505 @@
+//! 收尾静默压缩（server 侧）：触发判定 + 后台执行。
+//!
+//! 触发只有一条：上下文总量（每步 ContextUsage 的 projected，实报优先）≥ 窗口 ×
+//! 压缩线。判定在 done 发出之后，任务 `tokio::spawn` 独立跑——用户切会话/切工作区
+//! 都不打断；SSE 发送失败（页面已关）只影响实时行，结果照常落盘 + 广播刷新。
+//! 超时 120s、连续失败 3 次熔断；「点停止」不取消（回答已完成，压缩是收尾动作）。
+
+use super::*;
+use crate::compact::{self, CompactRecord};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+pub(super) type SseEmit = Arc<dyn Fn(Value) + Send + Sync>;
+
+/// 正在压缩的会话（进程内）：同一会话同时只允许一个压缩 job 在飞。压缩不占
+/// cancel 运行登记（不挡新一轮对话），没有这道闸时两轮收尾各起一个 job，慢的
+/// 旧压缩后落地会把边界回退到更早一次压缩，标记行/圆环与真实请求视图错位
+///（2026-11-08 审计 P2-2）。
+static INFLIGHT: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> = std::sync::OnceLock::new();
+fn inflight_slot() -> &'static std::sync::Mutex<HashSet<String>> {
+    INFLIGHT.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+}
+
+/// 在飞登记守卫：Drop 摘除（含 panic 路径），随 RunJob 进任务、随任务结束释放。
+struct InflightGuard(String);
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        inflight_slot()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
+}
+
+/// 连续失败计数（进程内；重启即清零，熔断只是防渠道挂死白烧钱）。
+pub type FailStreaks = std::sync::Mutex<HashMap<String, u32>>;
+
+fn fail_streak(state: &AppState, sid: &str) -> u32 {
+    state
+        .compact_fail_streak
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(sid)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// 触发入参打包（maybe_start 只收 state + 这一个结构，避免 8 参长签名）。
+pub(super) struct CompactTrigger {
+    pub session_id: String,
+    pub gateway: Arc<crate::gateway::Gateway>,
+    pub primary: crate::gateway::Channel,
+    pub summary_role: Option<crate::gateway::Channel>,
+    pub emit: Option<SseEmit>,
+    pub pre_tokens: u64,
+    pub tools_schema_tokens: u64,
+    /// 主循环实测的系统提示占用（会话文件不存 system，只能由最后一次圆环快照带入；
+    /// 原先写死 2000 常量，长系统提示的会话会漏报）。
+    pub system_tokens: u64,
+    /// 发送侧超大工具结果的截断阈值——压缩后的估价要和主循环请求视图同样经过这道
+    /// 卫生，否则标记行/圆环会比下一轮真实请求偏高。
+    pub max_tool_result_chars: usize,
+    /// 本轮请求生效的窗口（渠道 context_length 覆盖全局后的值）——必须与圆环
+    /// 同一把尺子：真机 2026-11-07 实锤「圆环 77% 不压缩」，触发用全局 9.6 万
+    /// 而圆环显示渠道 5 万，阈值差 400 tokens 永远够不着。
+    pub window: u64,
+}
+
+/// done 之后调用：满足条件就发 `compact_started` 并 spawn 后台任务。返回是否触发。
+pub(super) fn maybe_start(state: &AppState, t: CompactTrigger) -> bool {
+    let CompactTrigger {
+        session_id,
+        gateway,
+        primary,
+        summary_role,
+        emit,
+        pre_tokens,
+        tools_schema_tokens,
+        system_tokens,
+        max_tool_result_chars,
+        window,
+    } = t;
+    let session_id = session_id.as_str();
+    let percent = state
+        .settings
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .compact_percent
+        .unwrap_or(85);
+    let threshold = compact::threshold_tokens(window, percent);
+    // 诊断（2026-11-07）：静默返回全部落一条 not_triggered——「为什么没压」不能再靠猜
+    macro_rules! not_triggered {
+        ($reason:expr) => {{
+            observability::event(
+                EventType::State,
+                json!({ "kind": "compact.not_triggered", "session": session_id, "reason": $reason, "pre_tokens": pre_tokens, "window": window, "percent": percent, "threshold": threshold }),
+            );
+            return false;
+        }};
+    }
+    if threshold == 0 {
+        not_triggered!("窗口未知（context_length 未配置）"); // 窗口未知 = 不压（用户没配 context_length 时宁可不做）
+    }
+    if pre_tokens < threshold {
+        not_triggered!("占用未到线");
+    }
+    if fail_streak(state, session_id) >= compact::MAX_FAIL_STREAK {
+        observability::event(
+            EventType::State,
+            json!({ "kind": "compact.circuit_broken", "session": session_id, "streak": fail_streak(state, session_id) }),
+        );
+        return false;
+    }
+    if inflight_slot().lock().unwrap_or_else(|e| e.into_inner()).contains(session_id) {
+        not_triggered!("上一轮压缩还在跑");
+    }
+    let Some(f) = state.session.get(session_id) else { not_triggered!("会话文件读取失败") };
+    // 请求视图（与核心循环同一把尺子）：旧摘要消息 + tail 起的历史
+    let view = build_view(&f.messages, f.compact.as_ref());
+    let Some((split, summarized_last_id, tail_start_id, after_id)) = compact::split_for_summary(&view) else {
+        not_triggered!("切分失败（无可压段/锚点缺 id）");
+    };
+    if !compact::summarized_has_assistant(&view, split) {
+        not_triggered!("被压段没有 assistant 回复");
+    }
+    let tail = &view[split..];
+    // 占用估算要不要数思考：与主循环同款回放判定（主渠道为准）。守卫和标记行都
+    // 必须用它——写死 false 的尺子会把重发思考的渠道（DeepSeek/zai/白名单）整段
+    // 漏掉（真机 2026-11-07：尾段 2.7 万 thinking 全没进「压缩后上下文 29k」）。
+    let count_reasoning = {
+        let compat = crate::gateway::compat::resolve(
+            primary.params.provider_id.as_deref(),
+            Some(primary.base_url.trim()),
+            &primary.model,
+            primary.params.thinking_format,
+        );
+        crate::gateway::replay::should_preserve_replay(&primary.model, &compat)
+    };
+    // 守卫（用户拍板）：压完还 ≥ 线的 80% → 白压（很快又撞线），交给用户把控节奏。
+    // 工具定义等固定开销压不掉，是这条线的一部分——小窗口+重工具时守卫会偏保守，
+    // 想压得更勤可以把线调高（线的 80% 高于固定底座后守卫自然放行）。
+    // 尾段先过发送侧同一套卫生（重复结果去重+超大结果截断）：病理性的超大工具
+    // 结果恰恰是最该压的场景，拿原始切片估会把守卫虚高成误拦（2026-11-08 审计）。
+    let tail_clean = {
+        let (deduped, _) = crate::context::dedupe_tool_results(tail);
+        let (truncated, _) =
+            crate::context::truncate_oversized_results(&deduped, max_tool_result_chars);
+        truncated
+    };
+    let post_est = compact::guard_estimate(tools_schema_tokens, system_tokens, &tail_clean, count_reasoning);
+    if post_est >= threshold.saturating_mul(80) / 100 {
+        observability::event(
+            EventType::State,
+            json!({ "kind": "compact.skipped_guard", "session": session_id, "post_est": post_est, "threshold": threshold }),
+        );
+        return false;
+    }
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let pre_k = pre_tokens.saturating_add(999) / 1000;
+    if let Some(emit) = &emit {
+        emit(json!({ "compact_started": { "id": job_id, "pre_k": pre_k, "text": compact::RUNNING_MARKER_TEXT } }));
+    }
+    // 标记同步走全局 UI 总线（2026-11-08 真机：聊天流在压缩期间可能已死——用户中途
+    // 刷新过页面，started 只发死流 = 「正在压缩」全程不可见，done 靠文件重建才冒出来）。
+    // 圆环的 usage_changed 早已同款双发，标记补齐。
+    crate::server::ui_events::emit(json!({
+        "kind": "compact_started", "session": session_id, "id": job_id, "pre_k": pre_k, "text": compact::RUNNING_MARKER_TEXT
+    }));
+    observability::event(
+        EventType::State,
+        json!({ "kind": "compact.started", "session": session_id, "job": job_id, "pre_tokens": pre_tokens, "threshold": threshold, "summarized_msgs": split }),
+    );
+
+    // 占在飞登记：从这里到任务结束（含 panic 展开走 Drop）同会话不再起第二个 job
+    let inflight = InflightGuard(session_id.to_string());
+    let job = RunJob {
+        session: state.session.clone(),
+        fail_streaks: state.compact_fail_streak.clone(),
+        _inflight: inflight,
+        session_id: session_id.to_string(),
+        gateway,
+        primary,
+        summary_role,
+        emit,
+        job_id,
+        pre_tokens,
+        tools_schema_tokens,
+        system_tokens,
+        max_tool_result_chars,
+        count_reasoning,
+        summarized: view[..split].to_vec(),
+        tail: tail.to_vec(),
+        summarized_last_id,
+        tail_start_id,
+        after_id,
+        transcript_dir: state.session.transcripts_dir(),
+    };
+    tokio::spawn(run_job(job));
+    true
+}
+
+struct RunJob {
+    session: Arc<crate::session::SessionManager>,
+    fail_streaks: Arc<FailStreaks>,
+    /// 在飞登记：随任务 Drop 摘除（同会话并发压缩闸）
+    _inflight: InflightGuard,
+    session_id: String,
+    gateway: Arc<crate::gateway::Gateway>,
+    primary: crate::gateway::Channel,
+    summary_role: Option<crate::gateway::Channel>,
+    emit: Option<SseEmit>,
+    job_id: String,
+    pre_tokens: u64,
+    tools_schema_tokens: u64,
+    system_tokens: u64,
+    max_tool_result_chars: usize,
+    /// 回放判定同款：压缩后视图的占用估算要不要数思考（与主循环同一把尺子）
+    count_reasoning: bool,
+    summarized: Vec<Value>,
+    tail: Vec<Value>,
+    summarized_last_id: String,
+    tail_start_id: String,
+    after_id: String,
+    transcript_dir: std::path::PathBuf,
+}
+
+impl RunJob {
+    fn send(&self, v: Value) {
+        if let Some(emit) = &self.emit {
+            emit(v);
+        }
+    }
+    /// 良性作废：边界消息被回滚/删除，结果不落盘、**不计失败熔断**（用户压缩期间
+    /// 回滚几次就把会话熔断到重启才能恢复，是 2026-11-08 审计抓到的错位）。
+    fn void(&self, reason: &str) {
+        self.send(json!({ "compact_failed": { "id": self.job_id, "text": "压缩结果作废：该段已被回滚或删除" } }));
+        crate::server::ui_events::emit(json!({
+            "kind": "compact_failed", "session": self.session_id, "id": self.job_id, "text": "压缩结果作废：该段已被回滚或删除"
+        }));
+        observability::event(
+            EventType::State,
+            json!({ "kind": "compact.voided", "session": self.session_id, "job": self.job_id, "reason": reason }),
+        );
+    }
+    fn fail(&self, reason: &str) {
+        let streak = {
+            let mut m = self.fail_streaks.lock().unwrap_or_else(|e| e.into_inner());
+            let n = m.entry(self.session_id.clone()).or_insert(0);
+            *n += 1;
+            *n
+        };
+        self.send(json!({ "compact_failed": { "id": self.job_id, "text": compact::FAILED_MARKER_TEXT } }));
+        crate::server::ui_events::emit(json!({
+            "kind": "compact_failed", "session": self.session_id, "id": self.job_id, "text": compact::FAILED_MARKER_TEXT
+        }));
+        observability::event(
+            EventType::Error,
+            json!({ "kind": "compact.failed", "session": self.session_id, "job": self.job_id, "streak": streak, "reason": reason }),
+        );
+    }
+}
+
+async fn run_job(j: RunJob) {
+    // 摘要请求：清形后的被压段 + 提示词（纯文本输出，禁工具）
+    let mut req = compact::clean_for_summary(&j.summarized);
+    req.push(json!({ "role": "user", "content": compact::COMPACT_PROMPT }));
+    let ctx = crate::gateway::UsageCtx::aux(&j.session_id, "compact");
+    // 摘要不思考（2026-11-08 真机）：摘要参数原样继承主渠道，「思考：最大」会跟着进来
+    // ——DeepSeek 系思考直接吃满 SUMMARY_MAX_TOKENS（台账实锤：compact 调用
+    // completion_tokens 条条顶格 4000），正文被挤成空 → 判「摘要为空」，压缩白跑。
+    // 摘要是纯文本整卷归纳，不需要思考；两个分支统一剥掉。
+    let out = match &j.summary_role {
+        Some(role) => {
+            let rp = crate::gateway::ChatParams {
+                max_tokens: Some(compact::SUMMARY_MAX_TOKENS),
+                thinking: None,
+                ..role.params.clone()
+            };
+            let ch = crate::gateway::Channel { params: rp, ..role.clone() };
+            tokio::time::timeout(
+                compact::COMPACT_TIMEOUT,
+                j.gateway.complete(&ctx, &ch.base_url, &ch.model, &ch.api_key, &json!(req), &ch.params),
+            )
+            .await
+        }
+        None => {
+            let params = crate::gateway::ChatParams {
+                max_tokens: Some(compact::SUMMARY_MAX_TOKENS),
+                thinking: None,
+                ..j.primary.params.clone()
+            };
+            let ch = crate::gateway::Channel { params, ..j.primary.clone() };
+            tokio::time::timeout(
+                compact::COMPACT_TIMEOUT,
+                j.gateway.complete(&ctx, &ch.base_url, &ch.model, &ch.api_key, &json!(req), &ch.params),
+            )
+            .await
+        }
+    };
+    let summary = match out {
+        Ok(Ok(text)) if !text.trim().is_empty() => text.trim().to_string(),
+        Ok(Ok(_)) => {
+            j.fail("摘要为空");
+            return;
+        }
+        Ok(Err(e)) => {
+            j.fail(&e.to_string());
+            return;
+        }
+        Err(_) => {
+            j.fail("超时（120s）");
+            return;
+        }
+    };
+
+    // 完整记录落盘：被压段的原文级细节都在这里
+    let transcript_path = {
+        let dir = j.transcript_dir.clone();
+        let sid = j.session_id.clone();
+        let pre_tokens = j.pre_tokens;
+        let summarized = j.summarized.clone();
+        let write = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+            std::fs::create_dir_all(&dir)?;
+            let n = std::fs::read_dir(&dir)
+                .map(|rd| {
+                    let prefix = format!("{sid}-");
+                    rd.flatten().filter(|e| e.file_name().to_string_lossy().starts_with(&prefix)).count() + 1
+                })
+                .unwrap_or(1);
+            let path = dir.join(format!("{sid}-{n:03}.md"));
+            std::fs::write(&path, render_transcript_document(&sid, &summarized, pre_tokens))?;
+            Ok(path.display().to_string())
+        })
+        .await;
+        match write {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => {
+                j.fail(&format!("记录文件写失败: {e}"));
+                return;
+            }
+            Err(e) => {
+                j.fail(&format!("记录文件写任务失败: {e}"));
+                return;
+            }
+        }
+    };
+
+    // 压缩后的请求视图（摘要消息 + 保留尾段）：先按发送侧同一套卫生净化（重复结果
+    // 去重 + 超大结果截断），再估算——否则标记行/圆环会比下一轮真实请求偏高。
+    let view = compact::CompactView {
+        summary: summary.clone(),
+        transcript_path: transcript_path.clone(),
+        tail_start_id: j.tail_start_id.clone(),
+    };
+    let ring_view = {
+        let mut v = vec![compact::summary_message(&view)];
+        v.extend(j.tail.iter().cloned());
+        let (deduped, _) = crate::context::dedupe_tool_results(&v);
+        let (truncated, _) =
+            crate::context::truncate_oversized_results(&deduped, j.max_tool_result_chars);
+        truncated
+    };
+    // 标记行和圆环取同一个 Breakdown：尺子与主循环同一把（思考判定/系统提示/工具定义
+    // 全在里），两个数从构造上不可能再打架。
+    let ring = compact::post_breakdown(&ring_view, j.system_tokens, j.tools_schema_tokens, j.count_reasoning);
+    let post_tokens = ring.total();
+    let record = CompactRecord {
+        summary,
+        summarized_last_id: j.summarized_last_id.clone(),
+        tail_start_id: j.tail_start_id.clone(),
+        after_id: j.after_id.clone(),
+        pre_tokens: j.pre_tokens,
+        post_tokens,
+        transcript_path,
+        created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    };
+    let marker = compact::marker_message(&compact::done_marker_text(post_tokens));
+    let marker_text = marker.get("content").and_then(Value::as_str).unwrap_or("").to_string();
+    let session = j.session.clone();
+    let sid = j.session_id.clone();
+    let apply = tokio::task::spawn_blocking(move || session.apply_compaction(&sid, record, marker)).await;
+    match apply {
+        Ok(Ok(true)) => {
+            j.fail_streaks.lock().unwrap_or_else(|e| e.into_inner()).remove(&j.session_id);
+            // 先发完成事件、再广播 sessions_changed：前端收到广播会按会话文件重建
+            // 消息列表（文件里此刻已有完成标记行，替换实时行是无缝的）；顺序反过来
+            // 重建会先冲掉「正在压缩」实时行、compact_done 按 id 找不到目标被丢弃
+            // ——「正在压缩弹出来就消失」（真机 2026-11-07）。
+            j.send(json!({ "compact_done": { "id": j.job_id, "text": marker_text, "post_k": post_tokens.saturating_add(999) / 1000 } }));
+            crate::server::ui_events::emit(json!({
+                "kind": "compact_done", "session": j.session_id, "id": j.job_id, "text": marker_text
+            }));
+            crate::server::ui_events::emit(json!({ "kind": "sessions_changed" }));
+            // 圆环立即回落：同一形状走 chat 流的 context_usage 通道，前端圆环/构成
+            // 一起落；快照随会话落盘，重启/切回也是新值（真机 2026-11-07：不推这
+            // 一条，压缩完圆环停在旧占用上）。数目就是标记行那个 Breakdown。
+            let window = j
+                .session
+                .get(&j.session_id)
+                .and_then(|f| f.usage)
+                .map(|u| u.window)
+                .unwrap_or(0);
+            let b = ring;
+            let projected = post_tokens;
+            let mut snap = j.session.get(&j.session_id).and_then(|f| f.usage).unwrap_or_default();
+            snap.apply_context(None, projected, window, &b);
+            // 快照同时走全局 UI 事件：聊天流在此刻可能已经死了（用户中途刷新过页面/
+            // 断流），context_usage 发到死流上就丢——真机 2026-11-07 实锤「压缩完成后
+            // 圆环要再刷一次界面才同步」。前端按事件把圆环直接打到新快照上。
+            crate::server::ui_events::emit(json!({
+                "kind": "usage_changed",
+                "session": j.session_id,
+                "usage": snap,
+            }));
+            if let Err(e) = j.session.update_usage(&j.session_id, snap) {
+                observability::debug(&format!("压缩后用量快照落盘失败: {e}"));
+            }
+            j.send(json!({
+                "context_usage": {
+                    "pressure": null,
+                    "projected": projected,
+                    "window": window,
+                    "breakdown": {
+                        "messages": b.messages,
+                        "tools": b.tools,
+                        "system": b.system,
+                        "other": b.other,
+                        "tools_schema": b.tools_schema,
+                    },
+                }
+            }));
+            observability::event(
+                EventType::State,
+                json!({ "kind": "compact.done", "session": j.session_id, "job": j.job_id, "pre": j.pre_tokens, "post": post_tokens }),
+            );
+        }
+        Ok(Ok(false)) => {
+            // 边界消息已被回滚/删除：结果作废（不落盘），实时行收口但**不计失败**
+            j.void("边界消息已不在（回滚或删除）");
+        }
+        Ok(Err(e)) => {
+            j.fail(&e.to_string());
+        }
+        Err(e) => {
+            j.fail(&format!("落盘任务失败: {e}"));
+        }
+    }
+}
+
+/// 记录文档：会话头 + 被压段原文级细节。
+fn render_transcript_document(sid: &str, summarized: &[Value], pre_tokens: u64) -> String {
+    let ts = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
+    let pre_k = pre_tokens.saturating_add(999) / 1000;
+    format!(
+        "# 压缩完整记录 — 会话 {sid}\n\n压缩时间：{ts}  \n压缩前上下文：约 {pre_k}k tokens  \n> 本文件是「————压缩后上下文————」标记之前的对话全文记录；摘要只保留要点，精确细节（完整代码、报错原文）以这里为准。\n\n---\n\n",
+    ) + &compact::render_transcript(summarized, summarized.len())
+}
+
+/// 请求视图（无 system 头）：旧摘要消息 + tail_start 起的历史；记录作废 → 原样返回。
+pub(super) fn build_view(messages: &[Value], record: Option<&CompactRecord>) -> Vec<Value> {
+    let Some(r) = record else { return messages.to_vec() };
+    let view = crate::compact::CompactView::from_record(r);
+    let Some(i) = messages
+        .iter()
+        .position(|m| m.get("id").and_then(Value::as_str) == Some(&view.tail_start_id))
+    else {
+        return messages.to_vec();
+    };
+    let mut out = Vec::with_capacity(messages.len() + 1);
+    out.push(crate::compact::summary_message(&view));
+    out.extend_from_slice(&messages[i..]);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn build_view_inserts_summary_and_voids_on_missing_anchor() {
+        let msgs = vec![
+            json!({"id":"u1","role":"user","content":"q1"}),
+            json!({"id":"a1","role":"assistant","content":"ans1"}),
+            json!({"id":"u2","role":"user","content":"q2"}),
+        ];
+        let rec = CompactRecord {
+            summary: "摘要".into(),
+            summarized_last_id: "a1".into(),
+            tail_start_id: "u2".into(),
+            after_id: "u2".into(),
+            pre_tokens: 1,
+            post_tokens: 1,
+            transcript_path: "t.md".into(),
+            created_at: "x".into(),
+        };
+        let view = build_view(&msgs, Some(&rec));
+        assert_eq!(view.len(), 2);
+        assert!(view[0]["content"].as_str().unwrap().contains("【上下文已压缩】"));
+        assert_eq!(view[1]["id"], json!("u2"));
+        // 锚点被回滚删掉 → 记录作废，视图=全量
+        let broken = CompactRecord { tail_start_id: "gone".into(), ..rec.clone() };
+        assert_eq!(build_view(&msgs, Some(&broken)), msgs);
+    }
+}

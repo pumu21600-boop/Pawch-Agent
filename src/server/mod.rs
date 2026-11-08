@@ -46,6 +46,7 @@ pub(crate) use crate::core::agent::{self, AgentEvent, LoopOutcome};
 
 mod chat;
 pub(crate) mod auth;
+pub(crate) mod compact; // 2026-11-07 收尾静默压缩（触发判定 + 后台任务）
 pub(crate) mod data_admin;
 mod plugins;
 mod gate;
@@ -93,6 +94,8 @@ use workspace::*;
 
 // 无头会话的进程内入口：定时任务不走 HTTP 直接唤醒
 pub(crate) use headless::{HeadlessRequest, run_headless_inner};
+// 档位归一化只有 turn.rs 一处解释（chat 与无头共用）；定时任务推导高危策略也要用它
+pub(crate) use chat::normalize_mode;
 
 
 #[derive(Clone)]
@@ -108,6 +111,8 @@ pub struct AppState {
     /// 先写者，前者的键在内存与磁盘上一致地丢（用户改 MCP 的同时 agent 改设置即中）。
     /// 整条链路持这把锁串行化；外部文件监听线程换内存时也持它（见 start_external_reload）。
     pub settings_write: std::sync::Arc<std::sync::Mutex<()>>,
+    /// 收尾静默压缩的连续失败计数（会话 id → 连续失败次数；成功清零，≥3 熔断）
+    pub compact_fail_streak: Arc<crate::server::compact::FailStreaks>,
     pub agent_cfg: Arc<AgentConfig>,
     pub sandbox_cfg: Arc<crate::config::SandboxConfig>,
     pub context_cfg: Arc<crate::config::ContextConfig>,
@@ -183,6 +188,10 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
             "/api/chat",
             post(chat).layer(axum::extract::DefaultBodyLimit::max(40 * 1024 * 1024)),
         )
+        // 刷新回来认领正在跑的一轮：断线取消的 30 秒宽限内有效（2026-11-07）
+        .route("/api/chat/revive", post(revive))
+        // 刷新后重新附着直播：补发 after 之后漏掉的事件，再接上正在跑的一轮
+        .route("/api/chat/attach", get(attach))
         // 无头会话：程序化唤醒一条会话跑完整轮，结构化返回（子代理/定时/CLI 的共同底座）
         .route("/api/headless/run", post(run_headless))
         // 定时任务：清单（含下次运行/通知）/ 新建改 / 删 / 立即运行

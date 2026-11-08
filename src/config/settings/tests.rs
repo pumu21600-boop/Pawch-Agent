@@ -277,6 +277,18 @@
         assert!(s.active_config_id.is_some(), "应有激活配置");
     }
 
+    /// 2026-11-07：子代理「派发前询问」档下线，旧设置里的 ask 读盘时归回跟随主渠道
+    #[test]
+    fn legacy_subagent_ask_mode_falls_back_to_parent() {
+        let s = settings_from_text(r#"{"roles": {"subagent_mode": "ask"}}"#)
+            .expect("旧设置应可解析");
+        assert_eq!(
+            s.roles.as_ref().and_then(|r| r.subagent_mode.as_deref()),
+            None,
+            "ask 档已下线，应归回跟随主渠道"
+        );
+    }
+
     /// 2026-11-02 审计：一个字段类型写错（如 context_length 写成字符串）不该让整份
     /// 配置回退默认（渠道/key/MCP/定时全「消失」）。已知数值/布尔字段做保守纠型。
     #[test]

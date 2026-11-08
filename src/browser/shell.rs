@@ -152,12 +152,32 @@ pub fn open_path(path: &std::path::Path) -> bool {
     }))
 }
 
-/// 建 child webview。label 由服务端生成（tab 身份的一部分）。
-pub fn create(label: &str, url: &str, x: f64, y: f64, w: f64, h: f64, visible: bool) {
-    send(&json!({
+/// 建 child webview。label 由服务端生成（tab 身份的一部分）；rect = (x, y, w, h)。
+/// bg = 画布底色 [r,g,b]（跟应用主题）：不设的话 WebView2 画布跟系统深浅色走，
+/// 系统深色时 about:blank 等空白页在浅色主题下就是一块黑（2026-11-07 实锤）。
+pub fn create(label: &str, url: &str, rect: (f64, f64, f64, f64), visible: bool, bg: Option<[u8; 3]>) {
+    let (x, y, w, h) = rect;
+    let mut op = json!({
         "op": "create", "label": label, "url": url,
         "x": x, "y": y, "w": w, "h": h, "visible": visible
-    }));
+    });
+    if let Some([r, g, b]) = bg {
+        op["bg"] = json!([r, g, b]);
+    }
+    send(&op);
+}
+
+/// 应用主题（"light"/"dark"，来自前端上报的 theme_actual；没报过按默认深色）。
+pub fn app_theme_actual() -> &'static str {
+    let theme = crate::server::ui_events::last_state()
+        .and_then(|s| s.get("theme_actual").and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_else(|| "dark".into());
+    if theme == "light" { "light" } else { "dark" }
+}
+
+/// 应用主题对应的 webview 画布色（浅色 = 面板底色 g1（#fffefc）；深色 = g1（#1c1a18））。
+pub fn themed_webview_bg() -> Option<[u8; 3]> {
+    Some(if app_theme_actual() == "light" { [255, 254, 252] } else { [28, 26, 24] })
 }
 
 /// 清空壳里全部 child webview（服务端会话重建时调用——壳不重启时上一个会话的
@@ -180,7 +200,10 @@ pub fn menu(x: f64, y: f64, w: f64, h: f64, anchor: (f64, f64, f64, f64), tab: &
         "op": "menu", "label": MENU_LABEL,
         "x": x, "y": y, "w": w, "h": h,
         "ax": anchor.0, "ay": anchor.1, "aw": anchor.2, "ah": anchor.3,
-        "tab": tab
+        "tab": tab,
+        // 当前应用主题：壳用它校正窗口主题（防止浅色时代建过网页把窗口主题
+        // 卡在 Light，之后切深色菜单/DevTools 全跟浅色），并随 URL 传给菜单页
+        "theme": app_theme_actual()
     }));
 }
 

@@ -125,6 +125,42 @@ function emitToolCall(res, name, args) {  sendSSE(res, {
   res.end();
 }
 
+/** 慢写剧本：write_file 名字先到、参数 20 片 × 500ms 流 10 秒——
+ *  验证「调用先显示请求再显示结果」：tool_call 先建行、tool_call_args 节流补长。 */
+function emitSlowWrite(res) {
+  sendSSE(res, {
+    choices: [
+      {
+        index: 0,
+        delta: {
+          tool_calls: [
+            { index: 0, id: 'call-1', type: 'function', function: { name: 'write_file', arguments: '' } },
+          ],
+        },
+      },
+    ],
+  });
+  const text = JSON.stringify({ path: '慢写测试.txt', content: '测试内容行。\n'.repeat(30) });
+  const step = Math.ceil(text.length / 20);
+  let i = 0;
+  const timer = setInterval(() => {
+    i += 1;
+    if (i <= 20) {
+      sendSSE(res, {
+        choices: [
+          { index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: text.slice((i - 1) * step, i * step) } }] } },
+        ],
+      });
+    } else {
+      clearInterval(timer);
+      sendSSE(res, { choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] });
+      sendSSE(res, { choices: [], usage: usageOf() });
+      res.write('data: [DONE]\n\n');
+      res.end();
+    }
+  }, 500);
+}
+
 /** 长流剧本：慢速多片，供中途取消测试。 */
 function emitSlowStream(res) {
   let i = 0;
@@ -175,6 +211,9 @@ http
         const spawnOne = hasToolsParam && !hasToolMsg && /派子代理/.test(lastText);
         // 重试失败剧本：前两轮发同一个必失败的 read_file（文件不存在），验证失败重试放行
         const retryFail = hasToolsParam && /重试失败/.test(lastText);
+        // 慢写剧本：write_file 名字先到、参数 20 片 × 500ms 流 10 秒——验证「调用先显示
+        // 请求再显示结果」的节奏（tool_call 先建行、tool_call_args 按节流补长）。
+        const slowWrite = hasToolsParam && !hasToolMsg && /慢写/.test(lastText);
         const toolMsgCount = msgs.filter((m) => m.role === 'tool').length;
         // 工具结果回填后（hasToolMsg）不再吐工具调用，直接走最终回答；死循环/慢循环/多步剧本除外
         const wantsTool =
@@ -203,6 +242,34 @@ http
           res.end();
           return;
         }
+        // 非流式补全（stream:false）：网关的 complete()（标题/摘要等辅助角色）走这条路，
+        // 原先 mock 只会说 SSE，压缩摘要请求「解析补全响应失败」（2026-11-07 压缩 E2E 实锤）。
+        if (parsed.stream === false) {
+          const lastUserText = lastUser?.content || '';
+          const isSummary = /对话历史压缩器/.test(lastUserText);
+          // 「慢压缩」剧本：摘要请求拖 20 秒再答——复现真机「正在压缩」行中途消失的时序
+          if (isSummary && /慢压缩/.test(process.env.MOCK_SLOW_COMPACT || '')) {
+            setTimeout(() => {
+              try {
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                  choices: [{ index: 0, message: { role: 'assistant', content: '【压缩摘要·mock】慢速摘要。' }, finish_reason: 'stop' }],
+                  usage: usageOf(parsed),
+                }));
+              } catch {}
+            }, 20000);
+            return;
+          }
+          const text = isSummary
+            ? `【压缩摘要·mock】用户此前让生成 pelican 骑行动画相关内容并进行了长文填充测试；要点已保留，细节见完整记录。`
+            : '你好，这是模拟渠道的非流式回复。';
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
+            usage: usageOf(parsed),
+          }));
+          return;
+        }
         res.writeHead(200, {
           'Content-Type': 'text/event-stream',
           'Cache-Control': 'no-cache',
@@ -216,7 +283,9 @@ http
           }
           finishWithUsage(res, parsed);
         };
-        if (retryFail) {
+        if (slowWrite) {
+          emitSlowWrite(res);
+        } else if (retryFail) {
           // 前两轮同一个必失败调用（路径不存在）；第三轮起让模型收尾说话
           if (toolMsgCount < 2) {
             emitToolCall(res, 'read_file', { path: '绝不存在的文件.txt' });

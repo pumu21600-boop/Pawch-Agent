@@ -11,10 +11,12 @@
     --hover: #262320; --btn-line: #454039; --err: #e5534b; --ok: #4bb543;
     color-scheme: dark;
   }
+  /* 根元素也跟随主题：画布 color-scheme/兜底底色只认 html（body 被微调成透明时深色画布会露底） */
+  html.light { color-scheme: light; background: #fffefc; }
   body.light {
-    scrollbar-color: var(--line2, #b3bac4) transparent;
-    --bg: #ffffff; --fg: #1a1a1c; --dim: #6b6b74; --line: #e4e4e8;
-    --hover: #f2f2f5; --btn-line: #d4d4da; --err: #cf222e; --ok: #1a7f37;
+    scrollbar-color: var(--line2, #d9d3c9) transparent;
+    --bg: #fffefc; --fg: #1f1d1a; --dim: #87827a; --line: #e7e2da;
+    --hover: #f3f0eb; --btn-line: #d9d3c9; --err: #b3261e; --ok: #1e7a3f;
     color-scheme: light;
   }
   * { box-sizing: border-box; }
@@ -76,6 +78,7 @@ window.addEventListener('message', (ev) => {
   const d = ev.data || {};
   if (d.type === 'pawch:init') {
     // 主题跟着宿主走（宿主切主题会重发 init）；但 boot 只跑一次
+    document.documentElement.classList.toggle('light', ((d.payload || {}).theme) === 'light'); // 画布跟主题（只认根元素）
     document.body.classList.toggle('light', ((d.payload || {}).theme) === 'light');
     if (!booted) {
       booted = true;
@@ -252,7 +255,8 @@ index.html：
   :root { color-scheme: dark; }
   body { --bg:#151412; --fg:#f3f1ec; --dim:#8a8478; --line:#332f2a; margin:0; padding:16px;
          font:13px/1.7 "Segoe UI","Microsoft YaHei",system-ui,sans-serif; background:var(--bg); color:var(--fg); }
-  body.light { --bg:#ffffff; --fg:#1a1a1c; --dim:#6b6b74; --line:#e4e4e8; color-scheme:light; }
+  html.light { color-scheme:light; background:#fffefc; }
+  body.light { --bg:#fffefc; --fg:#1f1d1a; --dim:#87827a; --line:#e7e2da; color-scheme:light; }
 </style>
 </head>
 <body>
@@ -263,6 +267,7 @@ let seq = 0; const pending = new Map(); let booted = false;
 window.addEventListener('message', (ev) => {
   const d = ev.data || {};
   if (d.type === 'pawch:init') {
+    document.documentElement.classList.toggle('light', ((d.payload || {}).theme) === 'light'); // 画布跟主题（只认根元素）
     document.body.classList.toggle('light', ((d.payload || {}).theme) === 'light');
     if (!booted) { booted = true; boot(); }
   }

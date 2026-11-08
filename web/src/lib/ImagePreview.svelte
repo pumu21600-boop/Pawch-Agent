@@ -6,7 +6,10 @@
 </script>
 
 {#if src}
-  <div class="backdrop" on:click={() => dispatch('close')}>
+  <!-- modal-backdrop 类 = 壳 webview 让位清单的一员：大图预览是全屏浮层，壳里
+       webview 是原生窗口永远浮在 DOM 上，不进清单就会被浏览器面板盖住
+       （真机 2026-11-07 实锤「预览图片被内置浏览器盖住」） -->
+  <div class="backdrop modal-backdrop" on:click={() => dispatch('close')}>
     <div class="image-modal" on:click|stopPropagation>
       <img {src} alt="大图预览" />
       <button class="image-modal-close" on:click={() => dispatch('close')} aria-label="关闭"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg></button>

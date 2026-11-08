@@ -37,19 +37,29 @@ pub(crate) struct UsageOutcome {
     pub(crate) status: &'static str,
     pub(crate) tokens: (u64, u64, u64),
     pub(crate) error: Option<String>,
+    /// 流式计时 (首包延迟 ms, 输出耗时 ms)；非流式/无计时为 None（使用统计面板用）
+    pub(crate) timing: Option<(u64, u64)>,
 }
 
 impl UsageOutcome {
     pub(crate) fn ok(tokens: (u64, u64, u64)) -> Self {
-        Self { status: "ok", tokens, error: None }
+        Self { status: "ok", tokens, error: None, timing: None }
     }
     pub(crate) fn err(status: &'static str, error: String) -> Self {
-        Self { status, tokens: (0, 0, 0), error: Some(error) }
+        Self { status, tokens: (0, 0, 0), error: Some(error), timing: None }
     }
     /// 失败/取消时若已经收到过 usage（如 Anthropic message_start 带回的输入 token），
     /// 一并记上——否则反复取消会让花费统计系统性偏低（2026-11-02 审计）。
     pub(crate) fn err_with(status: &'static str, error: String, tokens: (u64, u64, u64)) -> Self {
-        Self { status, tokens, error: Some(error) }
+        Self { status, tokens, error: Some(error), timing: None }
+    }
+    /// 带流式计时（turn 的 ttft/gen 毫秒）：只有拿得到 AssistantTurn 的调用点能填。
+    pub(crate) fn timed(mut self, turn: &crate::gateway::AssistantTurn, started: std::time::Instant) -> Self {
+        self.timing = Some((
+            turn.ttft_ms(started).unwrap_or(0),
+            turn.gen_ms().unwrap_or(0),
+        ));
+        self
     }
 }
 
@@ -68,6 +78,10 @@ pub(crate) fn record_usage(ctx: &UsageCtx, base_url: &str, provider_id: Option<&
     rec.cached_tokens = outcome.tokens.2;
     rec.status = outcome.status.to_string();
     rec.latency_ms = latency_ms;
+    if let Some((ttft, gen_ms)) = outcome.timing {
+        rec.ttft_ms = (ttft > 0).then_some(ttft);
+        rec.gen_ms = (gen_ms > 0).then_some(gen_ms);
+    }
     rec.error = outcome.error.map(|e| e.chars().take(200).collect());
     crate::usage::record(rec);
 }

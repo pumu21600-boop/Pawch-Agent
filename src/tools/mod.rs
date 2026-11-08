@@ -287,14 +287,12 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "subagent_spawn",
-            description: "派发一个子代理：在一条独立会话里跑完你给的子任务，把它的最终回答作为工具结果返回给你（你看不到它的中间过程，成本记在你这条任务上）。适用：可并行的独立调研/多方案对比/批量同类小任务（一轮里发多个 subagent_spawn 会并行跑）。注意：子代理无人值守、没有用户来回答审批——需要审批的操作一律按拒绝处理并回给它自己调整；审批档位不得高于你当前会话的档位（只能更严）。子代理失败/超时会以错误文本返回，你可重派或换路。",
+            description: "派发一个子代理：在一条独立会话里跑完你给的子任务，把它的最终回答作为工具结果返回给你（你看不到它的中间过程，成本记在你这条任务上）。适用：可并行的独立调研/多方案对比/批量同类小任务（一轮里发多个 subagent_spawn 会并行跑）。注意：子代理的审批档位跟随你当前会话的档位（不能自选/升降）；它无人值守、没有用户来回答审批——命中审批的操作一律按拒绝处理并回给它自己调整。子代理失败/超时会以错误文本返回，你可重派或换路。",
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "task": { "type": "string", "description": "子任务：要它做什么、产出什么（说清边界，它看不到你的对话历史）" },
                     "model": { "type": "string", "description": "覆盖模型（留空=功能桥接子代理席位，未配跟主渠道）" },
-                    "approval_mode": { "type": "string", "enum": ["read-only", "auto", "full-access"], "description": "子代理审批档（不得高于父会话，缺省跟随）" },
-                    "on_approval": { "type": "string", "enum": ["deny", "approve"], "description": "命中审批时怎么办（仅 deny 生效）" },
                     "timeout_secs": { "type": "integer", "description": "整轮超时秒数（0=默认 1800）" },
                     "label": { "type": "string", "description": "一句话标签，方便在结果里识别" }
                 },

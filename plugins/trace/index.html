@@ -26,51 +26,63 @@
         --arrow-h: var(--t-gray-fg);
         --fico: #6e695f;
         --sep: #454039;
-        --ok: var(--t-green-fg);
-        --err: var(--t-red-fg);
-        --t-blue-bg: var(--t-blue-bg);
-        --t-blue-fg: var(--t-blue-fg);
-        --t-green-bg: var(--t-green-bg);
-        --t-green-fg: var(--t-green-fg);
-        --t-red-bg: var(--t-red-bg);
-        --t-red-fg: var(--t-red-fg);
-        --t-yellow-bg: var(--t-yellow-bg);
-        --t-yellow-fg: var(--t-yellow-fg);
-        --t-gray-bg: var(--t-gray-bg);
-        --t-gray-fg: var(--t-gray-fg);
+        --ok: #8fe3ae;
+        --err: #ff9b9b;
+        /* 深色实值（与主界面 ui.css 深色 tint 同板）。原先这里是
+           --t-blue-bg: var(--t-blue-bg) 这类自引用——CSS 循环引用=未定义，
+           深色下所有徽章/序号掉成灰色（2026-11-08 用户实锤）。 */
+        --t-blue-bg: #1f2c44;
+        --t-blue-fg: #9fc2f5;
+        --t-green-bg: #1d3a28;
+        --t-green-fg: #8fe3ae;
+        --t-red-bg: #541d1d;
+        --t-red-fg: #ff9b9b;
+        --t-yellow-bg: #241f14;
+        --t-yellow-fg: #facc15;
+        --t-orange-bg: #3d2a12;
+        --t-orange-fg: #f0a35e;
+        --t-gray-bg: #2a2723;
+        --t-gray-fg: #b8b3a9;
       }
             /* 跟随主界面：滑杆颜色随主题切（真机实测深色白滑杆） */
-      body.light {
-        scrollbar-color: var(--line2, #b3bac4) transparent;
+      /* 根元素也跟随主题：画布 color-scheme/兜底底色只认 html（body 被微调成透明时深色画布会露底） */
+      html.light {
         color-scheme: light;
-        --bg: #f6f7f9;
-        --fg: #1f2328;
-        --strong: #0d1117;
-        --dim: #626b78;
-        --hover: #e9eaee;
-        --sel: #dfe2e8;
-        --line: #e2e4e8;
-        --line2: #d3d6dc;
-        --btn: #4a5260;
-        --btn-hover: #0d1117;
-        --btn-line-h: #b3bac4;
-        --input-bg: #ffffff;
-        --arrow: #8b93a1;
-        --arrow-h: #4a5260;
-        --fico: #9aa1ac;
-        --sep: #9aa1ac;
-        --ok: #1a7f37;
-        --err: #cf222e;
-        --t-blue-bg: #dde9ff;
-        --t-blue-fg: #0b62d0;
-        --t-green-bg: #dcf3e5;
-        --t-green-fg: #1a7f37;
-        --t-red-bg: #ffe1e1;
-        --t-red-fg: #cf222e;
-        --t-yellow-bg: #fff3c4;
-        --t-yellow-fg: #9a6700;
-        --t-gray-bg: #e8eaee;
-        --t-gray-fg: #4a5260;
+        background: #fffefc;
+      }
+      body.light {
+        scrollbar-color: var(--line2, #d9d3c9) transparent;
+        color-scheme: light;
+        --bg: #fffefc;
+        --fg: #1f1d1a;
+        --strong: #1f1d1a;
+        --dim: #87827a;
+        --hover: #f3f0eb;
+        --sel: #f2e9df;
+        --line: #e7e2da;
+        --line2: #d9d3c9;
+        --btn: #56524b;
+        --btn-hover: #1f1d1a;
+        --btn-line-h: #b9b1a4;
+        --input-bg: #fffefc;
+        --arrow: #87827a;
+        --arrow-h: #56524b;
+        --fico: #9c968c;
+        --sep: #9c968c;
+        --ok: #1e7a3f;
+        --err: #b3261e;
+        --t-blue-bg: #e7edfb;
+        --t-blue-fg: #2f5fd0;
+        --t-green-bg: #e2f4e8;
+        --t-green-fg: #1e7a3f;
+        --t-red-bg: #fdeaea;
+        --t-red-fg: #b3261e;
+        --t-yellow-bg: #f7f1dd;
+        --t-yellow-fg: #8a6d1a;
+        --t-orange-bg: #fbf0e1;
+        --t-orange-fg: #a05a1a;
+        --t-gray-bg: #f0ede8;
+        --t-gray-fg: #56524b;
       }
 
       * {
@@ -167,7 +179,8 @@
         background: var(--sel);
       }
       .idx {
-        color: var(--t-blue-fg);
+        /* 任务序号：两主题统一品牌橙（2026-11-08 用户拍板，原先浅色蓝/深色掉灰） */
+        color: var(--t-orange-fg);
         font-weight: 600;
       }
       .time {
@@ -269,7 +282,8 @@
         word-break: break-all;
       }
       .pair {
-        color: var(--t-yellow-fg);
+        /* 工具耗时（ms/s）：与序号同橙，两主题统一（2026-11-08 用户拍板） */
+        color: var(--t-orange-fg);
         font-variant-numeric: tabular-nums;
       }
       .folded {
@@ -322,6 +336,7 @@
         // 初始拉数据必须挂在这里，脚本一跑就调用会因未登记被宿主丢弃（真机踩过）。
         if (d.type === 'pawch:init') {
           // 主题跟随宿主（init 里带已解析的 theme；宿主切主题会重发 init）
+          document.documentElement.classList.toggle('light', ((d.payload || {}).theme) === 'light'); // 画布跟主题（只认根元素）
           document.body.classList.toggle('light', ((d.payload || {}).theme) === 'light');
           if (!booted) { booted = true; load(); }
           return;

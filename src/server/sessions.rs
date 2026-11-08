@@ -256,6 +256,19 @@ pub(super) async fn clear_session(State(state): State<AppState>, axum::extract::
 ///   多选用（「勾了谁就删谁，不要连带彼此」）；user_index 忽略
 ///
 /// 会话在跑时拒绝（409）：跑完的 Snapshot 会整份覆写，截了也白截——先停再截。
+/// 会话消息的纯文本（与前端 contentText 同口径：字符串原样；内容块数组拼 text 块）。
+/// 删前核对（expect）用。
+fn session_msg_text(m: &Value) -> String {
+    match m.get("content") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .collect::<String>(),
+        _ => String::new(),
+    }
+}
+
 pub(super) async fn truncate_session(
     State(state): State<AppState>,
     Json(req): Json<serde_json::Value>,
@@ -315,6 +328,34 @@ pub(super) async fn truncate_session(
         }
         Some(flag) => state.cancel.end(id, &flag),
     }
+    // 删前核对（2026-11-08 防线二）：前端按视图序数发 N，视图与文件的 user 行一旦
+    // 错位就会静默删错段（引导行被展示层合并透明化 → 序数少 1，真机两次「一次回滚
+    // 冲掉两轮问答」）。expect = 目标 user 消息的内容前缀——第 N 条对不上就拒绝，
+    // 错要「响」，不能删完再说。放在文件恢复之前：校验不过连文件都不许动。
+    let expect = req.get("expect").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if !expect.is_empty() && mode != "delete_selected" {
+        let snap = state.session.get(id).map(|f| f.messages).unwrap_or_default();
+        let actual = snap
+            .iter()
+            .filter(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+            .nth(user_index)
+            .map(session_msg_text);
+        let ok = matches!(&actual, Some(t) if t.trim().starts_with(&expect));
+        if !ok {
+            observability::event(
+                EventType::State,
+                json!({
+                    "kind": "session.truncate_refused", "session": id, "mode": mode, "user_index": user_index,
+                    "expect": expect.chars().take(40).collect::<String>(),
+                    "actual": actual.unwrap_or_default().chars().take(40).collect::<String>(),
+                }),
+            );
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "页面的消息序号和会话文件对不上（页面数据可能过期），没有删除任何内容。请刷新页面后再试一次。" })),
+            );
+        }
+    }
     // 先恢复文件再截对话：文件恢复失败就整个不动（半回滚比不回滚更坑）
     if !restore_cp.is_empty() {
         let ws = crate::tools::workspace_root().to_path_buf();
@@ -337,6 +378,9 @@ pub(super) async fn truncate_session(
                     EventType::State,
                     json!({ "kind": "session.messages_deleted", "session": id, "deleted": n }),
                 );
+                // 删完消息上下文就变小了：圆环必须立刻按新视图重算（否则挂着旧值
+                // 直到下一轮实报跳变——会被误读成压缩，2026-11-07 真机）
+                refresh_ring_after_truncate(&state, id);
                 (StatusCode::OK, Json(json!({ "ok": true, "deleted": n })))
             }
             Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() }))),
@@ -355,8 +399,100 @@ pub(super) async fn truncate_session(
                 EventType::State,
                 json!({ "kind": "session.truncated", "session": id, "mode": mode, "user_index": user_index, "restore_checkpoint": !restore_cp.is_empty(), "messages": n }),
             );
+            // 回滚/编辑/删除把上下文实际变小了（跨过压缩边界还会让压缩记录作废、
+            // 原文全量回归）：圆环按当前请求视图重算并推送
+            refresh_ring_after_truncate(&state, id);
             (StatusCode::OK, Json(json!({ "ok": true, "messages": n })))
         }
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() }))),
     }
+}
+
+/// 截断（回滚/编辑/删除）后圆环立即重算（2026-11-07 用户拍板）。
+///
+/// 为什么需要：圆环分子 = 渠道实报锚点 + 自锚点以来的增量，锚点是截断**前**那次
+/// 请求的实报——消息删掉后锚点已失真。不重算的话圆环会一直挂着旧值，直到下一轮
+/// 实报回来才「跳变」，用户会把这次跳变误读成压缩（真机 2026-11-07：回滚到压缩
+/// 边界之前，压缩记录作废、原文全量回归约 16.8 万，圆环却还停在压缩完成时的 4.4 万）。
+///
+/// 尺子与核心循环/压缩一致：请求视图走 `compact::build_view`（记录有效=摘要+尾段；
+/// 锚点被删=全量原文），思考按渠道回放判定计入，system 与工具定义从上一轮快照带入
+/// （会话文件不存 system）。旧实报锚点随被删消息作废，下一次请求的实报重新校准。
+/// 重算**保留锚点的校准偏差**（只按构成增减平移），否则删消息后圆环可能不降反升。
+/// 回滚到一条消息都不剩时直接清零（与「新建对话」同口径，见下方空视图分支）。
+pub(super) fn refresh_ring_after_truncate(state: &AppState, id: &str) {
+    let Some(f) = state.session.get(id) else { return };
+    let prev = f.usage.unwrap_or_default();
+    let window = prev.window;
+    let view = crate::server::compact::build_view(&f.messages, f.compact.as_ref());
+    // 回滚/删除到一条消息都不剩：与「新建对话」同一把尺子——没发过请求就没有圆环占用。
+    // 固定底（系统提示词 + 工具定义）只在真正发请求时才算；回退后没有任何一轮读过它们，
+    // 圆环不应留着占比（2026-11-07 用户拍板）。窗口与历史 api 统计保留。
+    if view.is_empty() {
+        let mut snap = prev;
+        snap.apply_context(None, 0, window, &crate::context::Breakdown::default());
+        if let Err(e) = state.session.update_usage(id, snap) {
+            observability::debug(&format!("截断成空后用量快照落盘失败: {e}"));
+        }
+        crate::server::ui_events::emit(json!({
+            "kind": "context_usage",
+            "session": id,
+            "context_usage": { "pressure": null, "projected": 0, "window": window, "breakdown": null },
+        }));
+        return;
+    }
+    let count_reasoning = {
+        let s = state.settings.read().unwrap_or_else(|e| e.into_inner()).clone();
+        // 一套配置都没有（极端/测试态）= 按不计入处理，绝不 panic（请求路径不许崩）
+        if s.configs.is_empty() {
+            false
+        } else {
+            let active = s.active_or_default().clone();
+            let ch = crate::server::chat::assemble_turn_channels(state, &s, &active, "", "", "");
+            let compat = crate::gateway::compat::resolve(
+                ch.primary.params.provider_id.as_deref(),
+                Some(ch.primary.base_url.trim()),
+                &ch.primary.model,
+                ch.primary.params.thinking_format,
+            );
+            crate::gateway::replay::should_preserve_replay(&ch.primary.model, &compat)
+        }
+    };
+    let mut b = crate::context::estimate_breakdown(&view, count_reasoning);
+    b.system = prev.system;
+    b.tools_schema = prev.tools_schema;
+    let new_parts = b.total();
+    // 保留上一轮实报锚点的校准偏差：`projected` 是「实报 + 增量」的结果，本地估价
+    // 往往偏高（system/工具定义尤其明显）。直接拿 b.total() 当新 projected 会把偏差
+    // 丢掉——删掉消息后圆环反而可能变大（2026-11-07 用户实报「回滚后圆环没有变化」）。
+    // 只按构成增减平移：new = old + (new_parts - old_parts)，锚点仍作废（pressure=None），
+    // 下一次请求的实报再重新校准。
+    let old_parts = prev.messages + prev.tools + prev.system + prev.other + prev.tools_schema;
+    let projected = if prev.projected > 0 && old_parts > 0 {
+        let offset = prev.projected as i128 - old_parts as i128;
+        (new_parts as i128 + offset).clamp(0, u64::MAX as i128) as u64
+    } else {
+        new_parts
+    };
+    let mut snap = prev;
+    snap.apply_context(None, projected, window, &b);
+    if let Err(e) = state.session.update_usage(id, snap) {
+        observability::debug(&format!("截断后用量快照落盘失败: {e}"));
+    }
+    crate::server::ui_events::emit(json!({
+        "kind": "context_usage",
+        "session": id,
+        "context_usage": {
+            "pressure": null,
+            "projected": projected,
+            "window": window,
+            "breakdown": {
+                "messages": b.messages,
+                "tools": b.tools,
+                "system": b.system,
+                "other": b.other,
+                "tools_schema": b.tools_schema,
+            },
+        },
+    }));
 }

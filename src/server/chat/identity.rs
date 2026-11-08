@@ -156,7 +156,7 @@ pub(crate) async fn probe(state: &AppState, ch: &Channel, session_id: &str) -> a
     {
         ChatOutcome::Done(t) => t.content,
         ChatOutcome::Interrupted(t) => t.content,
-        ChatOutcome::Cancelled => anyhow::bail!("身份探测被取消"),
+        ChatOutcome::Cancelled(_) => anyhow::bail!("身份探测被取消"),
     };
     let answer = sanitize(&answer);
     if answer.is_empty() {
