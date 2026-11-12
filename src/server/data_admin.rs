@@ -113,7 +113,29 @@ fn write_pointer(dir: &Path) -> Result<(), String> {
     if let Some(parent) = p.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("建指针目录失败: {e}"))?;
     }
-    std::fs::write(&p, dir.display().to_string()).map_err(|e| format!("写数据目录指针失败: {e}"))
+    std::fs::write(&p, dir.display().to_string()).map_err(|e| format!("写数据目录指针失败: {e}"))?;
+    hide_pointer();
+    Ok(())
+}
+
+/// 指针目录/文件设隐藏：用户在资源管理器里默认看不到，不会顺手删。
+fn hide_pointer() {
+    use std::os::windows::process::CommandExt;
+    let p = ptr_path();
+    if let Some(parent) = p.parent() {
+        let _ = std::process::Command::new("attrib")
+            .args(["+h"])
+            .arg(parent)
+            .creation_flags(0x0800_0000)
+            .status();
+    }
+    if p.exists() {
+        let _ = std::process::Command::new("attrib")
+            .args(["+h"])
+            .arg(&p)
+            .creation_flags(0x0800_0000)
+            .status();
+    }
 }
 
 fn dir_size(path: &Path) -> u64 {
@@ -135,8 +157,23 @@ fn dir_size(path: &Path) -> u64 {
     total
 }
 
+/// 资源管理器/系统自己往文件夹里塞的隐藏文件：Explorer 看着是空的，别当成「不是空目录」。
+/// 用户手动新建的目录常带 desktop.ini（设过图标/视图）/ Thumbs.db，直接拦会让人以为程序不让建。
+fn is_os_junk(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "desktop.ini" | "thumbs.db" | ".ds_store"
+    )
+}
+
 fn count_entries(dir: &Path) -> usize {
-    std::fs::read_dir(dir).map(|rd| rd.flatten().count()).unwrap_or(0)
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| !is_os_junk(&e.file_name().to_string_lossy()))
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 /// 目录当前体积 + 文件数（导入进度用；解压过程中目录在增长）。
@@ -286,6 +323,9 @@ fn try_cleanup(old: &OldDirs) -> (Vec<String>, Vec<String>, Vec<String>) {
 /// 启动旧目录清理线程：`.migration-old.json` 里 delete=true 才动手，每 5s 试删一次；
 /// 被占用的等壳/进程退出后自动删掉。服务重启后从文件恢复，不依赖外部常驻进程。
 pub(crate) fn start_cleanup_worker() {
+    // 旧版壁纸在 cache 里（不会被导出/迁移）：启动时先挪到数据目录根
+    migrate_wallpaper_from_cache();
+    hide_pointer();
     std::thread::spawn(|| {
         loop {
             std::thread::sleep(std::time::Duration::from_secs(5));
@@ -500,10 +540,46 @@ pub(super) async fn data_info() -> Json<Value> {
         "data_dir": data.display().to_string(),
         "cache_dir": cache.display().to_string(),
         "pointer": ptr_path().display().to_string(),
+        "pointer_exists": ptr_path().is_file(),
         "data_bytes": data_bytes,
         "cache_bytes": cache_bytes,
         "started_at": started_at(),
     }))
+}
+
+/// POST /api/data/adopt —— 指针丢了 / 想用已有数据目录：只写指针并重启，不复制、不覆盖。
+#[derive(Debug, Deserialize)]
+pub(super) struct AdoptReq {
+    pub data_dir: String,
+}
+
+pub(super) async fn data_adopt(
+    Json(req): Json<AdoptReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let target = PathBuf::from(req.data_dir.trim());
+    if !target.is_absolute() {
+        return Err(err_json("数据目录要填完整路径"));
+    }
+    if !target.is_dir() {
+        return Err(err_json(format!("目录不存在：{}", target.display())));
+    }
+    let looks_like_data = target.join("settings.json").is_file()
+        || target.join("index.json").is_file()
+        || target.join("logs").is_dir();
+    if !looks_like_data {
+        return Err(err_json(format!(
+            "这个目录不像 Pawch 数据目录：{}",
+            target.display()
+        )));
+    }
+    write_pointer(&target).map_err(err_json)?;
+    let exe = std::env::current_exe().map_err(|e| err_json(format!("取服务路径失败: {e}")))?;
+    let restarting = spawn_service_restart(&exe, &exe, &target).is_ok();
+    Ok(Json(json!({
+        "ok": true,
+        "data_dir": target.display().to_string(),
+        "restarting": restarting,
+    })))
 }
 
 /// POST /api/data/pick —— 原生目录/文件选择框（服务进程弹窗，与工作区选择同一套）。
@@ -640,8 +716,9 @@ pub(super) async fn data_migrate(Json(req): Json<MigrateReq>) -> Result<Json<Val
         }
         if new_install.exists() && count_entries(&new_install) > 0 {
             return Err(err_json(format!(
-                "新安装目录不是空目录：{}（请选空目录，或让程序新建）",
-                new_install.display()
+                "新安装目录不是空目录：{}（已有 {} 项；请清空或换一个不存在的路径）",
+                new_install.display(),
+                count_entries(&new_install)
             )));
         }
     }
@@ -654,34 +731,51 @@ pub(super) async fn data_migrate(Json(req): Json<MigrateReq>) -> Result<Json<Val
         }
         if new_data.exists() && count_entries(&new_data) > 0 {
             return Err(err_json(format!(
-                "新数据目录不是空目录：{}（请选空目录，或让程序新建）",
-                new_data.display()
+                "新数据目录不是空目录：{}（已有 {} 项；请清空或换一个不存在的路径）",
+                new_data.display(),
+                count_entries(&new_data)
             )));
         }
     }
     if install_changed && data_changed && paths_conflict(&new_install, &new_data) {
         return Err(err_json("安装目录和数据目录不能相同或互相包含"));
     }
+    // 手动填的路径不存在时自动建空目录（用户要的行为）：先建好，复制阶段直接往里写
+    if install_changed && !new_install.exists() {
+        std::fs::create_dir_all(&new_install).map_err(|e| {
+            err_json(format!("创建安装目录失败（{}）: {e}", new_install.display()))
+        })?;
+    }
+    if data_changed && !new_data.exists() {
+        std::fs::create_dir_all(&new_data)
+            .map_err(|e| err_json(format!("创建数据目录失败（{}）: {e}", new_data.display())))?;
+    }
 
     let install_src = cur_install.clone();
     let install_dst = new_install.clone();
     let data_src = cur_data.clone();
     let data_dst = new_data.clone();
-    let include_cache = req.include_cache;
+    let include_cache = false; // 迁移固定不复制 cache：可再生，且 WebView2 锁文件会打断迁移
+    let _ = req.include_cache; // 字段保留兼容旧前端，实际忽略
     let res = tokio::task::spawn_blocking(move || -> Result<(CopyStats, CopyStats), String> {
         let _guard = DATA_OP.lock().unwrap_or_else(|e| e.into_inner());
         let mut st_install = CopyStats::default();
+        let mut st_data = CopyStats::default();
+        if data_changed {
+            copy_tree(&data_src, &data_dst, &["cache"], &mut st_data)?;
+            st_data.skipped.retain(|s| s.as_str() != "cache");
+        }
         if install_changed {
             copy_tree(&install_src, &install_dst, &[], &mut st_install)?;
             if !install_dst.join("pawch-agent.exe").is_file() {
                 return Err("复制完的新安装目录里没有 pawch-agent.exe（安装目录可能不完整）".to_string());
             }
+        }
+        // 指针与快捷方式最后写：前面任何一步失败都不让系统指向半成品
+        if install_changed {
             update_shortcuts_registry(&install_dst)?;
         }
-        let mut st_data = CopyStats::default();
         if data_changed {
-            let skip: &[&str] = if include_cache { &[] } else { &["cache"] };
-            copy_tree(&data_src, &data_dst, skip, &mut st_data)?;
             write_pointer(&data_dst)?;
         }
         Ok((st_install, st_data))
@@ -689,7 +783,16 @@ pub(super) async fn data_migrate(Json(req): Json<MigrateReq>) -> Result<Json<Val
     .await;
     let (st_install, st_data) = match res {
         Ok(Ok(v)) => v,
-        Ok(Err(e)) => return Err(err_json(e)),
+        Ok(Err(e)) => {
+            // 失败时收掉本次复制出来的半成品，否则重试会被「目标不是空目录」拦住
+            if install_changed {
+                let _ = std::fs::remove_dir_all(&new_install);
+            }
+            if data_changed {
+                let _ = std::fs::remove_dir_all(&new_data);
+            }
+            return Err(err_json(e));
+        }
         Err(e) => return Err(err_json(format!("迁移任务失败: {e}"))),
     };
 
@@ -715,6 +818,7 @@ pub(super) async fn data_migrate(Json(req): Json<MigrateReq>) -> Result<Json<Val
             "files_install": st_install.files,
             "files_data": st_data.files,
             "bytes_data": st_data.bytes,
+            "skipped": st_data.skipped.len(),
             "include_cache": include_cache,
         }),
     );
@@ -739,6 +843,7 @@ pub(super) async fn data_migrate(Json(req): Json<MigrateReq>) -> Result<Json<Val
         "files_install": st_install.files,
         "files_data": st_data.files,
         "bytes_data": st_data.bytes,
+        "skipped": st_data.skipped.len(),
         "restarting": restarting,
     })))
 }
@@ -904,6 +1009,7 @@ fn spawn_swap_helper(staging: &Path, data: &Path, backup: &Path) -> Result<(), S
          New-Item -ItemType Directory -Path {backup_q} -Force | Out-Null; \
          Get-ChildItem -LiteralPath {data_q} -Force | Where-Object {{ $_.Name -ne 'cache' }} | ForEach-Object {{ Move-Item -LiteralPath $_.FullName -Destination {backup_q} -Force -ErrorAction SilentlyContinue }}; \
          Get-ChildItem -LiteralPath {staging_q} -Force | ForEach-Object {{ Move-Item -LiteralPath $_.FullName -Destination {data_q} -Force -ErrorAction SilentlyContinue }}; \
+         if (Test-Path (Join-Path {backup_q} 'server.token')) {{ Copy-Item -LiteralPath (Join-Path {backup_q} 'server.token') -Destination (Join-Path {data_q} 'server.token') -Force }}; \
          Remove-Item -LiteralPath {staging_q} -Recurse -Force -ErrorAction SilentlyContinue; \
          $rec = @{{ install = $null; data = {backup_q}; delete = $false }} | ConvertTo-Json -Compress; \
          [System.IO.File]::WriteAllText((Join-Path {data_q} '.migration-old.json'), $rec, (New-Object System.Text.UTF8Encoding($false))); \
@@ -1284,6 +1390,28 @@ fn wallpaper_clear_files(dir: &Path) {
     }
 }
 
+/// 背景媒体落数据目录根（不走 cache）：导出/迁移/换机都带上。
+fn wallpaper_dir() -> PathBuf {
+    crate::config::data_root()
+}
+
+/// 旧版本把壁纸放在 cache（导出默认不含 cache，备份会丢）：启动时挪出来。
+fn migrate_wallpaper_from_cache() {
+    let data = wallpaper_dir();
+    let legacy = data.join("cache");
+    for ext in WALLPAPER_EXTS {
+        let from = legacy.join(format!("wallpaper.{ext}"));
+        let to = data.join(format!("wallpaper.{ext}"));
+        if from.is_file() && !to.exists() {
+            let _ = std::fs::rename(&from, &to).or_else(|_| {
+                std::fs::copy(&from, &to).map(|_| {
+                    let _ = std::fs::remove_file(&from);
+                })
+            });
+        }
+    }
+}
+
 /// POST /api/wallpaper —— 原始字节上传，Content-Type 定扩展名，上限 300MB。
 pub(super) async fn wallpaper_upload(
     headers: HeaderMap,
@@ -1302,9 +1430,10 @@ pub(super) async fn wallpaper_upload(
     if body.len() > WALLPAPER_MAX {
         return Err(err_json("背景媒体太大（上限 300MB），剪短一点或换一张"));
     }
-    let dir = crate::config::data_root().join("cache");
-    std::fs::create_dir_all(&dir).map_err(|e| err_json(format!("建缓存目录失败: {e}")))?;
+    let dir = wallpaper_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| err_json(format!("建数据目录失败: {e}")))?;
     wallpaper_clear_files(&dir); // 扩展名可能变化，旧的先清掉
+    wallpaper_clear_files(&dir.join("cache")); // 顺手清旧位置，别让旧图盖住新图
     std::fs::write(dir.join(format!("wallpaper.{ext}")), &body)
         .map_err(|e| err_json(format!("写背景文件失败: {e}")))?;
     let kind = if mime.starts_with("video/") { "video" } else { "image" };
@@ -1317,11 +1446,12 @@ pub(super) async fn wallpaper_upload(
 
 /// GET /api/wallpaper/file —— 背景媒体本体（按扩展名给 MIME）。
 pub(super) async fn wallpaper_file() -> impl IntoResponse {
-    let dir = crate::config::data_root().join("cache");
-    for ext in WALLPAPER_EXTS {
-        let p = dir.join(format!("wallpaper.{ext}"));
-        if let Ok(bytes) = std::fs::read(&p) {
-            return ([(CONTENT_TYPE, wallpaper_mime(ext).to_string())], bytes).into_response();
+    for dir in [wallpaper_dir(), wallpaper_dir().join("cache")] {
+        for ext in WALLPAPER_EXTS {
+            let p = dir.join(format!("wallpaper.{ext}"));
+            if let Ok(bytes) = std::fs::read(&p) {
+                return ([(CONTENT_TYPE, wallpaper_mime(ext).to_string())], bytes).into_response();
+            }
         }
     }
     (StatusCode::NOT_FOUND, "no wallpaper").into_response()
@@ -1329,8 +1459,9 @@ pub(super) async fn wallpaper_file() -> impl IntoResponse {
 
 /// DELETE /api/wallpaper —— 清掉背景文件（前端清壁纸时调用；文件不存在也算成功）。
 pub(super) async fn wallpaper_delete() -> Json<Value> {
-    let dir = crate::config::data_root().join("cache");
+    let dir = wallpaper_dir();
     wallpaper_clear_files(&dir);
+    wallpaper_clear_files(&dir.join("cache"));
     Json(json!({ "ok": true }))
 }
 
@@ -1349,6 +1480,17 @@ mod tests {
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn count_entries_ignores_os_junk() {
+        let d = tmp("count-junk");
+        std::fs::write(d.join("desktop.ini"), "x").unwrap();
+        std::fs::write(d.join("Thumbs.db"), "x").unwrap();
+        assert_eq!(count_entries(&d), 0, "系统隐藏文件不算内容");
+        std::fs::write(d.join("real.txt"), "x").unwrap();
+        assert_eq!(count_entries(&d), 1);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

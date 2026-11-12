@@ -60,6 +60,8 @@ pub(crate) mod settings; // settings 工具（tools/settings.rs）复用 apply_s
 mod subagent;
 mod system;
 pub(crate) mod ui_events; // 2026-10-03：服务端→前端 UI 事件流（ui 工具开面板 / settings 变更刷新）
+mod ui_prefs; // UI 偏好（微调规则/自定义 CSS）落数据目录，迁移/清缓存不丢
+mod update; // 版本更新：检查 Release / 下载（镜像回退 + SHA256）/ 静默安装
 mod usage;
 pub(crate) mod workspace; // settings 工具的 workspace 动作复用 canon_workspace/apply_workspace
 mod webpanel;
@@ -254,12 +256,23 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/data/pick", post(data_admin::data_pick))
         .route("/api/data/move", post(data_admin::data_move))
         .route("/api/data/migrate", post(data_admin::data_migrate))
+        .route("/api/data/adopt", post(data_admin::data_adopt))
         .route("/api/data/cleanup_old", post(data_admin::data_cleanup_old))
         .route("/api/data/forget_old", post(data_admin::data_forget_old))
         .route("/api/data/restart_app", post(data_admin::data_restart_app))
         .route("/api/data/export", post(data_admin::data_export))
         .route("/api/data/import", post(data_admin::data_import))
         .route("/api/data/import/progress", get(data_admin::data_import_progress))
+        // UI 偏好（微调规则/自定义 CSS）：存数据目录，不走 WebView2 的 Local Storage
+        .route(
+            "/api/ui-prefs",
+            get(ui_prefs::get_ui_prefs).put(ui_prefs::put_ui_prefs),
+        )
+        // 版本更新（2026-11-12）：检查 / 下载 / 进度 / 静默安装
+        .route("/api/update/check", get(update::update_check))
+        .route("/api/update/download", post(update::update_download))
+        .route("/api/update/progress", get(update::update_progress))
+        .route("/api/update/install", post(update::update_install))
         .route("/api/data/open", post(data_admin::data_open))
         // 界面微调规则导出（2026-11-12）：写 <数据目录>/exports/ 并回真实路径——
         // 浏览器下载落哪前端拿不到，用户问「导出到哪了」

@@ -55,6 +55,7 @@
   import ExtTab from './lib/ExtTab.svelte';
   import ScheduleTab from './lib/ScheduleTab.svelte';
   import DataTab from './lib/DataTab.svelte';
+  import AboutTab from './lib/AboutTab.svelte';
   import TerminalPanel from './lib/TerminalPanel.svelte';
   import Select from './Select.svelte'; // git 面板范围选择器（自绘下拉：选中态可走统一口径，原生 select 弹层画不了）
   import { fmtBytes, relTime, fmtTok, norm, configLabel, cfgMediaBadge, gitStatusLabel, normPath, relShort, contentText, webNormalizeUrl, riskLabelFor } from './lib/format.js';
@@ -630,6 +631,7 @@
 
   onMount(async () => {
     await initStartupData();
+    void loadUiPrefs(); // 微调规则/自定义 CSS 以数据目录为准（localStorage 只作兜底）
     // 手风琴启动归一（同时只展开一个工作区）：老配置里可能存着
     // 多个展开态（改版前的行为），启动收敛成只展开当前项目
     expandedFlags = workspace ? { [workspace]: true } : { __ungrouped__: true };
@@ -3448,7 +3450,8 @@
     const mainTweaks = Object.fromEntries(Object.entries(microTweaks || {}).filter(([k]) => !k.startsWith('frame:')));
     const micro = microCss(mainTweaks);
     el.textContent = (micro ? `${micro}\n` : '') + escalateCss(customCss);
-    localStorage.setItem('customCss', customCss);
+    try { localStorage.setItem('customCss', customCss); } catch (e) {}
+    saveUiPrefs();
     applyFrameMicro();
     applyExtMicroAll();
   }
@@ -3497,7 +3500,84 @@
     }
   })();
 
-
+  // —— UI 偏好落数据目录（2026-11-12）：微调规则/自定义 CSS 不再只存在 WebView2 的
+  // Local Storage 里（它跟着 cache 走，迁移/清缓存会丢）。启动时从 /api/ui-prefs 拉，
+  // 改的时候本地留一份兜底，同时防抖推给服务端；迁移时随数据目录一起走。 ——
+  let uiPrefsLoaded = false;
+  let uiPrefsTimer = 0;
+  function persistMicroTweaks() {
+    try { localStorage.setItem('microTweaks', JSON.stringify(microTweaks)); } catch (e) {}
+    saveUiPrefs();
+  }
+  function saveUiPrefs(immediate = false) {
+    if (!uiPrefsLoaded) return;
+    const send = () => {
+      apiJson('/api/ui-prefs', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ microTweaks, customCss, wallpaper, wallpaperKind, wallpaperOpacity }),
+      }, '服务没有 UI 偏好接口（请重启服务）').catch(() => {});
+    };
+    clearTimeout(uiPrefsTimer);
+    if (immediate) send();
+    else uiPrefsTimer = setTimeout(send, 500);
+  }
+  async function loadUiPrefs() {
+    try {
+      const p = await apiJson('/api/ui-prefs', {}, '服务没有 UI 偏好接口（请重启服务）');
+      const hasPrefs = p && typeof p === 'object'
+        && (p.microTweaks || typeof p.customCss === 'string' || typeof p.wallpaper === 'string');
+      if (hasPrefs) {
+        if (p.microTweaks && typeof p.microTweaks === 'object') microTweaks = p.microTweaks;
+        if (typeof p.customCss === 'string') customCss = p.customCss;
+        // 壁纸本体在数据目录（/api/wallpaper/file），这里只带 URL/类型/透明度
+        if (typeof p.wallpaper === 'string') {
+          wallpaper = p.wallpaper;
+          try {
+            if (wallpaper) localStorage.setItem('wallpaper', wallpaper);
+            else localStorage.removeItem('wallpaper');
+          } catch (e) {}
+        }
+        if (typeof p.wallpaperKind === 'string') wallpaperKind = p.wallpaperKind;
+        if (typeof p.wallpaperOpacity === 'number') wallpaperOpacity = p.wallpaperOpacity;
+        try { localStorage.setItem('microTweaks', JSON.stringify(microTweaks)); } catch (e) {}
+        try { localStorage.setItem('customCss', customCss); } catch (e) {}
+        uiPrefsLoaded = true;
+        applyCustomCss();
+        // 老版本图片壁纸是 dataURL 存在 localStorage：转存成文件，之后备份/迁移才带得走
+        if (wallpaper.startsWith('data:')) await migrateLegacyImageWallpaper();
+        // 服务端还没有壁纸字段（旧 ui-prefs.json）而本机有：补写一次
+        if (typeof p.wallpaper !== 'string' && wallpaper) saveUiPrefs(true);
+        return;
+      }
+      uiPrefsLoaded = true;
+      // 升级后首次：服务端还没有，把本机 localStorage 里已有的推上去
+      saveUiPrefs(true);
+      if (wallpaper.startsWith('data:')) await migrateLegacyImageWallpaper();
+    } catch (e) {
+      // 旧服务没有这个接口：照旧用 localStorage，不反复重试
+      uiPrefsLoaded = true;
+    }
+  }
+  async function migrateLegacyImageWallpaper() {
+    try {
+      const blob = await (await fetch(wallpaper)).blob();
+      const r = await fetch('/api/wallpaper', {
+        method: 'POST',
+        headers: { 'Content-Type': blob.type || 'image/jpeg' },
+        body: blob,
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) return;
+      wallpaper = d.url + '?v=' + Date.now();
+      wallpaperKind = 'image';
+      try {
+        localStorage.setItem('wallpaper', wallpaper);
+        localStorage.setItem('wallpaperKind', 'image');
+      } catch (e) {}
+      saveUiPrefs(true);
+    } catch (e) {}
+  }
 
   // 补盖标记：只在元素还匹配原选择器时才盖，避免路径漂移后错标到别的元素
   function stampMicroUids() {
@@ -3964,7 +4044,7 @@
       const cur = { ...microTweaks };
       cur[p.key] = entry;
       microTweaks = cur;
-      localStorage.setItem('microTweaks', JSON.stringify(cur));
+      persistMicroTweaks();
       microPanel = null;
       applyCustomCss();
       toast(`已应用微调：${p.name}`);
@@ -4070,7 +4150,7 @@
     const cur = { ...microTweaks };
     cur[saveKey] = entry;
     microTweaks = cur;
-    localStorage.setItem('microTweaks', JSON.stringify(cur));
+    persistMicroTweaks();
     applyCustomCss();
     microPanel = null;
     if (!isHover && p.scope === 'all' && !selStable) toast('这个元素没有稳定类名：同类无法可靠命中，已只作用于这一个元素');
@@ -4083,7 +4163,7 @@
       const cur = { ...microTweaks };
       delete cur[p.key];
       microTweaks = cur;
-      localStorage.setItem('microTweaks', JSON.stringify(cur));
+      persistMicroTweaks();
       const n = p.extName;
       microPanel = null;
       applyCustomCss();
@@ -4101,7 +4181,7 @@
     const cur = { ...microTweaks };
     delete cur[saveKey];
     microTweaks = cur;
-    localStorage.setItem('microTweaks', JSON.stringify(cur));
+    persistMicroTweaks();
     applyCustomCss();
     microPanel = null;
   }
@@ -4109,7 +4189,7 @@
   // 一键清空所有微调规则（手写 CSS 不动）；用于清掉历史遗留的实色深底等顽固样式
   function clearAllMicro() {
     microTweaks = {};
-    localStorage.setItem('microTweaks', '{}');
+    persistMicroTweaks();
     unstampAll();
     applyCustomCss();
     settingsMsg = '已清空全部微调规则';
@@ -4478,7 +4558,7 @@
       customCss = css;
       if (overwriteMicro) {
         microTweaks = tweaks;
-        try { localStorage.setItem('microTweaks', JSON.stringify(tweaks)); } catch (err) {}
+        persistMicroTweaks();
         unstampAll();
       }
       applyCustomCss();
@@ -5988,7 +6068,7 @@
   let manageMode = false;
   let checkedIds = [];
   let sidebarCollapsed = false;
-  let sidebarW = Number(localStorage.getItem('sidebarW')) || 300; // 侧栏宽度（右缘拖拽可调，240–520）
+  let sidebarW = Number(localStorage.getItem('sidebarW')) || 280; // 初始宽度刚好放下品牌名（右缘拖拽可调，240–720）
   let resizing = false;
 
   // 侧栏右缘拖拽调宽：按住手柄移动鼠标，松手持久化（240–720）。
@@ -6695,12 +6775,15 @@
       }
     } else bindMicroFrames();
   }
-  $: localStorage.setItem('wallpaperOpacity', String(wallpaperOpacity));
+  $: {
+    localStorage.setItem('wallpaperOpacity', String(wallpaperOpacity));
+    saveUiPrefs();
+  }
   function onWallpaperPick(e) {
     const file = e.currentTarget.files && e.currentTarget.files[0];
     e.currentTarget.value = '';
     if (!file) return;
-    // 视频：localStorage 装不下，走后端存 <数据目录>\cache\wallpaper.<ext> + URL 引用
+    // 视频：走后端存 <数据目录>\wallpaper.<ext>（不进 cache：导出/迁移才带得走）+ URL 引用
     if (file.type.startsWith('video/')) {
       wallpaperMsg = '保存中…';
       fetch('/api/wallpaper', {
@@ -6711,18 +6794,21 @@
         .then(async (r) => {
           const d = await r.json().catch(() => ({}));
           if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
-          wallpaper = d.url;
+          wallpaper = d.url + '?v=' + Date.now();
           wallpaperKind = 'video';
-          localStorage.setItem('wallpaper', wallpaper);
-          localStorage.setItem('wallpaperKind', 'video');
+          try {
+            localStorage.setItem('wallpaper', wallpaper);
+            localStorage.setItem('wallpaperKind', 'video');
+          } catch (e) {}
           wallpaperMsg = '';
+          saveUiPrefs(true);
         })
         .catch((err) => {
           wallpaperMsg = `视频背景保存失败：${err.message || err}`;
         });
       return;
     }
-    // 图片：原路径（canvas 压到 1920 存 data URL，localStorage 直接装）
+    // 图片：canvas 压到 1920 后上传到数据目录（和视频一样走文件，备份/迁移带得走）
     const reader = new FileReader();
     reader.onload = () => {
       const img = new Image();
@@ -6738,32 +6824,46 @@
         ctx.fillStyle = '#ffffff';
         ctx.fillRect(0, 0, w, h);
         ctx.drawImage(img, 0, 0, w, h);
-        try {
-          wallpaper = cv.toDataURL('image/jpeg', 0.85);
-          wallpaperKind = 'image';
-          localStorage.setItem('wallpaper', wallpaper);
-          localStorage.setItem('wallpaperKind', 'image');
-          wallpaperMsg = '';
-        } catch (err) {
-          wallpaperMsg = '壁纸保存失败（图片过大），换张小图试试';
-        }
+        cv.toBlob(async (blob) => {
+          if (!blob) { wallpaperMsg = '壁纸保存失败，换张小图试试'; return; }
+          try {
+            const r = await fetch('/api/wallpaper', {
+              method: 'POST',
+              headers: { 'Content-Type': 'image/jpeg' },
+              body: blob,
+            });
+            const d = await r.json().catch(() => ({}));
+            if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+            wallpaper = d.url + '?v=' + Date.now();
+            wallpaperKind = 'image';
+            try {
+              localStorage.setItem('wallpaper', wallpaper);
+              localStorage.setItem('wallpaperKind', 'image');
+            } catch (e) {}
+            wallpaperMsg = '';
+            saveUiPrefs(true);
+          } catch (err) {
+            wallpaperMsg = `壁纸保存失败：${err.message || err}`;
+          }
+        }, 'image/jpeg', 0.85);
       };
       img.src = String(reader.result);
     };
     reader.readAsDataURL(file);
   }
   function clearWallpaper() {
-    if (wallpaperKind === 'video') fetch('/api/wallpaper', { method: 'DELETE' }).catch(() => {});
+    fetch('/api/wallpaper', { method: 'DELETE' }).catch(() => {});
     wallpaper = '';
     wallpaperKind = 'image';
     localStorage.removeItem('wallpaper');
     localStorage.removeItem('wallpaperKind');
     wallpaperMsg = '';
+    saveUiPrefs(true);
   }
 
   // —— 设置分区（左侧导航）——
   // 'params' 页签已并入「模型配置」；旧 localStorage 值回退到 model
-  let settingsTab = ['appearance', 'model', 'roles', 'memory', 'skills', 'mcp', 'ext', 'schedule', 'data'].includes(localStorage.getItem('settingsTab'))
+  let settingsTab = ['appearance', 'model', 'roles', 'memory', 'skills', 'mcp', 'ext', 'schedule', 'data', 'about'].includes(localStorage.getItem('settingsTab'))
     ? localStorage.getItem('settingsTab')
     : 'model';
   function pickSettingsTab(t) {
@@ -7068,12 +7168,16 @@
         wallpaper = v === '' || v.startsWith('data:') ? v : `/api/workspace/raw?path=${encodeURIComponent(v)}`;
         wallpaperKind = 'image'; // 这个桥只支持图片；视频背景由设置页「选择媒体」走 /api/wallpaper
         if (v === '') {
+          fetch('/api/wallpaper', { method: 'DELETE' }).catch(() => {});
           localStorage.removeItem('wallpaper');
           localStorage.removeItem('wallpaperKind');
         } else {
           localStorage.setItem('wallpaper', wallpaper);
           localStorage.setItem('wallpaperKind', 'image');
         }
+        saveUiPrefs(true);
+        // dataURL 顺手转存成文件，备份/迁移才带得走
+        if (v.startsWith('data:')) migrateLegacyImageWallpaper();
       },
     },
     open_tab: {
@@ -10626,6 +10730,7 @@
           <button class:active={settingsTab === 'ext'} on:click={() => pickSettingsTab('ext')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="3.5" y="4.5" width="17" height="15" rx="2.6"/><path d="M3.5 9.5h17"/><path d="M8 14h5" stroke-linecap="round"/></svg> 插件</button>
           <button class:active={settingsTab === 'schedule'} on:click={() => pickSettingsTab('schedule')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg> 定时任务</button>
           <button class:active={settingsTab === 'data'} on:click={() => pickSettingsTab('data')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="6" rx="7" ry="3"/><path d="M5 6v6c0 1.7 3.1 3 7 3s7-1.3 7-3V6"/><path d="M5 12v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6"/></svg> 数据管理</button>
+          <button class:active={settingsTab === 'about'} on:click={() => pickSettingsTab('about')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v6"/><circle cx="12" cy="7.8" r="1" fill="currentColor" stroke="none"/></svg> 关于</button>
         </div>
         <div class="settings-content">
       <AppearanceTab
@@ -10711,6 +10816,7 @@
 
       <ScheduleTab tab={settingsTab} workspace={workspace} recentWorkspaces={recentWorkspaces} on:open-session={(e) => openScheduleSession(e.detail.id)} />
       <DataTab tab={settingsTab} confirm={confirmAsk} />
+      <AboutTab tab={settingsTab} version={appVersion?.version || ''} />
 
         </div>
       </div>
@@ -11015,7 +11121,7 @@
     border-color: color-mix(in srgb, var(--g3) 50%, transparent);
   }
   .sidebar {
-    width: 300px;
+    width: 280px;
     box-sizing: border-box; /*  修复：宽=sidebarW 语义对齐（渲染宽不再多出 padding+border 25px，拖拽手柄贴手指） */
     flex: none;
     /* 2026-11-11 全局透明+描边：面板玻璃化（壁纸透出，文字仍有底） */
@@ -12373,6 +12479,8 @@
     width: 100%;
     max-width: 480px;
     padding: 0 14px;
+    /* width:100% 再加左右 padding 会撑出面板，右侧那列卡片被裁掉 */
+    box-sizing: border-box;
   }
   .rp-open-title {
     font-size: 17px;

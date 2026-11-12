@@ -202,7 +202,8 @@ const WIN_CTRL_JS: &str = r#"(function () {
       toggleMax: function () { return inv('win_toggle_maximize', {}); },
       hide: function () { return inv('win_hide', {}); },
       startResize: function (dir) { return inv('win_start_resize', { dir: dir }); },
-      isMaximized: function () { return inv('win_is_maximized', {}); }
+      isMaximized: function () { return inv('win_is_maximized', {}); },
+      openExternal: function (url) { return inv('open_external', { url: url }); }
     };
     window.dispatchEvent(new Event('agentwinready'));
   } catch (e) {}
@@ -240,6 +241,23 @@ fn win_is_maximized(win: tauri::Window) -> bool {
     let m = win.is_maximized().unwrap_or(false);
     slog(&format!("win_is_maximized: {m}"));
     m
+}
+
+/// 用系统默认浏览器打开 http(s) 链接。webview 自己的新窗口被 `on_new_window` 拒绝，
+/// 页面里的外链统一走这里（explorer 转发，URL 里的 & 不会被 cmd 吃掉）。
+#[tauri::command]
+fn open_external(url: String) {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        slog(&format!("open_external: rejected scheme: {url}"));
+        return;
+    }
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let r = std::process::Command::new("explorer")
+        .arg(&url)
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn();
+    slog(&format!("open_external: {url} -> {:?}", r.map(|_| ())));
 }
 
 /// 无边框窗边缘拉伸（Windows 没有原生 resize 边框，边缘热区按下时从这里起拖）。
@@ -1113,7 +1131,8 @@ fn main() {
             win_toggle_maximize,
             win_hide,
             win_start_resize,
-            win_is_maximized
+            win_is_maximized,
+            open_external
         ])
         .setup(|app| {
             // 先登记句柄：守卫线程收到「第二个壳」的连接时要用它把窗口顶出来

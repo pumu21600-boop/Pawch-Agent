@@ -155,11 +155,39 @@ fn wizard(payload: &Path) -> Option<(PathBuf, PathBuf)> {
         );
         return None;
     }
-    // 不再弹「选文件夹」对话框，改成一个窗口里两行地址直接填/粘贴。
+    // 升级：注册表里已有安装目录 → 不再问目录，原地覆盖；数据目录沿用当前指针。
+    // 这样手动点 Setup 下一步也不会被重置回默认的 C 盘路径。
+    if let Some(install) = existing_install_dir() {
+        return Some((install, current_data_dir()));
+    }
+    // 全新安装：一个窗口里两行地址直接填/粘贴。
     // 向导不创建任何目录（用户自己建）；只有用户点「开始安装」的路径才会被使用。
     let install_default = local_appdata().join("Programs").join("Pawch Agent");
     let data_default = home().join(".pawch-agent");
     ask_dirs_form(&install_default, &data_default)
+}
+
+/// 已安装的目录（升级判定）：读注册表卸载项的 InstallLocation，且目录里有服务 exe。
+fn existing_install_dir() -> Option<PathBuf> {
+    use std::os::windows::process::CommandExt;
+    let out = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            "(Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\PawchAgent' -ErrorAction SilentlyContinue).InstallLocation",
+        ])
+        .creation_flags(0x0800_0000)
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(s);
+    p.join("pawch-agent.exe").is_file().then_some(p)
 }
 
 /// 目录输入窗口的 PowerShell 脚本（WinForms，一行一个地址，可粘贴；不弹文件夹选择框）。
@@ -385,6 +413,15 @@ fn stop_app(install_dir: &Path) {
     std::thread::sleep(std::time::Duration::from_millis(800));
 }
 
+fn hide_path(p: &Path) {
+    use std::os::windows::process::CommandExt;
+    let _ = Command::new("attrib")
+        .args(["+h"])
+        .arg(p)
+        .creation_flags(0x0800_0000)
+        .status();
+}
+
 fn remove_shortcuts() {
     let _ = run_ps(
         "$ws = New-Object -ComObject WScript.Shell; \
@@ -590,6 +627,11 @@ fn purge(args: &Args) {
 }
 
 fn install(payload: &Path, install_dir: &Path, data_dir: &Path, shortcuts: bool) -> Result<(), String> {
+    // 升级：先停服务和壳，否则覆盖运行中的 exe 会失败。
+    // 全新目录没有 exe，不碰机器上别的实例。
+    if install_dir.join("pawch-agent.exe").is_file() {
+        stop_app(install_dir);
+    }
     if let Some(parent) = install_dir.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             format!("建安装目录的上级失败（{}）：{e}", parent.display())
@@ -624,6 +666,9 @@ fn install(payload: &Path, install_dir: &Path, data_dir: &Path, shortcuts: bool)
     std::fs::create_dir_all(&ptr_dir).map_err(|e| format!("建指针目录失败（{}）：{e}", ptr_dir.display()))?;
     std::fs::write(ptr_dir.join(".data-dir"), data_dir.display().to_string())
         .map_err(|e| format!("写数据目录指针失败: {e}"))?;
+    // 指针别让用户顺手删：目录和文件都设隐藏
+    hide_path(&ptr_dir);
+    hide_path(&ptr_dir.join(".data-dir"));
 
     if shortcuts {
         let target = if install_dir.join("Pawch Agent.exe").is_file() {

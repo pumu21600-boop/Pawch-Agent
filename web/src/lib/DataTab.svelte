@@ -90,6 +90,9 @@
     for (let i = 0; i < 120; i++) {
       await sleep(500);
       try {
+        // 导入会换掉 server.token（导出包刻意不带令牌）：先拉一次静态首页让服务补发新 cookie，
+        // 否则下面带旧 cookie 的 /api/data/info 永远 401，界面就卡在「正在重启后端…」。
+        await fetch('/', { cache: 'no-store' });
         const d = await api('/api/data/info');
         if (d.started_at && d.started_at !== oldStarted) return true;
       } catch {
@@ -106,7 +109,7 @@
     const lines = [];
     lines.push(`安装：${info.install_dir}${changedInstall ? `\n      → ${installInput.trim()}` : '（不变）'}`);
     lines.push(`数据：${info.data_dir}${changedData ? `\n      → ${dataInput.trim()}` : '（不变）'}`);
-    const ok = await confirm(`迁移目录：\n${lines.join('\n')}\n\n只复制、不删旧目录；完成后会自动重启后端。继续？`);
+    const ok = await confirm(`迁移目录：\n${lines.join('\n')}\n\n目标目录不存在会自动创建；缓存不复制（可再生）；只复制、不删旧目录；完成后会自动重启后端。继续？`);
     if (!ok) return;
     const started0 = (info && info.started_at) || 0;
     busy = 'migrate';
@@ -114,9 +117,8 @@
       const r = await api('/api/data/migrate', {
         install_dir: installInput.trim(),
         data_dir: dataInput.trim(),
-        // 迁移固定带缓存（2026-11-12 用户拍板，勾选框已去掉）：缓存不迁过去
-        // 到新目录还得重建（模型缓存/会话索引等），迁移完直接可用
-        include_cache: true,
+        // 缓存不迁移（2026-11-12）：cache 可再生，且运行中的 WebView2 文件会被锁住；
+        // 微调规则/自定义 CSS 已改存数据目录的 ui-prefs.json，不再依赖 Local Storage。
       });
       if (!r.restarting) {
         msg = '已复制完成，但自动重启失败，请手动重启 Pawch 后生效。';
@@ -131,6 +133,35 @@
       msg = '';
       if (r.old_install || r.old_data) {
         cleanup = { install: r.old_install, data: r.old_data, kind: 'migrate' };
+        return;
+      }
+      location.reload();
+    } catch (e) {
+      err = e.message || String(e);
+    } finally {
+      busy = '';
+    }
+  }
+
+  // 指针丢了 / 想用已有数据目录：只写指针并重启，不复制、不覆盖
+  async function adoptExisting() {
+    msg = '';
+    err = '';
+    try {
+      const p = await api('/api/data/pick', { kind: 'data' });
+      if (!p.path) return;
+      const ok = await confirm(`把数据目录切换到这个已有目录？\n${p.path}\n\n只写指针并重启，不复制、不覆盖文件。`);
+      if (!ok) return;
+      const started0 = (info && info.started_at) || 0;
+      busy = 'migrate';
+      const r = await api('/api/data/adopt', { data_dir: p.path });
+      if (!r.restarting) {
+        msg = '已记住目录，但自动重启失败，请手动重启 Pawch 后生效。';
+        return;
+      }
+      msg = '已切换数据目录，正在重启后端…';
+      if (!(await waitForRestart(started0))) {
+        err = '后端 60 秒内没有恢复，请手动重启 Pawch。';
         return;
       }
       location.reload();
@@ -175,7 +206,10 @@
     try {
       const p = await api('/api/data/import/progress');
       progress = p;
-      pct = p.total_bytes > 0 ? Math.min(99, Math.round((p.bytes / p.total_bytes) * 100)) : 0;
+      // 按文件数算进度：体积统计会滞后，出现“100% 但只解压了 106/148 个文件”
+      const total = p.total_files > 0 ? p.total_files : p.total_bytes;
+      const done = p.total_files > 0 ? p.files : p.bytes;
+      pct = total > 0 ? Math.min(99, Math.round((done / total) * 100)) : 0;
     } catch {
       // 后端正在重启时轮询会失败，忽略
     }
@@ -218,8 +252,12 @@
       startProgressPoll();
       const r = await api('/api/data/import', {});
       if (r.cancelled) return;
-      pct = 100;
       stopProgressPoll();
+      // 最后一轮轮询可能停在 106/148：用总量收尾，别让「100%」配一行没走完的数字
+      if (progress && progress.total_files > 0) {
+        progress = { ...progress, bytes: progress.total_bytes || progress.bytes, files: progress.total_files, running: false };
+      }
+      pct = 100;
       if (!r.restarting) {
         msg = '已导入，但自动重启失败，请手动重启 Pawch 后生效。';
         return;
@@ -273,6 +311,14 @@
       </div>
     </div>
 
+    {#if info && info.pointer_exists === false}
+      <div class="pointer-warn">
+        未找到数据目录指针（可能被误删）。如果数据在别的目录，先
+        <button class="link-btn" on:click={adoptExisting}>使用已有数据目录</button>
+        切换过去。
+      </div>
+    {/if}
+
     <div class="data-actions">
       <button class="btn primary" disabled={!canMigrate} on:click={doMigrate}>
         {busy === 'migrate' ? '迁移中…' : '迁移'}
@@ -302,6 +348,7 @@
         已解压 {fmtBytes(progress?.bytes || 0)} / {fmtBytes(progress?.total_bytes || 0)}（{progress?.files || 0} / {progress?.total_files || 0} 个文件）
       </div>
     {/if}
+    <div class="param-hint">跨版本备份：先导入备份再升级；先升级再导出备份。</div>
   </div>
 
   {#if msg}<div class="data-msg">{msg}</div>{/if}
@@ -453,5 +500,20 @@
     justify-content: flex-end;
     gap: 8px;
     margin-top: 16px;
+  }
+  .pointer-warn {
+    margin-top: 10px;
+    color: var(--brand-text);
+    line-height: 1.6;
+  }
+  .link-btn {
+    padding: 0;
+    border: none;
+    background: none;
+    color: var(--brand-text);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    cursor: pointer;
+    font: inherit;
   }
 </style>
