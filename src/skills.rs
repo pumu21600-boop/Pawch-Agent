@@ -156,11 +156,17 @@ fn load_skill(dir: &Path, source: &str) -> Option<Skill> {
     let folder = dir.file_name()?.to_string_lossy().to_string();
     // 正文不单独用：下面连 frontmatter 一起原样存（read_skill 给模型全文）
     let (fm_name, fm_desc, _body) = parse_frontmatter(content.as_str());
-    // frontmatter name 留空时回退文件夹名（空名字技能既没法删也会污染索引）
+    // frontmatter name 留空时回退文件夹名（空名字技能既没法删也会污染索引）。
+    // 2026-11-10：name 也必须过 valid_name——`name: ../evil` 之类会进索引但
+    // read/delete 入口被拒，产生「列得出、读不到、删不掉」的僵尸条目；不合法
+    // 就回退文件夹名，文件夹名也不合法则整条跳过。
     let name = match fm_name {
-        Some(n) if !n.trim().is_empty() => n,
+        Some(n) if !n.trim().is_empty() && valid_name(&n).is_ok() => n,
         _ => folder,
     };
+    if valid_name(&name).is_err() {
+        return None;
+    }
     // 正文与 frontmatter 都保留，read_skill 原样给模型
     Some(Skill {
         description: fm_desc.unwrap_or_default(),
@@ -185,17 +191,33 @@ pub fn list() -> Vec<Skill> {
         dirs.sort();
         for d in dirs {
             if let Some(s) = load_skill(&d, source) {
-                if let Some(existing) = out.iter_mut().find(|x| x.name == s.name) {
-                    *existing = s; // 项目级覆盖全局
-                } else {
-                    out.push(s);
-                }
+                merge_skill(&mut out, s);
             }
         }
     }
     merge_plugin_skills(&mut out, &crate::plugin::ui::skill_roots());
+    // 2026-11-10：数据目录里的同名技能是「内置技能的自定义覆盖副本」（编辑内置技能时
+    // save 写的就是数据目录），界面与用户认知里它仍是内置技能——source 归为 builtin，
+    // 不另造「已覆盖」标签。真正的安装目录原文件不参与覆盖，升级不影响用户修改。
+    let builtin_root = builtin_skills_root();
+    if builtin_root.is_dir() {
+        for s in out.iter_mut() {
+            if s.source == "global" && load_skill(&builtin_root.join(&s.name), "builtin").is_some() {
+                s.source = "builtin".to_string();
+            }
+        }
+    }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
+}
+
+/// 同名技能先到先得：roots() 顺序是 项目 → 全局 → 内置，先到者优先。
+/// 2026-11-10 修：旧实现是「后到覆盖」，与「项目覆盖全局」的设计相反——
+/// 数据目录/内置技能会顶掉项目级，导致编辑内置技能（写入数据目录后）永远不生效。
+fn merge_skill(out: &mut Vec<Skill>, s: Skill) {
+    if !out.iter().any(|x| x.name == s.name) {
+        out.push(s);
+    }
 }
 
 /// 生态轮：把插件自带的技能并入清单。同名规则：项目/全局技能已在前 → 覆盖插件
@@ -241,6 +263,13 @@ pub fn read(name: &str) -> Result<String, String> {
 /// 文件名，省掉模型去 read_file 猜路径（猜相对路径必然 os error 2——那相对的是工作区）。
 /// 技能页编辑器仍走 read（原文）。
 pub fn read_for_agent(name: &str) -> Result<String, String> {
+    // 2026-11-10 修：停用在模型侧必须闭环——索引与「/」菜单已过滤，但模型从
+    // 历史上下文记得名字就能 read_skill 拿到全文继续执行（开关形同虚设）。
+    if disabled().contains(&name.trim().to_string()) {
+        return Err(format!(
+            "技能「{name}」已被停用（在设置 → 插件页的技能里重新打开开关后再用）"
+        ));
+    }
     let listed = list().into_iter().find(|s| s.name == name.trim());
     let dir = listed.as_ref().map(|s| s.dir.clone());
     let content = read(name)?;
@@ -277,6 +306,11 @@ pub fn read_for_agent(name: &str) -> Result<String, String> {
 pub fn read_ref(name: &str, ref_name: &str) -> Result<String, String> {
     valid_name(name)?;
     valid_name(ref_name)?;
+    if disabled().contains(&name.trim().to_string()) {
+        return Err(format!(
+            "技能「{name}」已被停用（在设置 → 插件页的技能里重新打开开关后再用）"
+        ));
+    }
     let dir = find_dir(name).ok_or_else(|| format!("未找到技能「{name}」"))?;
     let path = dir.join("references").join(ref_name);
     if is_symlink(&path) {
@@ -305,14 +339,31 @@ fn find_dir(name: &str) -> Option<PathBuf> {
 
 fn valid_name(name: &str) -> Result<(), String> {
     let n = name.trim();
+    // Windows 保留设备名（CON/NUL/COM1…）与结尾点/空格在 Windows 上会被解析成
+    // 设备或截断——目录建不出来或指向意外目标（2026-11-10 审查加固）。
+    let base = n
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let reserved = matches!(
+        base.as_str(),
+        "con" | "prn" | "aux" | "nul"
+            | "com1" | "com2" | "com3" | "com4" | "com5" | "com6" | "com7" | "com8" | "com9"
+            | "lpt1" | "lpt2" | "lpt3" | "lpt4" | "lpt5" | "lpt6" | "lpt7" | "lpt8" | "lpt9"
+    );
     let bad = n.is_empty()
         || n.chars().count() > 64
         || n.contains('/')
         || n.contains('\\')
         || n.contains("..")
-        || n.chars().any(|c| c.is_control());
+        || n.chars().any(|c| c.is_control())
+        || reserved
+        || n.ends_with('.')
+        || name.ends_with(' ');
     if bad {
-        Err("技能名不能为空、含 / \\ .. 或控制字符（最长 64 字符）".into())
+        Err("技能名不能为空、含 / \\ ..、控制字符、Windows 保留名（CON/NUL/COM1 等）或结尾点/空格（最长 64 字符）".into())
     } else {
         Ok(())
     }
@@ -399,12 +450,22 @@ fn sync_desc(full: &str, desc: &str) -> String {
     let mut in_fm = false;
     let mut replaced = false;
     let mut name_seen = false;
+    // 2026-11-10 修：只有前两条 `---` 是 frontmatter 围栏；旧实现每见一条 `---`
+    // 都翻转 in_fm，正文里的水平线会把状态翻回 true——其后以 description: 开头的
+    // 正文行被吞掉或被原地替换（保存即丢内容）。
+    let mut fences = 0u32;
     for line in full.lines() {
-        if line.trim() == "---" {
-            if in_fm && !replaced && name_seen {
-                out.push_str(&format!("description: {desc}\n")); // 收尾补
+        if line.trim() == "---" && fences < 2 {
+            fences += 1;
+            if fences == 1 {
+                in_fm = true;
+            } else {
+                // 第二条：frontmatter 收尾，缺 description 时在这里补
+                if !replaced && name_seen {
+                    out.push_str(&format!("description: {desc}\n")); // 收尾补
+                }
+                in_fm = false;
             }
-            in_fm = !in_fm;
             out.push_str(line);
             out.push('\n');
             continue;
@@ -428,6 +489,14 @@ fn sync_desc(full: &str, desc: &str) -> String {
 /// 插件技能不许删（目录在插件里，删了等于毁插件文件）；想覆盖走同名新建。
 /// 返回 Some(人话错) = 该拒。
 fn plugin_delete_error(s: &Skill) -> Option<String> {
+    // 2026-11-10：随包内置技能与插件技能同属「装上去的东西」，不许在技能页删
+    // （删的是安装目录文件，升级才回得来）。想改就新建同名技能覆盖。
+    if s.source == "builtin" {
+        return Some(format!(
+            "「{}」是随包内置技能，不能删除；想覆盖它就在技能页新建一个同名技能",
+            s.name
+        ));
+    }
     if s.source != "plugin" {
         return None;
     }
@@ -461,8 +530,11 @@ pub fn delete(name: &str) -> Result<(), String> {
     // 但必须校验该目录的**有效名**（frontmatter name 优先，空则回退文件夹名）就是
     // name——否则删的是另一个技能（实测场景：全局 docx 的 frontmatter 写成
     // docx-old，list 里没有 docx，兜底按文件夹名会把项目级真实 docx 删掉）。
-    // roots() 只含项目/全局两个根，插件技能不在其中，天然碰不到。
-    for (root, _) in roots() {
+    // roots() 只含项目/全局/内置三个根，插件技能不在其中，天然碰不到。
+    for (root, source) in roots() {
+        if source == "builtin" {
+            continue; // 兜底路径同样不许删内置（有效名与文件夹名不一致时也拦住）
+        }
         let dir = root.join(name);
         if !dir.is_dir() || is_symlink(&dir) {
             continue;
@@ -496,9 +568,9 @@ pub fn index_prompt() -> String {
     s.push_str("以下是本环境的自建技能清单。当用户消息中出现 `/技能名`、或任务与某技能的描述明显相关时，先调用 read_skill 工具读取该技能全文，再严格按其步骤执行。\n新建/修改/删除技能一律用 skill 工具（不用去文件系统找技能正文文件在哪）；「可用插件」一节里标了「自带技能」的是插件包内的说明书，read_skill 按名可读，但它们不属于本清单、也改不得：\n");
     for sk in &skills {
         let desc = if sk.description.is_empty() {
-            "（无描述）"
+            "（无描述）".to_string()
         } else {
-            &sk.description
+            flatten_index_text(&sk.description)
         };
         // references 渐进披露——索引只报篇数，模型按需 read_skill(name, ref) 拉单篇
         let refs_hint = if sk.refs.is_empty() {
@@ -515,6 +587,30 @@ pub fn index_prompt() -> String {
         s.push_str(&format!("- /{}{}: {}{}\n", sk.name, from, desc, refs_hint));
     }
     s
+}
+
+/// 索引文本压平：控制字符/零宽字符一律换空格并压缩连续空白——防 frontmatter
+/// description 伪造系统提示结构（与插件索引 flatten_line 同款纪律，2026-11-10）。
+fn flatten_index_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut pending_space = false;
+    for c in s.chars() {
+        let ch = if c.is_control() || c == '\u{200b}' || c == '\u{feff}' {
+            ' '
+        } else {
+            c
+        };
+        if ch == ' ' {
+            pending_space = !out.is_empty();
+        } else {
+            if pending_space {
+                out.push(' ');
+                pending_space = false;
+            }
+            out.push(ch);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -569,6 +665,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&to);
     }
 
+    /// 2026-11-10 审查：停用技能在模型执行侧必须读不到——索引与「/」菜单已过滤，
+    /// 执行链路原先没拦（模型从历史上下文记得名字就能绕过开关）；UI 编辑用的
+    /// read() 不受影响（用户仍要能打开被停用的技能改内容）。
+    #[test]
+    fn disabled_skill_cannot_be_read_by_agent() {
+        let name = format!("zz-disabled-{}", std::process::id());
+        save(&name, "停用测试", "正文内容").expect("save");
+        set_disabled(std::slice::from_ref(&name));
+        assert!(read(&name).is_ok(), "UI 编辑读原文不受影响");
+        let err = read_for_agent(&name).unwrap_err();
+        assert!(err.contains("停用"), "模型侧要拒绝: {err}");
+        assert!(
+            read_ref(&name, "r.md").unwrap_err().contains("停用"),
+            "参考资料也要拦"
+        );
+        set_disabled(&[]);
+        assert!(read_for_agent(&name).is_ok(), "重新启用后恢复可读");
+        delete(&name).expect("cleanup");
+    }
+
     #[test]
     fn invalid_name_rejected() {
         assert!(valid_name("../evil").is_err());
@@ -576,6 +692,57 @@ mod tests {
         assert!(valid_name("a\\b").is_err());
         assert!(valid_name("ok-name_1").is_ok());
         assert!(valid_name("部署流程").is_ok(), "中文技能名应允许");
+        // 2026-11-10 加固：Windows 保留名与结尾点/空格
+        assert!(valid_name("CON").is_err());
+        assert!(valid_name("nul").is_err());
+        assert!(valid_name("COM1").is_err());
+        assert!(valid_name("con.txt").is_err());
+        assert!(valid_name("skill.").is_err());
+        assert!(valid_name("skill ").is_err());
+        assert!(valid_name("console").is_ok(), "普通名字不许误伤");
+        assert!(valid_name("com10").is_ok());
+    }
+
+    /// 2026-11-10：frontmatter 名非法时回退文件夹名，不产生「列得出、读不到、
+    /// 删不掉」的僵尸条目。
+    #[test]
+    fn load_skill_sanitizes_invalid_frontmatter_name() {
+        let dir = std::env::temp_dir().join(format!("agent-skill-badname-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("SKILL.md"), "---\nname: ../evil\ndescription: x\n---\n正文").unwrap();
+        let s = load_skill(&dir, "project").expect("应回退文件夹名加载");
+        assert_eq!(s.name, dir.file_name().unwrap().to_string_lossy());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 2026-11-10：内置技能与插件技能同属「装上去的东西」，删除必须拒。
+    #[test]
+    fn builtin_skill_delete_guarded() {
+        let s = Skill {
+            name: "docx".into(),
+            description: String::new(),
+            source: "builtin".into(),
+            dir: String::new(),
+            content: String::new(),
+            refs: Vec::new(),
+            plugin: String::new(),
+            enabled: true,
+        };
+        let err = plugin_delete_error(&s).expect("builtin 必须拒删");
+        assert!(err.contains("内置"), "{err}");
+        let mut proj = s.clone();
+        proj.source = "project".into();
+        assert!(plugin_delete_error(&proj).is_none(), "项目级技能可删");
+    }
+
+    /// 2026-11-10：技能描述进索引前必须压平（控制字符/零宽字符 → 空格）。
+    #[test]
+    fn index_text_flattened() {
+        let out = flatten_index_text("描述一\r\n第二行\u{200b}尾巴");
+        assert!(!out.contains('\r') && !out.contains('\n') && !out.contains('\u{200b}'));
+        assert!(out.contains("描述一"));
+        assert!(out.contains("第二行"));
     }
 
     /// 2026-10-08 修：delete 的文件夹名兜底必须校验有效名——全局技能 frontmatter
@@ -676,6 +843,75 @@ mod tests {
         let _ = fs::remove_dir_all(&outside);
     }
 
+    /// 2026-11-10 审查 P1：同名技能必须「项目级 > 全局 > 内置」。旧实现是后到覆盖，
+    /// 全局/内置会顶掉项目级——编辑内置技能（写入数据目录）永远不生效。
+    #[test]
+    fn list_priority_project_over_global() {
+        let name = format!("zz-priority-{}", std::process::id());
+        let proj = crate::tools::workspace_root().join("skills").join(&name);
+        let glob = global_skills_root().join(&name);
+        let _ = fs::remove_dir_all(&proj);
+        let _ = fs::remove_dir_all(&glob);
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(
+            proj.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: 项目版\n---\n项目正文"),
+        )
+        .unwrap();
+        fs::create_dir_all(&glob).unwrap();
+        fs::write(
+            glob.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: 全局版\n---\n全局正文"),
+        )
+        .unwrap();
+        let hit = list()
+            .into_iter()
+            .find(|s| s.name == name)
+            .expect("同名技能应列出");
+        assert_eq!(hit.source, "project", "项目级必须压过全局/内置");
+        assert!(read(&name).unwrap().contains("项目正文"));
+        assert_eq!(
+            list().into_iter().filter(|s| s.name == name).count(),
+            1,
+            "同名只留一条"
+        );
+        let _ = fs::remove_dir_all(&proj);
+        let _ = fs::remove_dir_all(&glob);
+    }
+
+    /// 2026-11-10（真机反馈）：编辑内置技能后数据目录留了覆盖副本，界面必须仍显示
+    /// 「内置」——source 归为 builtin，不另造「已覆盖」标签。
+    #[test]
+    fn global_override_of_builtin_still_reads_as_builtin() {
+        let name = format!("zz-builtin-cover-{}", std::process::id());
+        let builtin = builtin_skills_root().join(&name);
+        let glob = global_skills_root().join(&name);
+        let _ = fs::remove_dir_all(&builtin);
+        if glob != builtin {
+            let _ = fs::remove_dir_all(&glob);
+        }
+        fs::create_dir_all(&builtin).unwrap();
+        fs::write(
+            builtin.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: 内置版\n---\n内置正文"),
+        )
+        .unwrap();
+        if glob != builtin {
+            fs::create_dir_all(&glob).unwrap();
+            fs::write(
+                glob.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: 用户改版\n---\n改后正文"),
+            )
+            .unwrap();
+        }
+        let hit = list().into_iter().find(|s| s.name == name).expect("应列出");
+        assert_eq!(hit.source, "builtin", "覆盖副本仍应显示为内置");
+        let _ = fs::remove_dir_all(&builtin);
+        if glob != builtin {
+            let _ = fs::remove_dir_all(&glob);
+        }
+    }
+
     #[test]
     fn sync_desc_updates_and_inserts() {
         // frontmatter 缺 description → 补（收尾补，不再 name 后立即补）
@@ -692,6 +928,32 @@ mod tests {
         // name 在前、description 在后的标准 frontmatter 保存，不许出现两行 description
         let occ = fm2.matches("description:").count();
         assert_eq!(occ, 1, "只允许一行 description: {fm2}");
+    }
+
+    /// 2026-11-10 审查 P1：正文里的 `---` 不许再被当围栏翻转——其后的正文行
+    /// （尤其 description: 开头的示例行）曾被吞掉/替换，保存一次丢一行。
+    #[test]
+    fn sync_desc_keeps_body_separators_and_lines() {
+        // 形态 1：正文含 --- 分隔线 + 其后有 description: 起始的示例行
+        let src = "---\nname: a\ndescription: 旧\n---\n正文第一段\n\n---\n\ndescription: 这是正文里的一行示例\n正文最后\n";
+        let out = sync_desc(src, "新描述");
+        assert!(out.contains("description: 新描述"), "frontmatter 描述要更新");
+        assert!(
+            out.contains("description: 这是正文里的一行示例"),
+            "正文行不许被吞: {out}"
+        );
+        assert!(out.contains("正文最后"));
+        // 形态 2：frontmatter 缺 description，正文含 --- 与 description: 行
+        let src2 = "---\nname: b\n---\n正文A\n\n---\n\ndescription: 正文示例\n";
+        let out2 = sync_desc(src2, "补描述");
+        let fm_pos = out2.find("description: 补描述").expect("应补 description");
+        let body_pos = out2.find("description: 正文示例").expect("正文示例保留");
+        assert!(fm_pos < body_pos, "补的描述在 frontmatter 内: {out2}");
+        assert_eq!(out2.matches("description:").count(), 2, "一条 frontmatter + 一条正文示例");
+        // 形态 3：正文含 --- 但无 description 行——整体原样
+        let src3 = "---\nname: c\ndescription: 旧\n---\nA\n---\nB";
+        let out3 = sync_desc(src3, "新");
+        assert!(out3.contains("A\n---\nB"), "正文分隔线原样保留: {out3}");
     }
 
     #[test]

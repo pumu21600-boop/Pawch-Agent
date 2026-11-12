@@ -63,6 +63,28 @@ impl Default for ModelCapabilities {
     }
 }
 
+/// 单个模型的参数覆盖（「同渠道不同模型各自调参」）。
+/// 全部 Option：None = 回落配置级字段（渠道默认更远）；capabilities 为 Some
+/// 时整体覆盖（「这个模型不支持音频」是明确声明，不做字段级回落）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    /// 思考开关/档位（同 Config.thinking）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_style: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<ModelCapabilities>,
+}
+
 // 按模型名「智能推导」能力的机制整体退役——聚合渠道上模型名与真实能力
 // 对不上（统计不过来），预测错的徽章/门控比没有更糟。能力一律以用户手动勾选为准：
 // 新建/迁移配置用 Default（tools 开、其余关，user_set=false），媒体门控只认勾选值。
@@ -107,7 +129,7 @@ pub struct RolesSettings {
 /// 无此字段时行为与从前完全一致；关掉的语义见各字段注释（全部复用现成的退化路径）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeatureSettings {
-    /// 功能桥接（原「角色分工」渠道路由）：关 = 摘要/标题/嵌入/多模态/子代理/预算降级
+    /// 功能桥接（原「角色分工」渠道路由）：关 = 摘要/嵌入/多模态/子代理/预算降级
     /// 全部回主渠道或默认退化（config.toml [roles] 一并不再生效）
     #[serde(default = "default_true")]
     pub roles: bool,
@@ -224,7 +246,7 @@ pub struct ModelPrice {
 /// `0`=清除长度类（context_length/max_output_tokens）；负数=清除采样类（temperature/top_p）；
 /// 空串/auto=清除思考类（thinking/thinking_style）；clear_key=true=清 key。
 /// 「思考档位被吞」事故即源于此约定未成文。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     pub id: String,
     /// 用户起的名字；空则自动补「配置 N」
@@ -260,9 +282,23 @@ pub struct Config {
     /// 新形态入词表必须附真实渠道冒烟记录。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_style: Option<String>,
+    /// 传输协议锁定（2026-11-11「API 格式」三选）：openai=Chat Completions、
+    /// anthropic=Anthropic Messages、responses=OpenAI Responses；空=旧档未设置，
+    /// 按端点特征推初值（anthropic 预设/官方域//anthropic 挂载 → Messages，其余 →
+    /// Completions）。UI 只有三项，没有「自动」档；预设不背协议的账。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    /// 「自动补后缀」勾选框（默认勾选）：勾=按惯例补 /v1/messages、/chat/completions、
+    /// /v1/responses；不勾=Base URL 即最终地址，原样直发一个字符不加。
+    #[serde(default = "default_true")]
+    pub auto_suffix: bool,
     /// 模型能力标记（工具调用/图片/视频/音频解析）
     #[serde(default)]
     pub capabilities: ModelCapabilities,
+    /// 每个模型各自的参数覆盖（键 = 模型 id）；没配的模型回落到上面的配置级字段。
+    /// 这样同一渠道下可以「文本模型不勾音视频、omni 模型勾音频」并存。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_params: BTreeMap<String, ModelParams>,
     /// A2 能力标记所有权：true=用户显式标记过（勾选框），此后任何模型切换/勾选
     /// 不得被推导覆盖；false=推导态（模型首次成为当前模型时按模型名推导作初值）。
     /// 「按模型名重新推导」按钮复位为 false。
@@ -271,6 +307,28 @@ pub struct Config {
 }
 
 impl Config {
+    /// 「API 格式」三选的生效值：显式指定优先；旧档未设置时按端点特征推初值
+    /// （provider_id=anthropic、官方域或 /anthropic 挂载 → Messages，其余 →
+    /// Completions）。推导只服务旧档迁移/新档初值，UI 没有「自动」档。
+    pub fn effective_protocol(&self) -> crate::gateway::Protocol {
+        use crate::gateway::Protocol;
+        match self.protocol.as_deref() {
+            Some("anthropic") => Protocol::AnthropicMessages,
+            Some("responses") => Protocol::OpenAiResponses,
+            Some("openai") => Protocol::OpenAiCompletions,
+            _ => {
+                if crate::gateway::anthropic::is_anthropic_endpoint(
+                    Some(&self.provider_id),
+                    Some(&self.effective_base_url()),
+                ) {
+                    Protocol::AnthropicMessages
+                } else {
+                    Protocol::OpenAiCompletions
+                }
+            }
+        }
+    }
+
     /// 生效的 base_url：自定义 > 预设默认
     pub fn effective_base_url(&self) -> String {
         if !self.base_url.trim().is_empty() {
@@ -299,6 +357,43 @@ impl Config {
     #[allow(dead_code)]
     pub fn has_key(&self) -> bool {
         self.key_cipher.is_some()
+    }
+
+    /// 指定模型生效的参数：模型级覆盖 > 配置级回落。
+    /// `model` 为空时按 effective_model 取。
+    pub fn params_for(&self, model: &str) -> ModelParams {
+        let m = if model.trim().is_empty() {
+            self.effective_model()
+        } else {
+            model.trim().to_string()
+        };
+        let over = self.model_params.get(&m);
+        ModelParams {
+            context_length: over
+                .and_then(|p| p.context_length)
+                .or(self.context_length),
+            max_output_tokens: over
+                .and_then(|p| p.max_output_tokens)
+                .or(self.max_output_tokens),
+            temperature: over.and_then(|p| p.temperature).or(self.temperature),
+            top_p: over.and_then(|p| p.top_p).or(self.top_p),
+            thinking: over
+                .and_then(|p| p.thinking.clone())
+                .or_else(|| self.thinking.clone()),
+            thinking_style: over
+                .and_then(|p| p.thinking_style.clone())
+                .or_else(|| self.thinking_style.clone()),
+            capabilities: over
+                .and_then(|p| p.capabilities.clone())
+                .or_else(|| Some(self.capabilities.clone())),
+        }
+    }
+
+    /// 指定模型的能力标记：模型级 > 配置级。
+    pub fn caps_for(&self, model: &str) -> ModelCapabilities {
+        self.params_for(model)
+            .capabilities
+            .unwrap_or_else(|| self.capabilities.clone())
     }
 
     /// key 的尾 4 位提示
@@ -605,8 +700,11 @@ impl Settings {
             top_p: None,
             thinking: None,
             thinking_style: None,
+            protocol: None,
+            auto_suffix: true,
             capabilities: cap,
             capabilities_user_set: false,
+            model_params: Default::default(),
         });
         s.ensure_active_config();
         // 坏文件没能改名备份（文件被占用/只读）时不落盘：宁可这次用默认值跑，
@@ -724,8 +822,11 @@ impl Settings {
                 top_p: None,
                 thinking: None,
                 thinking_style: None,
+                protocol: None,
+                auto_suffix: true,
                 capabilities: ModelCapabilities::default(),
                 capabilities_user_set: false,
+            model_params: Default::default(),
             });
         }
         self.assign_missing_names();
@@ -822,8 +923,11 @@ impl Settings {
             top_p: None,
             thinking: None,
             thinking_style: None,
+            protocol: None,
+            auto_suffix: true,
             capabilities: ModelCapabilities::default(),
             capabilities_user_set: false,
+            model_params: Default::default(),
         });
         self.active_config_id = Some(id.clone());
         id
@@ -985,8 +1089,12 @@ pub(crate) fn settings_from_text(text: &str) -> Result<Settings, serde_json::Err
             top_p: legacy.top_p,
             thinking: legacy.thinking,
             thinking_style: legacy.thinking_style,
+            // 旧档迁移：v0 时代没有协议锁定概念，一律回到端点探测
+            protocol: None,
+            auto_suffix: true,
             capabilities: cap,
             capabilities_user_set: false,
+            model_params: Default::default(),
         });
     }
 
@@ -1139,12 +1247,20 @@ fn bool_from_value(v: &serde_json::Value) -> Option<serde_json::Value> {
 
 /// 递归纠型（纯函数）。`null`/救不回来的形态直接删键 → serde default 生效，
 /// 不拿 0/false 硬顶（0 在不少字段里有「不限」的语义）。
+///
+/// `in_roles`：roles 子树的键全是字符串/数组（roles.vision/video/audio 是配置名
+/// 引用，不是能力布尔）——跳过 NUMERIC/BOOL 纠型，否则类型救援会把多模态角色值
+/// 当「非布尔的 vision 键」删掉（2026-11-10 审查 P2）。
 fn coerce_known_scalars(v: &mut serde_json::Value, changed: &mut bool) {
+    coerce_impl(v, changed, false)
+}
+
+fn coerce_impl(v: &mut serde_json::Value, changed: &mut bool, in_roles: bool) {
     match v {
         serde_json::Value::Object(map) => {
             for k in map.keys().cloned().collect::<Vec<_>>() {
                 let cur = map.get(&k).cloned().unwrap_or(serde_json::Value::Null);
-                if NUMERIC_SETTING_KEYS.contains(&k.as_str()) {
+                if !in_roles && NUMERIC_SETTING_KEYS.contains(&k.as_str()) {
                     if cur.is_null() {
                         map.remove(&k);
                         *changed = true;
@@ -1161,7 +1277,7 @@ fn coerce_known_scalars(v: &mut serde_json::Value, changed: &mut bool) {
                         }
                         *changed = true;
                     }
-                } else if BOOL_SETTING_KEYS.contains(&k.as_str()) {
+                } else if !in_roles && BOOL_SETTING_KEYS.contains(&k.as_str()) {
                     if cur.is_null() {
                         map.remove(&k);
                         *changed = true;
@@ -1180,13 +1296,13 @@ fn coerce_known_scalars(v: &mut serde_json::Value, changed: &mut bool) {
                     }
                 }
                 if let Some(child) = map.get_mut(&k) {
-                    coerce_known_scalars(child, changed);
+                    coerce_impl(child, changed, in_roles || k == "roles");
                 }
             }
         }
         serde_json::Value::Array(a) => {
             for x in a {
-                coerce_known_scalars(x, changed);
+                coerce_impl(x, changed, in_roles);
             }
         }
         _ => {}

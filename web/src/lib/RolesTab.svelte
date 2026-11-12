@@ -16,16 +16,24 @@
   function modelsOf(c) {
     return (c.models && c.models.length ? c.models : [c.model]).filter(Boolean);
   }
-  function groups(list, cap, capName) {
+  /// 某模型的实际能力：模型级覆盖 > 配置级（与后端 caps_for 同口径）。
+  /// 功能桥接必须按模型过滤——配置级 video=false 不代表里面的 qwen3-vl-plus 不支持视频。
+  function capsOf(c, m) {
+    return c.model_params?.[m]?.capabilities || c.capabilities || {};
+  }
+  /// 按能力过滤后的分组：只把真正支持该能力的模型放进二级菜单。
+  /// 整组没有可用模型就不显示这一组；菜单仍是「渠道分组 → 模型」两级结构。
+  function groups(list, cap) {
     return list
-      .filter((c) => modelsOf(c).length)
       .map((c) => {
-        const warn = cap && !c.capabilities?.[cap] ? `（未勾「${capName}」）` : '';
+        const models = modelsOf(c).filter((m) => !cap || capsOf(c, m)[cap]);
+        if (!models.length) return null;
         return {
-          group: `${configLabel(c)}${warn}`,
-          items: modelsOf(c).map((m) => ({ value: `${c.id}::${m}`, label: m })),
+          group: configLabel(c),
+          items: models.map((m) => ({ value: `${c.id}::${m}`, label: m })),
         };
-      });
+      })
+      .filter(Boolean);
   }
   function cfgIdOf(v) {
     return String(v || '').split('::')[0];
@@ -109,11 +117,7 @@
             { value: null, label: '未配置' },
             ...withCurrent(
               roleValue('vision'),
-              groups(
-                configs.filter((c) => c.id === cfgIdOf(roleValue('vision')) || c.capabilities?.vision),
-                'vision',
-                '图片解析',
-              ),
+              groups(configs, 'vision'),
             ),
           ]}
           on:change={(e) => {
@@ -131,11 +135,7 @@
             { value: null, label: '未配置' },
             ...withCurrent(
               roleValue('video'),
-              groups(
-                configs.filter((c) => c.id === cfgIdOf(roleValue('video')) || c.capabilities?.video),
-                'video',
-                '视频解析',
-              ),
+              groups(configs, 'video'),
             ),
           ]}
           on:change={(e) => {
@@ -153,11 +153,7 @@
             { value: null, label: '未配置' },
             ...withCurrent(
               roleValue('audio'),
-              groups(
-                configs.filter((c) => c.id === cfgIdOf(roleValue('audio')) || c.capabilities?.audio),
-                'audio',
-                '音频解析',
-              ),
+              groups(configs, 'audio'),
             ),
           ]}
           on:change={(e) => {

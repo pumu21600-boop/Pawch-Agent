@@ -11,10 +11,11 @@
 //!    模型要精确细节可以自己回去读；
 //! 3. 会话文件存完整历史，压缩只影响请求侧（历史不再被压缩后的列表覆写）。
 
-use crate::context::estimate_messages;
 use serde_json::{json, Value};
 
-/// 摘要输出上限（tokens）：9 段结构给足余量，超长由模型截断。
+/// 摘要正文的设计上限（tokens）：9 段结构给足余量，超长由模型截断。
+/// 实际请求的 max_tokens 在此之上再加思考余量（见 server/compact.rs）——
+/// 有些模型在「不发思考参数」时仍会默认思考，正文预算要扣掉思考量。
 pub const SUMMARY_MAX_TOKENS: u64 = 4000;
 /// 单次压缩调用的硬超时。
 pub const COMPACT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -55,6 +56,10 @@ impl CompactView {
 /// summary + transcript 路径决定 → 跨轮逐字节稳定，不破坏缓存前缀。
 pub fn summary_message(view: &CompactView) -> Value {
     json!({
+        // 稳定 id：二次压缩在「请求视图」上切分时，摘要消息要能当锚点。旧实现无 id
+        // → 压缩后再聊一轮切分必失败（not_triggered 报「锚点缺 id」，看不出真实
+        // 原因；2026-11-10）。id 由尾段起点派生，同一记录跨轮不变。
+        "id": format!("compact-summary:{}", view.tail_start_id),
         "role": "user",
         "content": format!(
             "【上下文已压缩】此前的对话已压缩为下面的摘要。需要精确细节（完整代码、报错原文）时可读完整记录文件：{}\n\n{}\n\n（接下来是压缩前保留的最近对话原文）",
@@ -121,23 +126,6 @@ pub fn summarized_has_assistant(view: &[Value], split: usize) -> bool {
         .any(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
 }
 
-/// 守卫：预计压缩后的占用（工具 Schema + 系统提示 + 摘要上限 + 保留尾段）。
-/// ≥ 阈值的 80% 说明压了也白压（很快又撞线），宁可不做。
-///
-/// 尺子必须与圆环一致：`count_reasoning` 由调用方按渠道回放判定传入（DeepSeek/zai
-/// 契约与白名单模型每轮重发思考，必须计入；剥离渠道不计），`system_tokens` 用主
-/// 循环实测的系统提示占用——原先写死的 2000 常量会把长系统提示的会话低估。
-pub fn guard_estimate(
-    tools_schema_tokens: u64,
-    system_tokens: u64,
-    tail: &[Value],
-    count_reasoning: bool,
-) -> u64 {
-    // 摘要占位按上限 SUMMARY_MAX_TOKENS 算（真实摘要允许到 4000；按 3000 估会把
-    // 守卫低估 1000，压完撞 80% 线的白压放行进来）
-    tools_schema_tokens + system_tokens + SUMMARY_MAX_TOKENS + estimate_messages(tail, count_reasoning)
-}
-
 /// 压缩后请求视图的完整估价——**与圆环同一个函数、同一把尺子**：摘要消息 +
 /// 保留尾段（调用方已按发送侧同一套卫生净化）+ 系统提示 + 工具定义。
 /// 「压缩后上下文 Nk」标记行和紧随其后的圆环都取它的 `total()`，两个数不会再打架
@@ -146,7 +134,7 @@ pub fn post_breakdown(
     view: &[Value],
     system_tokens: u64,
     tools_schema_tokens: u64,
-    count_reasoning: bool,
+    count_reasoning: crate::context::ReasoningCount,
 ) -> crate::context::Breakdown {
     let mut b = crate::context::estimate_breakdown(view, count_reasoning);
     b.system = system_tokens;
@@ -310,7 +298,6 @@ pub fn done_marker_text(post_tokens: u64) -> String {
 }
 
 pub const RUNNING_MARKER_TEXT: &str = "————正在压缩上下文————";
-pub const FAILED_MARKER_TEXT: &str = "————压缩失败，下轮结束后重试————";
 
 #[cfg(test)]
 mod tests {
@@ -374,23 +361,14 @@ mod tests {
     }
 
     #[test]
-    fn guard_blocks_when_post_still_near_threshold() {
-        // 尾段巨大 + 摘要上限 → post 估算超阈值 80% → 调用方放弃
-        let big_tail = vec![msg("u", "user", &"x".repeat(100_000))];
-        let post = guard_estimate(3000, 2000, &big_tail, false);
-        let threshold = threshold_tokens(100_000, 40);
-        assert!(post >= threshold * 80 / 100, "post={post} threshold={threshold}");
-    }
-
-    #[test]
     fn post_breakdown_uses_ring_yardstick_for_every_channel() {
         let view = vec![
             summary_message(&CompactView { summary: "摘要".into(), transcript_path: "t.md".into(), tail_start_id: "u2".into() }),
             json!({"role":"assistant","content":"答","reasoning_content":"想".repeat(500)}),
             json!({"role":"user","content":"继续"}),
         ];
-        let replay = post_breakdown(&view, 5000, 9000, true).total();
-        let strip = post_breakdown(&view, 5000, 9000, false).total();
+        let replay = post_breakdown(&view, 5000, 9000, crate::context::ReasoningCount::All).total();
+        let strip = post_breakdown(&view, 5000, 9000, crate::context::ReasoningCount::None).total();
         assert!(
             replay >= strip + 500,
             "重发思考的渠道（DeepSeek/zai/白名单）必须把 thinking 算进标记行：replay={replay} strip={strip}"

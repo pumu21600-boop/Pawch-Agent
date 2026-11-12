@@ -34,10 +34,20 @@ pub(super) async fn post_mcp(
                 let Some(srv) = req.server.clone() else {
                     return err("缺少 server 配置".into());
                 };
-                let cfg: crate::config::settings::McpServerCfg = match serde_json::from_value(srv) {
+                let mut cfg: crate::config::settings::McpServerCfg = match serde_json::from_value(srv) {
                     Ok(c) => c,
                     Err(e) => return err(format!("server 配置不合法: {e}")),
                 };
+                // 2026-11-10：GET 不再回显 client_secret（前端圆点），编辑保存时回传
+                // 空值/圆点占位 → 沿用旧 secret，别把已存密钥冲掉（与 API Key 同款）。
+                if let Some(new_oauth) = cfg.oauth.as_mut()
+                    && (new_oauth.client_secret.trim().is_empty()
+                        || new_oauth.client_secret.trim() == "••••••••")
+                    && let Some(old) = s.mcp_servers.iter().find(|c| c.name == cfg.name)
+                    && let Some(old_oauth) = &old.oauth
+                {
+                    new_oauth.client_secret = old_oauth.client_secret.clone();
+                }
                 // transport 合法性 + 必需字段 + 名称规则：与 settings 工具的整表替换
                 // 共用同一份校验（mcp::validate_server_cfg）
                 if let Err(e) = crate::mcp::validate_server_cfg(&cfg) {
@@ -49,6 +59,9 @@ pub(super) async fn post_mcp(
             "remove" => {
                 let Some(name) = &req.name else { return err("缺少 name".into()) };
                 s.mcp_servers.retain(|c| &c.name != name);
+                // 2026-11-10：删服务顺带撤销 OAuth token——否则 mcp_tokens.json 里
+                // 永久残留，日后新建同名服务会静默继承旧授权（可能指向别的服务）。
+                crate::mcp::oauth::revoke(name);
             }
             "toggle" => {
                 let Some(name) = &req.name else { return err("缺少 name".into()) };
@@ -179,8 +192,17 @@ fn get_mcp_inner(state: &AppState) -> Json<Value> {
                 "tools": tools.iter().map(|(n, d)| json!({"name": n, "desc": d})).collect::<Vec<_>>(),
                 "resources": res,
                 "prompts": prompts,
-                // OAuth 配置 + 授权状态（tx=事务快照，oauth=token 态）
-                "oauth": c.oauth,
+                // OAuth 配置 + 授权状态（tx=事务快照，oauth=token 态）。
+                // 2026-11-10：client_secret 不回显明文——env/headers 早已脱敏，oauth 漏了；
+                // 只给 has_client_secret，前端显示圆点、留空保存不覆盖。
+                "oauth": c.oauth.as_ref().map(|o| json!({
+                    "type": o.r#type,
+                    "client_id": o.client_id,
+                    "client_secret": "",
+                    "has_client_secret": !o.client_secret.trim().is_empty(),
+                    "scope": o.scope,
+                    "redirect_path": o.redirect_path,
+                })),
                 "oauth_status": crate::mcp::oauth::tx_status(&c.name),
             })
         })

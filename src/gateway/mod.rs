@@ -26,7 +26,10 @@ pub mod compat;
 pub mod effort;
 pub mod providers;
 pub mod replay;
+pub mod responses;
 pub mod tags;
+
+pub use compat::Protocol;
 
 pub mod openai;
 mod accounting;
@@ -36,7 +39,7 @@ pub use openai::*;
 
 #[cfg(test)]
 mod tests;
-use compat::{CacheRetention, Compat, Protocol, ThinkingFormat};
+use compat::{CacheRetention, Compat, ThinkingFormat};
 use providers::ProviderPreset;
 use tags::TagSplit;
 
@@ -137,6 +140,12 @@ pub struct ChatParams {
     /// 提示缓存保留档（[cost] cache_retention）：决定是否发 cache_control 断点 /
     /// prompt_cache_key / 长保留 TTL。默认 Short（对齐 pi-ai 的 cacheRetention 默认档）。
     pub cache_retention: CacheRetention,
+    /// 传输协议锁定（配置 `protocol` 字段，2026-11-11「API 格式」三选）：
+    /// None=端点探测（旧行为，未走配置组装的路径照旧）；Some=显式锁定，探测让位。
+    /// 只有 build_chat_params（配置组装）会置值——预设不背协议的账。
+    pub protocol: Option<Protocol>,
+    /// 「自动补后缀」勾选（默认勾）：不勾时对话/模型列表 URL=Base URL 原样直发。
+    pub suffix_auto: bool,
 }
 
 impl Default for ChatParams {
@@ -152,6 +161,8 @@ impl Default for ChatParams {
             tools_enabled: true,
             vision: false,
             cache_retention: CacheRetention::Short,
+            protocol: None,
+            suffix_auto: true,
         }
     }
 }
@@ -273,6 +284,27 @@ fn redact_url(url: &str) -> String {
     }
 }
 
+/// JSON 响应里的业务错误字段。成功响应也可能显式带 `"error": null`——OpenAI
+/// Responses 对象固定带这个键（DeepSeek `/v1/responses` 实测）。按「有 error 键」
+/// 判错会把成功当失败：2026-11-11 用户测试连通报「渠道业务错误 (raw: null)」。
+fn body_error(data: &Value) -> Option<&Value> {
+    data.get("error").filter(|v| !v.is_null())
+}
+
+/// embeddings 端点 URL：只给了主机时补 `/v1`，给了路径原样拼（与 chat_url 同款
+/// 根路径判定；2026-11-10 审查：embed 漏了这步，只填主机的配置必 404）。
+fn embed_url(base_url: &str) -> String {
+    let b = base_url.trim().trim_end_matches('/');
+    let path_is_root = url::Url::parse(b)
+        .map(|u| u.path().is_empty() || u.path() == "/")
+        .unwrap_or(false);
+    if path_is_root {
+        format!("{b}/v1/embeddings")
+    } else {
+        format!("{b}/embeddings")
+    }
+}
+
 /// base_url 是否指向环回主机（本地模型服务）：是则 send() 换 loopback_client。
 /// 本地端点经代理必坏（代理连自己的 localhost，回 502），而 reqwest 默认不排除
 /// 环回——注释里写了多年的「ProxyOverride 环回绕代理」其实从未实现，2026-10-08 补。
@@ -330,6 +362,13 @@ fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
 pub struct AssistantTurn {
     pub content: String,
     pub reasoning: String,
+    /// Anthropic 思考块签名（signature_delta 到达；回放时随 thinking 块原样带回）
+    pub reasoning_signature: Option<String>,
+    /// Responses 思考条目 encrypted_content（回放时作为 reasoning item 带回）
+    pub reasoning_encrypted: Option<String>,
+    /// 思考块序列（Anthropic: thinking / redacted_thinking；Responses: reasoning 条目）。
+    /// 一条回答里可能有多个块（interleaved thinking），按到达顺序原样回放。
+    pub reasoning_blocks: Vec<Value>,
     pub tool_calls: Vec<ToolCall>,
     /// 渠道返回的用量（：缓存命中率展示用；台账分计量）
     pub prompt_tokens: Option<u64>,
@@ -366,8 +405,19 @@ impl AssistantTurn {
             .and_then(|t| t.checked_duration_since(call_started))
             .map(|d| d.as_millis() as u64)
     }
-    /// 输出耗时毫秒：正文首→流结束（单分片回答正文跨度≈0 时它就是总生成窗口）；
+    /// 生成窗口毫秒（首包 → 流结束）：输出速度的唯一分母口径。
+    /// 渠道报的 completion_tokens 含思考与工具参数，计时必须覆盖同一段输出——
+    /// 用「正文首 → 结束」会漏掉思考时长，速度凭空快几倍到几十倍（2026-11-09 修）。
+    pub fn decode_ms(&self) -> Option<u64> {
+        let span = self
+            .first_chunk_at
+            .and_then(|a| self.finished_at.and_then(|b| b.checked_duration_since(a)))
+            .map(|d| d.as_millis() as u64)?;
+        (span > 0).then_some(span)
+    }
+    /// 正文输出耗时毫秒：正文首→流结束（单分片回答正文跨度≈0 时它就是该段收尾）；
     /// 没有正文时回落思考跨度（弱模型常只有 reasoning）；都没计时返回 None。
+    /// 注意：**不能**拿它当输出速度的分母——completion_tokens 还含思考/工具参数。
     pub fn gen_ms(&self) -> Option<u64> {
         let span = match (self.content_first_at, self.finished_at) {
             (Some(a), Some(b)) => b.checked_duration_since(a),
@@ -465,7 +515,7 @@ impl Gateway {
 
     /// 请求体是否携带思考字段（两协议：thinking 对象 / enable_thinking / reasoning_effort / 聊天模板）。
     fn body_has_thinking_params(body: &Value) -> bool {
-        ["thinking", "enable_thinking", "reasoning_effort", "chat_template_kwargs"]
+        ["thinking", "enable_thinking", "reasoning_effort", "reasoning", "chat_template_kwargs"]
             .iter()
             .any(|k| body.get(*k).is_some())
     }
@@ -641,43 +691,142 @@ impl Gateway {
         match protocol {
             Protocol::OpenAiCompletions => Self::chat_url(base_url),
             Protocol::AnthropicMessages => anthropic::messages_url(base_url),
+            Protocol::OpenAiResponses => crate::gateway::responses::responses_url(base_url),
         }
+    }
+
+    /// 「自动补后缀」两种取值的统一出口：勾=按协议惯例补；不勾=Base URL 原样直发。
+    /// 设置页「测试连通」也走这里——如实展示按哪种协议发到哪个地址。
+    pub fn endpoint_url_with(base_url: &str, protocol: Protocol, suffix_auto: bool) -> String {
+        if !suffix_auto {
+            return base_url.trim().trim_end_matches('/').to_string();
+        }
+        Self::request_url(base_url, protocol)
     }
 
     /// 按协议挂鉴权：OpenAI Authorization Bearer；Anthropic x-api-key + anthropic-version。
     fn auth(rb: reqwest::RequestBuilder, api_key: &str, protocol: Protocol) -> reqwest::RequestBuilder {
         match protocol {
-            Protocol::OpenAiCompletions => rb.bearer_auth(api_key),
+            Protocol::OpenAiCompletions | Protocol::OpenAiResponses => rb.bearer_auth(api_key),
             Protocol::AnthropicMessages => rb
                 .header("x-api-key", api_key)
                 .header("anthropic-version", anthropic::ANTHROPIC_VERSION),
         }
     }
 
-    /// GET {base}/models → 模型 id 列表（OpenAI 兼容）。
-    pub async fn list_models(&self, base_url: &str, api_key: &str) -> anyhow::Result<Vec<String>> {
-        // Anthropic /v1/models 的 data[].id 与 OpenAI 同形，仅 URL 与鉴权头不同
-        let protocol = if anthropic::is_anthropic_endpoint(None, Some(base_url)) {
-            Protocol::AnthropicMessages
+    /// 「自动补后缀」不勾 = Base URL 被用户当成最终请求地址：先剥掉已知对话端点
+    /// 尾巴，再补清单路径——直接 GET 聊天地址永远 404（2026-11-11 用户实测）。
+    fn strip_chat_endpoint(base: &str) -> &str {
+        let b = base.trim().trim_end_matches('/');
+        for tail in ["/chat/completions", "/messages", "/responses"] {
+            if let Some(rest) = b.strip_suffix(tail) {
+                return rest.trim_end_matches('/');
+            }
+        }
+        b
+    }
+
+    /// Anthropic 兼容挂载（`<root>/anthropic`、`<root>/anthropic/v1`）剥出厂商根。
+    /// DeepSeek/Moonshot 这类兼容层只实现 `/v1/messages`，模型清单挂在厂商根上的
+    /// OpenAI `/models`——2026-11-11 用户实测 `/anthropic/v1/models` 恒 404。
+    fn anthropic_mount_root(base: &str) -> Option<String> {
+        let b = base.trim().trim_end_matches('/');
+        let b = b.strip_suffix("/v1").unwrap_or(b);
+        b.strip_suffix("/anthropic").map(|r| r.trim_end_matches('/').to_string())
+    }
+
+    /// 模型清单候选地址（按顺序试，只有 404 才换下一个）。Anthropic /v1/models
+    /// 的 data[].id 与 OpenAI 同形，差别只在 URL 与鉴权头：
+    /// 1. 协议惯例端点（官方 Anthropic / 中转都认）；
+    /// 2. Anthropic 兼容层把清单也挂在同一个 base 下（OpenAI 形状）；
+    /// 3. 剥掉 `/anthropic` 后的厂商根：`/models`、`/v1/models`（Bearer）。
+    fn model_list_candidates(base_url: &str, protocol: Protocol, suffix_auto: bool) -> Vec<(String, Protocol)> {
+        let base = if suffix_auto {
+            base_url.trim().trim_end_matches('/').to_string()
         } else {
-            Protocol::OpenAiCompletions
+            Self::strip_chat_endpoint(base_url).to_string()
         };
-        let url = match protocol {
-            Protocol::AnthropicMessages => anthropic::models_url(base_url),
-            Protocol::OpenAiCompletions => Self::models_url(base_url),
+        let mut out: Vec<(String, Protocol)> = Vec::new();
+        let mut push = |url: String, auth: Protocol| {
+            if !out.iter().any(|(u, a)| u == &url && *a == auth) {
+                out.push((url, auth));
+            }
         };
-        observability::event(EventType::State, json!({ "kind": "gateway.request", "url": redact_url(&url), "body": json!(null) }));
-        observability::debug(&format!("[gateway] GET {url}"));
+        match protocol {
+            Protocol::AnthropicMessages => {
+                push(anthropic::models_url(&base), Protocol::AnthropicMessages);
+                push(Self::models_url(&base), Protocol::OpenAiCompletions);
+                if let Some(root) = Self::anthropic_mount_root(&base) {
+                    push(format!("{root}/models"), Protocol::OpenAiCompletions);
+                    push(format!("{root}/v1/models"), Protocol::OpenAiCompletions);
+                }
+            }
+            Protocol::OpenAiCompletions | Protocol::OpenAiResponses => {
+                push(Self::models_url(&base), Protocol::OpenAiCompletions);
+            }
+        }
+        out
+    }
 
-        let response = self
-            .send(base_url, |c| Self::auth(c.get(&url), api_key, protocol))
-            .await
-            .with_context(|| format!("请求渠道失败: {}（网络层不通：检查 Clash/系统代理；若程序刚重新构建过，可能是安全软件拦了新程序的联网）", redact_url(&url)))?;
+    /// GET 模型清单 → 模型 id 列表。协议与「自动补后缀」开关由「API 格式」
+    /// 选择器给定（旧档按端点特征推初值，UI 无自动档）。
+    pub async fn list_models_with(
+        &self,
+        base_url: &str,
+        api_key: &str,
+        protocol: Protocol,
+        suffix_auto: bool,
+    ) -> anyhow::Result<Vec<String>> {
+        let candidates = Self::model_list_candidates(base_url, protocol, suffix_auto);
+        let mut last_fail: Option<(u16, String)> = None;
+        let mut auth_fail: Option<(u16, String)> = None;
+        for (url, auth_protocol) in &candidates {
+            observability::event(EventType::State, json!({ "kind": "gateway.request", "url": redact_url(url), "body": json!(null) }));
+            observability::debug(&format!("[gateway] GET {url}"));
 
-        let status = response.status();
-        observability::event(EventType::State, json!({ "kind": "gateway.response", "status": status.as_u16() }));
-        if !status.is_success() {
+            let response = self
+                .send(base_url, |c| Self::auth(c.get(url), api_key, *auth_protocol))
+                .await
+                .with_context(|| format!("请求渠道失败: {}（网络层不通：检查 Clash/系统代理；若程序刚重新构建过，可能是安全软件拦了新程序的联网）", redact_url(url)))?;
+
+            let status = response.status();
+            observability::event(EventType::State, json!({ "kind": "gateway.response", "status": status.as_u16() }));
+            if status.is_success() {
+                let data: Value = response.json().await.context("解析模型列表失败")?;
+                let mut ids: Vec<String> = data
+                    .pointer("/data")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|m| m.pointer("/id").and_then(Value::as_str).map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                ids.sort();
+                ids.dedup();
+                observability::debug(&format!("[gateway] models: {ids:?}"));
+                return Ok(ids);
+            }
+
             let text = response.text().await.unwrap_or_default();
+            // 404 = 这个地址没有清单接口：试下一个候选；401/403/5xx 是确定性结果，直接报
+            if status.as_u16() == 404 {
+                observability::debug(&format!("[gateway] models 404 → 换下一个候选: {url}"));
+                last_fail = Some((status.as_u16(), text));
+                continue;
+            }
+            // 401/403 不一定是 key 错：同一 URL 可能只认另一种鉴权头——StepFun
+            // `/v1/models` 只认 Bearer，对 x-api-key 与裸请求都回 401
+            // 「Incorrect API key provided」。记下鉴权失败、继续试剩余候选，
+            // 全失败才把鉴权错误报给用户（2026-11-11 用户实测）。
+            if status.as_u16() == 401 || status.as_u16() == 403 {
+                observability::debug(&format!("[gateway] models {status} → 换下一个候选: {url}"));
+                if auth_fail.is_none() {
+                    auth_fail = Some((status.as_u16(), text.clone()));
+                }
+                last_fail = Some((status.as_u16(), text));
+                continue;
+            }
             observability::event(
                 EventType::Error,
                 json!({ "kind": "gateway.error", "status": status.as_u16(), "body": text }),
@@ -685,20 +834,18 @@ impl Gateway {
             return Err(anyhow!("渠道返回 {status}: {text}"));
         }
 
-        let data: Value = response.json().await.context("解析模型列表失败")?;
-        let mut ids: Vec<String> = data
-            .pointer("/data")
-            .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|m| m.pointer("/id").and_then(Value::as_str).map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        ids.sort();
-        ids.dedup();
-        observability::debug(&format!("[gateway] models: {ids:?}"));
-        Ok(ids)
+        let (code, body) = auth_fail.or(last_fail).unwrap_or((404, String::new()));
+        observability::event(
+            EventType::Error,
+            json!({ "kind": "gateway.error", "status": code, "body": body }),
+        );
+        let mut msg = format!("渠道返回 {code}");
+        if !body.trim().is_empty() {
+            msg.push_str(": ");
+            msg.push_str(&body);
+        }
+        msg.push_str(&format!("（已试 {} 个模型清单地址）", candidates.len()));
+        Err(anyhow!(msg))
     }
 
     /// 非流式单轮补全（滚动摘要 / 媒体旁路用）：返回 choices[0].message.content。
@@ -714,22 +861,26 @@ impl Gateway {
         params: &ChatParams,
     ) -> anyhow::Result<String> {
         let started = Instant::now();
-        let compat = compat::resolve(
+        let compat = compat::resolve_with_protocol(
             params.provider_id.as_deref(),
             params.base_url.as_deref().or(Some(base_url.trim())),
             model,
             params.thinking_format,
+            params.protocol,
         );
-        let url = Self::request_url(base_url, compat.protocol);
+        let url = Self::endpoint_url_with(base_url, compat.protocol, params.suffix_auto);
         // 降级登记：该端点已确认拒收思考字段 → 本请求直接不发（人话提示由每轮渠道组装时出）
         let degraded = self.thinking_is_degraded(base_url, model);
-        let eff_params = if degraded {
+        let mut eff_params = if degraded {
             let mut p = params.clone();
             p.thinking = None;
             p
         } else {
             params.clone()
         };
+        // 实际请求地址写回参数：适配器的回放来源指纹按它判定（请求级覆盖/降级链
+        // 与配置里的 base_url 可能不同，不能用旧值）
+        eff_params.base_url = Some(url.clone());
         let mut outgoing = messages.clone();
         replay::apply_outgoing_transforms(&mut outgoing, model, &compat);
         let body = build_body_with_compat(model, &outgoing, false, &eff_params, None, &compat, &ctx.session_id);
@@ -796,11 +947,17 @@ impl Gateway {
             return Err(anyhow!("渠道返回 {status}: {text}"));
         }
         let data: Value = response.json().await.context("解析补全响应失败")?;
-        if let Some(err) = data.get("error") {
+        if let Some(err) = body_error(&data) {
             let msg = err.get("message").and_then(Value::as_str).unwrap_or_default();
             record_usage(ctx, base_url, params.provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("error", format!("渠道业务错误: {msg}")));
             return Err(anyhow!("渠道业务错误: {msg} (raw: {err})"));
         }
+        // Responses 协议：合成回 OpenAI chat.completion 形状，usage/正文抽取零感知
+        let data = if compat.protocol == Protocol::OpenAiResponses {
+            responses::to_openai_completion(&data)
+        } else {
+            data
+        };
         // 台账：usage 三路分计量（渠道不回 usage 时记 0，请求与延迟照记）
         let (p, c, k) = usage_triple(&data);
         record_usage(ctx, base_url, params.provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::ok((p, c, k)));
@@ -829,7 +986,8 @@ impl Gateway {
                         .collect::<String>()
                 })
                 .unwrap_or_default(),
-            Protocol::OpenAiCompletions => data
+            // Responses 已在上方合成回 OpenAI 形状
+            Protocol::OpenAiCompletions | Protocol::OpenAiResponses => data
                 .pointer("/choices/0/message/content")
                 .and_then(Value::as_str)
                 .unwrap_or("")
@@ -858,8 +1016,7 @@ impl Gateway {
         if api_key.trim().is_empty() {
             return Err(anyhow!("API key 未设置，无法调用 embeddings"));
         }
-        let b = base_url.trim().trim_end_matches('/');
-        let url = format!("{b}/embeddings");
+        let url = embed_url(base_url);
         let body = json!({ "model": model, "input": input });
         observability::event(EventType::State, json!({ "kind": "gateway.request", "url": redact_url(&url), "purpose": "embedding", "inputs": input.len() }));
         let response = self
@@ -913,6 +1070,19 @@ impl Channel {
     }
 }
 
+/// 渠道实际会走的传输协议（配置锁定 > 端点探测）——供媒体旁路这类需要「先判断
+/// 这路媒体能不能发」的调用方使用，与 complete / stream_chat 内部解析同一把尺子。
+pub fn channel_protocol(params: &ChatParams, base_url: &str, model: &str) -> Protocol {
+    compat::resolve_with_protocol(
+        params.provider_id.as_deref(),
+        params.base_url.as_deref().or(Some(base_url.trim())),
+        model,
+        params.thinking_format,
+        params.protocol,
+    )
+    .protocol
+}
+
 impl Gateway {
     /// 一轮模型调用 → 流式输出并聚合结果。
     ///
@@ -963,22 +1133,25 @@ impl Gateway {
             return Ok(ChatOutcome::Cancelled(None));
         }
 
-        let compat = compat::resolve(
+        let compat = compat::resolve_with_protocol(
             channel.params.provider_id.as_deref(),
             Some(base_url.trim()),
             &channel.model,
             channel.params.thinking_format,
+            channel.params.protocol,
         );
-        let url = Self::request_url(base_url, compat.protocol);
+        let url = Self::endpoint_url_with(base_url, compat.protocol, channel.params.suffix_auto);
         // 降级登记：该端点已确认拒收思考字段 → 本请求直接不发（人话提示由每轮渠道组装时出）
         let degraded = self.thinking_is_degraded(base_url, model);
-        let eff_params = if degraded {
+        let mut eff_params = if degraded {
             let mut p = channel.params.clone();
             p.thinking = None;
             p
         } else {
             channel.params.clone()
         };
+        // 实际请求地址写回参数：回放来源指纹与 400 剥参重试共用同一份
+        eff_params.base_url = Some(url.clone());
         let mut outgoing = messages.clone();
         replay::apply_outgoing_transforms(&mut outgoing, &channel.model, &compat);
         // 思考预算扩容：思考开启时上游把思考+正文算进同一个 max_tokens，用户配的
@@ -1201,9 +1374,11 @@ impl Gateway {
         // 说明关键分片（典型是携带 tool_calls 的那个）被吞了——必须报错而不是
         // 当「模型给了空回答」静默结束（2026-10-08 修）。
         let mut parse_failures = 0usize;
-        // Anthropic 协议：事件流经 SseTranslator 合成回 OpenAI delta 分片再进同一聚合器
+        // Anthropic / Responses 协议：事件流经各自 SseTranslator 合成回 OpenAI delta 分片再进同一聚合器
         let mut translator = anthropic::SseTranslator::default();
+        let mut responses_translator = responses::SseTranslator::default();
         let is_anthropic = compat.protocol == Protocol::AnthropicMessages;
+        let is_responses = compat.protocol == Protocol::OpenAiResponses;
         // 打断信号（「立即发送」）：None = 该调用不支持打断（摘要/标题等辅助调用）。
         // 用一个进程级永不置位的信号兜底，select! 不用分叉两套写法。
         static NEVER_INTERRUPT: std::sync::OnceLock<CancelFlag> = std::sync::OnceLock::new();
@@ -1382,6 +1557,22 @@ impl Gateway {
                             break;
                         }
                         Ok(anthropic::Translated::Ignore) => {}
+                        Err(msg) => {
+                            record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("error", format!("渠道流式错误: {msg}")));
+                            anyhow::bail!("渠道流式错误: {msg}");
+                        }
+                    }
+                } else if is_responses {
+                    match responses_translator.translate(&chunk) {
+                        Ok(responses::Translated::Chunk(mut synthetic)) => {
+                            agg.feed(&mut synthetic, &data);
+                            on_chunk(&synthetic);
+                        }
+                        Ok(responses::Translated::Done) => {
+                            done = true;
+                            break;
+                        }
+                        Ok(responses::Translated::Ignore) => {}
                         Err(msg) => {
                             record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("error", format!("渠道流式错误: {msg}")));
                             anyhow::bail!("渠道流式错误: {msg}");

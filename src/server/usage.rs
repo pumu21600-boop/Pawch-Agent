@@ -20,6 +20,7 @@ pub(super) async fn get_usage(State(state): State<AppState>, Query(q): Query<Usa
         "from": report.from,
         "rows": report.rows,
         "totals": report.totals,
+        "totals_main": report.totals_main,
         "spend_cap_usd": report.spend_cap_usd,
         "spend_total_usd": report.spend_total_usd,
         "priced": report.priced,

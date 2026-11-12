@@ -116,12 +116,22 @@ pub(super) async fn save_schedule(
             let last_status = t.last_status.clone();
             let last_error = t.last_error.clone();
             let last_session = t.last_session_id.clone();
+            // 已完成的单次任务被编辑并重新启用（选了将来的时间）：清掉完成态，
+            // 卡片回到「待运行」，不再顶着上一次的「已完成」。
+            let reactivated_done = t.once_ts > 0
+                && last_status.as_deref() == Some("done")
+                && req.enabled;
             *t = req.clone();
             t.created_ts = created;
             t.last_run_ts = last_run;
             t.last_manual_ts = last_manual;
-            t.last_status = last_status;
-            t.last_error = last_error;
+            if reactivated_done {
+                t.last_status = None;
+                t.last_error = None;
+            } else {
+                t.last_status = last_status;
+                t.last_error = last_error;
+            }
             t.last_session_id = last_session;
         } else {
             return (

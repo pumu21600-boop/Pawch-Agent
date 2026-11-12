@@ -91,6 +91,10 @@ pub async fn panel_state() -> Value {
         // agent 工具最近一次碰浏览器的时间戳（0 = 没有过）——前端据此自动唤起面板
         "agentTouched": s.agent_touched_ms.load(Ordering::Relaxed),
         "agentTab": s.agent_tab_now(),
+        // 壳主窗口是否「看得见」（未最小化、未被完全遮挡；2026-11-09）：看不见时
+        // 可见网页的动画会被冻结。前端与真机排障都看这个字段，缺了「面板开着
+        // 却不动」就分不清是冻结门还是矩形问题。
+        "windowVisible": crate::browser::shell::window_visible(),
     })
 }
 

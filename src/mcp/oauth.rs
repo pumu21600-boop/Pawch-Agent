@@ -108,13 +108,13 @@ pub fn token_for(name: &str) -> Option<McpTokens> {
 
 /// 存/更新 token（内存 + 落盘）。
 pub fn store_tokens(name: &str, tokens: McpTokens) {
-    let snapshot = {
-        let mut c = token_cache().lock().unwrap_or_else(|e| e.into_inner());
-        c.insert(name.to_string(), tokens);
-        c.clone()
-    };
+    let mut c = token_cache().lock().unwrap_or_else(|e| e.into_inner());
+    c.insert(name.to_string(), tokens);
+    // 2026-11-10：落盘也在同一把锁内——旧实现锁外 save 快照，两个 server 并发
+    // 授权/刷新时慢的那次会用旧快照盖掉新条目（重启后「授权凭空消失」）。
+    // 文件很小，持锁 IO 可接受。
     // N4：落盘失败不许静默吞——token 只在内存里，重启后「已授权」凭空消失且无迹可查
-    if let Err(e) = save_all(&snapshot) {
+    if let Err(e) = save_all(&c) {
         observability::event(
             observability::EventType::Error,
             json!({ "kind": "mcp.token_persist_failed", "server": name, "error": format!("{e:#}") }),
@@ -124,13 +124,10 @@ pub fn store_tokens(name: &str, tokens: McpTokens) {
 
 /// 撤销授权（删 token；下次调用回到「未授权」人话错误）。
 pub fn revoke(name: &str) {
-    let snapshot = {
-        let mut c = token_cache().lock().unwrap_or_else(|e| e.into_inner());
-        c.remove(name);
-        c.clone()
-    };
+    let mut c = token_cache().lock().unwrap_or_else(|e| e.into_inner());
+    c.remove(name);
     // N4：落盘失败不许静默吞——token 只在内存里，重启后「已授权」凭空消失且无迹可查
-    if let Err(e) = save_all(&snapshot) {
+    if let Err(e) = save_all(&c) {
         observability::event(
             observability::EventType::Error,
             json!({ "kind": "mcp.token_persist_failed", "server": name, "error": format!("{e:#}") }),
@@ -233,16 +230,19 @@ pub fn start_authorize(name: &str, cfg: &McpServerCfg) -> Result<Value, String> 
 
 // ———————————————— 授权码流程 ————————————————
 
-fn http_client() -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("建 HTTP 客户端失败: {e}"))
+fn http_client(for_url: Option<&str>) -> Result<reqwest::blocking::Client, String> {
+    let mut builder = reqwest::blocking::Client::builder().timeout(Duration::from_secs(30));
+    // 2026-11-10：环回目标不走环境代理——数据面（mcp/mod.rs）早已对 127.0.0.1 关代理，
+    // OAuth 侧没跟，挂代理/VPN 时本地 MCP 的 discovery/换 token 全失败，表现成「授权失败」。
+    if for_url.map(super::is_loopback_url).unwrap_or(false) {
+        builder = builder.no_proxy();
+    }
+    builder.build().map_err(|e| format!("建 HTTP 客户端失败: {e}"))
 }
 
 /// protected-resource → authorization-server 两级 discovery（MCP 规范 + RFC 8414）。
 fn discovery(base_url: &str) -> Result<Value, String> {
-    let client = http_client()?;
+    let client = http_client(Some(base_url))?;
     let origin = origin_of(base_url)?;
     // 1) MCP 规范的 resource metadata：授权服务器可能与资源不同源
     let mut auth_servers: Vec<String> = Vec::new();
@@ -292,7 +292,7 @@ fn origin_of(url: &str) -> Result<String, String> {
 
 /// DCR 动态注册（无预置 client_id 时；服务器不支持就明说，不瞎猜）。
 fn dynamic_register(registration_endpoint: &str, redirect_uri: &str, scope: &str) -> Result<String, String> {
-    let client = http_client()?;
+    let client = http_client(Some(registration_endpoint))?;
     let mut body = json!({
         "client_name": "agent（本地编码助手）",
         "redirect_uris": [redirect_uri],
@@ -330,67 +330,82 @@ fn spawn_callback_server(path: &str, state: &str) -> Result<(u16, Receiver<Resul
     let (tx, rx): (Sender<Result<String, String>>, _) = channel();
     std::thread::spawn(move || {
         let _ = listener.set_nonblocking(true);
-        // TTL 轮询等连接：非阻塞 accept + 25ms 步进，到点收线程（不留孤儿监听）
+        // TTL 轮询等连接：非阻塞 accept + 25ms 步进，到点收线程（不留孤儿监听）。
+        // 2026-11-10：旧实现只 accept 一次——浏览器预连接/安全软件探测/错路径请求
+        // 先到时会把真正的回调吃掉，整次授权报「回调路径不匹配」。改成循环等待：
+        // 无关/错路径/错 state 的连接回 404/400 后继续等，直到本次回调到达或 TTL。
         let deadline = std::time::Instant::now() + TX_TTL;
-        let accepted = loop {
-            match listener.accept() {
-                Ok((s, _)) => break Some(s),
-                Err(_) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(25));
+        loop {
+            let accepted = loop {
+                match listener.accept() {
+                    Ok((s, _)) => break Some(s),
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                    Err(_) => break None,
                 }
-                Err(_) => break None,
+            };
+            let Some(mut stream) = accepted else {
+                let _ = tx.send(Err("授权超时（300 秒内未完成）".into()));
+                return;
+            };
+            let _ = stream.set_nonblocking(false);
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let line = req.lines().next().unwrap_or("");
+            let target = line.split_whitespace().nth(1).unwrap_or("");
+            let (got_path, query) = match target.split_once('?') {
+                Some((p, q)) => (p.to_string(), q.to_string()),
+                None => (target.to_string(), String::new()),
+            };
+            if got_path != path {
+                // 无关请求（预连接/探测/别的路径）：404 后继续等真正的回调
+                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+                continue;
             }
-        };
-        let Some(mut stream) = accepted else {
-            let _ = tx.send(Err("授权超时（300 秒内未完成）".into()));
-            return;
-        };
-        let _ = stream.set_nonblocking(false);
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-        let mut buf = [0u8; 4096];
-        let n = stream.read(&mut buf).unwrap_or(0);
-        let req = String::from_utf8_lossy(&buf[..n]).to_string();
-        let line = req.lines().next().unwrap_or("");
-        let target = line.split_whitespace().nth(1).unwrap_or("");
-        let (got_path, query) = match target.split_once('?') {
-            Some((p, q)) => (p.to_string(), q.to_string()),
-            None => (target.to_string(), String::new()),
-        };
-        let params: HashMap<String, String> = query
-            .split('&')
-            .filter_map(|kv| kv.split_once('='))
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        if got_path != path {
-            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
-            let _ = tx.send(Err("回调路径不匹配（授权服务器重定向到了别的路径）".into()));
+            let params: HashMap<String, String> = query
+                .split('&')
+                .filter_map(|kv| kv.split_once('='))
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let ok = params.get("state").map(String::as_str) == Some(state.as_str());
+            if !ok {
+                // state 对不上（旧页面/伪造/别的授权）：400 页面，但不结束本次授权
+                let body = "<html><meta charset='utf-8'><body style='font-family:sans-serif;padding:40px'><h2>授权失败</h2><p>state 不匹配，请重试。</p></body></html>";
+                let resp = format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                continue;
+            }
+            let body = if params.contains_key("error") {
+                "<html><meta charset='utf-8'><body style='font-family:sans-serif;padding:40px'><h2>授权失败</h2><p>授权服务器拒绝了本次授权，请回到 agent 重试。</p></body></html>"
+            } else {
+                "<html><meta charset='utf-8'><body style='font-family:sans-serif;padding:40px'><h2>授权成功</h2><p>可以关闭这个页面，回到 agent。</p></body></html>"
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let outcome = if let Some(err) = params.get("error") {
+                Err(format!("授权服务器拒绝: {err}"))
+            } else {
+                let code = params.get("code").cloned().unwrap_or_default();
+                if code.is_empty() {
+                    Err("回调里没有授权码".into())
+                } else {
+                    Ok(code)
+                }
+            };
+            let _ = tx.send(outcome);
             return;
         }
-        let ok = params.get("state").map(String::as_str) == Some(state.as_str());
-        let body = if ok {
-            "<html><meta charset='utf-8'><body style='font-family:sans-serif;padding:40px'><h2>授权成功</h2><p>可以关闭这个页面，回到 agent。</p></body></html>"
-        } else {
-            "<html><meta charset='utf-8'><body style='font-family:sans-serif;padding:40px'><h2>授权失败</h2><p>state 不匹配，请重试。</p></body></html>"
-        };
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        let _ = stream.write_all(resp.as_bytes());
-        let outcome = if !ok {
-            Err("state 不匹配（可能不是本次授权）".into())
-        } else if let Some(err) = params.get("error") {
-            Err(format!("授权服务器拒绝: {err}"))
-        } else {
-            let code = params.get("code").cloned().unwrap_or_default();
-            if code.is_empty() {
-                Err("回调里没有授权码".into())
-            } else {
-                Ok(code)
-            }
-        };
-        let _ = tx.send(outcome);
     });
     Ok((port, rx))
 }
@@ -463,7 +478,7 @@ fn exchange_code(
     redirect_uri: &str,
     base_url: &str,
 ) -> Result<McpTokens, String> {
-    let client = http_client()?;
+    let client = http_client(Some(token_ep))?;
     let mut form: Vec<(String, String)> = vec![
         ("grant_type".into(), "authorization_code".into()),
         ("code".into(), code.to_string()),
@@ -488,7 +503,7 @@ fn run_client_credentials(base_url: &str, oauth: &McpOAuthCfg) -> Result<McpToke
     if oauth.client_id.trim().is_empty() || oauth.client_secret.trim().is_empty() {
         return Err("client_credentials 需要 client_id 与 client_secret".into());
     }
-    let client = http_client()?;
+    let client = http_client(Some(&token_ep))?;
     let mut form: Vec<(String, String)> = vec![
         ("grant_type".into(), "client_credentials".into()),
         ("client_id".into(), oauth.client_id.trim().to_string()),
@@ -543,7 +558,7 @@ pub fn refresh_if_needed(name: &str, base_url: &str, oauth: &McpOAuthCfg, tokens
         .and_then(Value::as_str)
         .ok_or("授权服务器元数据缺 token_endpoint")?
         .to_string();
-    let client = http_client()?;
+    let client = http_client(Some(&token_ep))?;
     let form: Vec<(String, String)> = vec![
         ("grant_type".into(), "refresh_token".into()),
         ("refresh_token".into(), tokens.refresh_token.clone()),
@@ -560,9 +575,17 @@ pub fn refresh_if_needed(name: &str, base_url: &str, oauth: &McpOAuthCfg, tokens
             Ok(fresh)
         }
         Err(e) => {
-            // 刷新失败不静默：撤销旧 token，让下次调用回「未授权」人话错误
-            revoke(name);
-            Err(format!("token 刷新失败（{e}），请重新授权"))
+            // 2026-11-10：只有授权服务器明确说 invalid_grant（token 真废了）才撤销；
+            // 网络抖动/超时/5xx 保留现有 token 等下次重试——旧实现一律 revoke，
+            // 一次 30s 网络抖动就逼用户重新走授权。
+            if e.contains("invalid_grant") {
+                revoke(name);
+                Err(format!("token 刷新失败（{e}），请重新授权"))
+            } else {
+                Err(format!(
+                    "token 刷新暂时失败（{e}），已保留现有授权，请稍后重试"
+                ))
+            }
         }
     }
 }
@@ -655,13 +678,41 @@ mod tests {
         assert_eq!(code, "the_code");
     }
 
+    /// 2026-11-10：错误 state / 错路径的请求不再把整次授权判死——回 400/404 后
+    /// 继续等真正的回调（浏览器预连接/安全软件探测会先到）。
     #[tokio::test]
-    async fn callback_server_rejects_bad_state() {
+    async fn callback_server_ignores_bad_requests_until_real_callback() {
         let (port, rx) = spawn_callback_server("/callback", "st_right").unwrap();
         // 同上：no_proxy 直连环回，不吃进程级代理环境变量
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let url = format!("http://127.0.0.1:{port}/callback?code=x&state=st_wrong");
-        let _ = client.get(&url).send().await.unwrap().text().await.unwrap();
-        assert!(rx.recv().unwrap().is_err(), "state 不匹配必须拒绝");
+        // 错路径（404）与错 state（400）：都不许结束本次授权
+        let _ = client
+            .get(format!("http://127.0.0.1:{port}/wrong-path?code=x&state=st_right"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let bad = client
+            .get(format!("http://127.0.0.1:{port}/callback?code=x&state=st_wrong"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(bad.contains("授权失败"), "错误 state 页面应提示失败");
+        // 真正的回调随后到达 → 成功
+        let good = client
+            .get(format!("http://127.0.0.1:{port}/callback?code=the_code&state=st_right"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(good.contains("授权成功"), "真正的回调应成功");
+        assert_eq!(rx.recv().unwrap().unwrap(), "the_code");
     }
 }

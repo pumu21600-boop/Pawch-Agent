@@ -2,16 +2,10 @@
   "providers": [
     {
       "id": "openai_compat",
-      "name": "OpenAI兼容",
+      "name": "自定义供应商",
       "default_base_url": "",
       "default_model": "",
       "key_optional": true
-    },
-    {
-      "id": "anthropic",
-      "name": "Anthropic兼容",
-      "default_base_url": "https://api.anthropic.com",
-      "default_model": ""
     },
     {
       "id": "deepseek",

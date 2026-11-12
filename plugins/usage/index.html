@@ -278,26 +278,35 @@ function renderUsage(r) {
     $('usageBody').innerHTML = '<div class="empty">本次对话还没有模型调用。</div>';
     return;
   }
+  // 主循环子合计（2026-11-11）：图片/视频/音频理解转接（purpose=media）也真实花钱，
+  // 但没有缓存概念——混进分母会把缓存命中率稀释出假差异（真机：面板 90.1% vs 圆环 91.6%）。
+  // 四格大字与请求次数按主模型口径（与圆环「平均缓存命中率」同源），转接流量单列一行；费用仍按全口径。
+  const m = r.totals_main && r.totals_main.requests ? r.totals_main : t;
   // 输入 = prompt_tokens 总量，**含缓存输入**（渠道口径就是含的：OpenAI prompt_tokens、
   // Anthropic 已并回 cache_read/cache_creation；缓存输入是它的子集，单列展示占比）。
   // 价格表的「输入」列仍是单价口径（非缓存部分按输入价、缓存按缓存价），两者不冲突。
-  const inputTotal = t.prompt_tokens || 0;
-  const inputOnly = Math.max(inputTotal - (t.cached_tokens || 0), 0); // 仅用于悬停提示的拆分说明
+  const inputTotal = m.prompt_tokens || 0;
+  const inputOnly = Math.max(inputTotal - (m.cached_tokens || 0), 0); // 仅用于悬停提示的拆分说明
   // 缓存命中率 = 缓存输入 / 输入总量（分母是含缓存的总量；输入为 0 时不给百分比）
-  const hitRate = inputTotal > 0 && t.cached_tokens != null ? ((t.cached_tokens / inputTotal) * 100).toFixed(1) + '%' : '—';
+  const hitRate = inputTotal > 0 && m.cached_tokens != null ? ((m.cached_tokens / inputTotal) * 100).toFixed(1) + '%' : '—';
   // 计时行（2026-11-08）：平均首 token 延迟 / 平均输出速度来自台账的流式计时；
   // 旧记录没这两个字段，聚合为 null 时显示 —（新会话跑一两条就有了）
-  const ttft = t.avg_ttft_ms;
-  const tps = t.avg_out_tps;
+  const ttft = m.avg_ttft_ms;
+  const tps = m.avg_out_tps;
+  const mediaReq = Math.max((t.requests || 0) - (m.requests || 0), 0);
+  const mediaRow = mediaReq > 0
+    ? `<div class="mrow"><span>媒体理解转接</span><span class="mv" title="图片/视频/音频理解的旁路专家请求，另计">${num(mediaReq)} 次 · 输入 ${num(Math.max((t.prompt_tokens || 0) - (m.prompt_tokens || 0), 0))} tok</span></div>`
+    : '';
   $('usageBody').innerHTML = `
     <div class="stats">
-      <div class="stat"><span class="sk">输入（含缓存）</span><span class="sv" title="其中缓存输入 ${num(t.cached_tokens)}，非缓存 ${num(inputOnly)}">${num(inputTotal)}</span></div>
-      <div class="stat"><span class="sk">缓存输入</span><span class="sv">${num(t.cached_tokens)}</span></div>
+      <div class="stat"><span class="sk">输入（含缓存）</span><span class="sv" title="其中缓存输入 ${num(m.cached_tokens)}，非缓存 ${num(inputOnly)}">${num(inputTotal)}</span></div>
+      <div class="stat"><span class="sk">缓存输入</span><span class="sv">${num(m.cached_tokens)}</span></div>
       <div class="stat"><span class="sk">缓存命中率</span><span class="sv">${hitRate}</span></div>
-      <div class="stat"><span class="sk">输出</span><span class="sv">${num(t.completion_tokens)}</span></div>
+      <div class="stat"><span class="sk">输出</span><span class="sv">${num(m.completion_tokens)}</span></div>
     </div>
     <div class="meta">
-      <div class="mrow"><span>请求次数</span><span class="mv">${num(t.requests)}</span></div>
+      <div class="mrow"><span>请求次数</span><span class="mv">${num(m.requests)}</span></div>
+      ${mediaRow}
       <div class="mrow"><span>费用</span><span class="mv strong">${money(t.cost_usd)}</span></div>
       <div class="mrow"><span>平均首 token 延迟</span><span class="mv">${ttft != null ? num(ttft) + ' ms' : '—'}</span></div>
       <div class="mrow"><span>平均输出速度</span><span class="mv">${tps != null ? tps.toFixed(1) + ' tok/s' : '—'}</span></div>

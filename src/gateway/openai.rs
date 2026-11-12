@@ -11,11 +11,12 @@ pub fn build_body(
     params: &ChatParams,
     tools: Option<&Value>,
 ) -> Value {
-    let compat = compat::resolve(
+    let compat = compat::resolve_with_protocol(
         params.provider_id.as_deref(),
         params.base_url.as_deref(),
         model,
         params.thinking_format,
+        params.protocol,
     );
     build_body_with_compat(model, messages, stream, params, tools, &compat, "")
 }
@@ -174,10 +175,13 @@ pub fn build_body_with_compat(    model: &str,
     compat: &Compat,
     session_id: &str,
 ) -> Value {
-    // Anthropic Messages 协议：请求体形状完全不同，交给专用适配器；
+    // Anthropic Messages / OpenAI Responses 协议：请求体形状完全不同，交给专用适配器；
     // 响应侧同样由适配器合成为 OpenAI 分片，下游零感知
     if compat.protocol == Protocol::AnthropicMessages {
         return anthropic::build_body(model, messages, stream, params, tools, compat);
+    }
+    if compat.protocol == Protocol::OpenAiResponses {
+        return responses::build_body(model, messages, stream, params, tools, compat, session_id);
     }
     // tool 结果里的截图投递（2026-11-02 统一）：模型能看图（勾了「图片解析」）就把图
     // 挪进紧随其后的 user 消息——和用户发附件同形，OpenAI 协议只允许图活在 user 消息里；
@@ -401,6 +405,16 @@ impl StreamAgg {
             self.turn.reasoning_first_at.get_or_insert(now);
             self.turn.reasoning_last_at = Some(now);
         }
+        // 回放元数据：Anthropic 思考签名 / Responses 加密思考条目（随 turn 落到消息上）
+        if let Some(sig) = &delta.reasoning_signature {
+            self.turn.reasoning_signature = Some(sig.clone());
+        }
+        if let Some(enc) = &delta.reasoning_encrypted {
+            self.turn.reasoning_encrypted = Some(enc.clone());
+        }
+        if !delta.reasoning_blocks.is_empty() {
+            self.turn.reasoning_blocks.extend(delta.reasoning_blocks.iter().cloned());
+        }
         if tc_arr.is_some() || payload.get("finish_reason").is_some() {
             payload["raw"] = json!(data);
         }
@@ -470,6 +484,13 @@ pub struct Delta {
     pub content: String,
     pub reasoning: Option<String>,
     pub finish: Option<String>,
+    /// Anthropic 思考块签名（随 signature_delta 到达；回放时要原样带回）
+    pub reasoning_signature: Option<String>,
+    /// Responses 思考条目加密内容（回放时作为 reasoning item 的 encrypted_content）
+    pub reasoning_encrypted: Option<String>,
+    /// 思考块序列（Anthropic thinking/redacted_thinking、Responses reasoning 条目），
+    /// 按到达顺序累积；回放时逐块原样带回
+    pub reasoning_blocks: Vec<Value>,
 }
 
 /// 上游把错误塞进 200 的 SSE 分片里（典型：中转/队列服务返回
@@ -512,6 +533,21 @@ pub fn extract_delta(chunk: &Value) -> Delta {
         content: delta.pointer("/content").and_then(Value::as_str).unwrap_or("").to_string(),
         reasoning: extract_reasoning(&delta),
         finish: choice.pointer("/finish_reason").and_then(Value::as_str).map(String::from),
+        reasoning_signature: delta
+            .get("reasoning_signature")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(String::from),
+        reasoning_encrypted: delta
+            .get("reasoning_encrypted")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(String::from),
+        reasoning_blocks: delta
+            .get("reasoning_blocks")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
     }
 }
 

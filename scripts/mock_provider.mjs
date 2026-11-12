@@ -499,12 +499,35 @@ http
         const slowLoop = isChildRound && /慢循环/.test(JSON.stringify(msgs));
         const wantsTool =
           hasToolsParam && !spawnTwo && !spawnThree && !spawnOne && !spawnFetch && !wantComputer && (/读/.test(lastText) || slowLoop);
-        // 思考块：无论如何都吐一段（验证 thinking_delta → reasoning_content 通道）
+        // 思考块：吐一段（验证 thinking_delta → reasoning_content 通道）
         const ti = startBlock({ type: 'thinking', thinking: '' });
         ev('content_block_delta', {
           type: 'content_block_delta',
           index: ti,
           delta: { type: 'thinking_delta', thinking: '模拟思考：请求形状是 Messages 协议。' },
+        });
+        // 官方流必带签名（signature_delta）：没有它，下一轮工具请求无法回放
+        // thinking 块，网关会按「历史会话缺签名」退回不开思考（2026-11-11）。
+        ev('content_block_delta', {
+          type: 'content_block_delta',
+          index: ti,
+          delta: { type: 'signature_delta', signature: 'sig-mock-1' },
+        });
+        stopBlock();
+        // 安全拦截块（只有密文，无 delta）：回放必须原样带回
+        const ri = startBlock({ type: 'redacted_thinking', data: 'redacted-enc-1' });
+        stopBlock();
+        // 第二个思考块：验证 interleaved 多块按原序回放
+        const ti2 = startBlock({ type: 'thinking', thinking: '' });
+        ev('content_block_delta', {
+          type: 'content_block_delta',
+          index: ti2,
+          delta: { type: 'thinking_delta', thinking: '模拟思考二：工具轮也要能回放。' },
+        });
+        ev('content_block_delta', {
+          type: 'content_block_delta',
+          index: ti2,
+          delta: { type: 'signature_delta', signature: 'sig-mock-2' },
         });
         stopBlock();
         // 流式吐一个 tool_use 块（官方形状：start → input_json_delta 分片 → stop）

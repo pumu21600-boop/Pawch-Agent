@@ -37,6 +37,16 @@ export function configLabel(c) {
   return c.name || '未命名';
 }
 
+/// 配置组头的能力徽标：同名模型常出现在多条配置上（如都叫 deepseek-x），
+/// 点错一条就换了主渠道；把「音频/视频」勾选标在组头上，选之前一眼能分辨
+export function cfgMediaBadge(c) {
+  const caps = (c && c.capabilities) || {};
+  const tags = [];
+  if (caps.audio) tags.push('音频');
+  if (caps.video) tags.push('视频');
+  return tags.length ? ' · ' + tags.join('+') : '';
+}
+
 // inferCapabilities（按模型名猜图片/视频/音频能力）已随智能预测机制一并删除——
 // 聚合渠道上名字与真实能力对不上；能力一律以设置里手动勾选为准。
 

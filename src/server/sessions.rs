@@ -123,16 +123,20 @@ pub(super) async fn session_meta(
 #[derive(Debug, Deserialize)]
 pub struct ForkRequest {
     pub id: String,
+    /// 只分叉到第几条用户消息（含）；缺省 = 整条会话
+    #[serde(default)]
+    pub user_index: Option<usize>,
 }
 
-/// POST /api/sessions/fork —— DSH 式「分叉会话」：复制消息/摘要/工作区为新会话。
+/// POST /api/sessions/fork —— 分叉会话：复制消息/摘要/工作区为新会话。
+/// 带 user_index 时复制到该条用户消息为止（消息操作条的「从这条消息分叉」）。
 pub(super) async fn fork_session(
     State(state): State<AppState>,
     Json(req): Json<ForkRequest>,
 ) -> (StatusCode, Json<Value>) {
     let sess = state.session.clone();
     let id = req.id.clone();
-    match tokio::task::spawn_blocking(move || sess.fork(&id)).await {
+    match tokio::task::spawn_blocking(move || sess.fork(&id, req.user_index)).await {
         Ok(Ok(new_id)) => (StatusCode::OK, Json(json!({ "ok": true, "id": new_id }))),
         Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() }))),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
@@ -445,17 +449,18 @@ pub(super) fn refresh_ring_after_truncate(state: &AppState, id: &str) {
         let s = state.settings.read().unwrap_or_else(|e| e.into_inner()).clone();
         // 一套配置都没有（极端/测试态）= 按不计入处理，绝不 panic（请求路径不许崩）
         if s.configs.is_empty() {
-            false
+            crate::context::ReasoningCount::None
         } else {
             let active = s.active_or_default().clone();
             let ch = crate::server::chat::assemble_turn_channels(state, &s, &active, "", "", "");
-            let compat = crate::gateway::compat::resolve(
+            let compat = crate::gateway::compat::resolve_with_protocol(
                 ch.primary.params.provider_id.as_deref(),
                 Some(ch.primary.base_url.trim()),
                 &ch.primary.model,
                 ch.primary.params.thinking_format,
+                ch.primary.params.protocol,
             );
-            crate::gateway::replay::should_preserve_replay(&ch.primary.model, &compat)
+            crate::gateway::replay::reasoning_count(&compat, &ch.primary.model)
         }
     };
     let mut b = crate::context::estimate_breakdown(&view, count_reasoning);

@@ -29,7 +29,7 @@ pub mod oauth;
 use std::{
     collections::{BTreeMap, HashMap},
     io::{BufRead, BufReader, Write},
-    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    process::{Child, ChildStdin, Command, Stdio},
     sync::{Arc, Mutex, OnceLock, RwLock},
     time::Duration,
 };
@@ -90,7 +90,13 @@ struct ServerState {
     /// stdio 子进程的 kill-on-close 保险丝（审计 09：服务硬杀/崩溃时 node 树不留孤儿）
     job: Option<crate::jobguard::ChildJob>,
     stdin: Option<ChildStdin>,
-    reader: Option<BufReader<ChildStdout>>,
+    /// stdout 行通道（2026-11-10 修）：reader 线程把每行推进来，rpc_round 侧带
+    /// 超时 receive——直接在调用里 read_line 没有超时，server 卡住不输出会永久
+    /// 阻塞并一直持有执行态锁，该 server 之后每次都等满超时、还泄漏读线程。
+    rx: Option<std::sync::mpsc::Receiver<String>>,
+    /// stdio 子进程 stderr 尾部（环形 50 行）：握手/调用失败时附在错误里，让
+    /// 「npx 拉不起包 / server panic」这类真因可见，而不是只剩一句超时（2026-11-10）。
+    stderr_tail: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
     /// HTTP transport 态（Some 即代表该 server 走 http）
     http: Option<HttpState>,
     /// SSE transport 态（Some 即代表该 server 走 sse）
@@ -108,10 +114,23 @@ impl ServerState {
         self.job = None;
         self.child = None;
         self.stdin = None;
-        self.reader = None;
+        self.rx = None;
         self.http = None;
         self.sse = None; // 丢 rx → reader 线程下一次 send 失败即自行退出
         self.online = false;
+    }
+
+    /// stderr 尾部摘要（诊断用；空则空串，非空时带「；server stderr：」前缀）。
+    fn stderr_hint(&self) -> String {
+        let t = self.stderr_tail.lock().unwrap_or_else(|e| e.into_inner());
+        if t.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "；server stderr：{}",
+                t.iter().cloned().collect::<Vec<_>>().join(" | ")
+            )
+        }
     }
 }
 
@@ -140,18 +159,72 @@ impl ServerBrief {
     }
 }
 
+/// 待同步配置：settings 保存时若该 server 正被长调用占用执行态锁，不阻塞等待，
+/// 只记下待应用变更，等它下一次调用/刷新时在锁内应用（2026-11-10 P1：一次慢
+/// MCP 调用曾把保存设置/切换工作区整条链挂住最长 120s）。
+#[derive(Clone, Default)]
+enum PendingCfg {
+    #[default]
+    None,
+    Set(Box<McpServerCfg>),
+    Remove,
+}
+
+impl PendingCfg {
+    fn apply(&self, st: &mut ServerState) {
+        match self {
+            PendingCfg::None => {}
+            PendingCfg::Remove => {
+                st.reset_proc();
+                st.cfg = None;
+                st.tools.clear();
+            }
+            PendingCfg::Set(c) => {
+                if st.cfg.as_ref().map(|old| cfg_changed(old, c)).unwrap_or(true) {
+                    st.reset_proc();
+                    st.tools.clear();
+                }
+                st.cfg = Some((**c).clone());
+            }
+        }
+    }
+}
+
+fn cfg_changed(old: &McpServerCfg, new: &McpServerCfg) -> bool {
+    old.command != new.command
+        || old.args != new.args
+        || old.env != new.env
+        || old.transport != new.transport
+        || old.url != new.url
+        || old.headers != new.headers
+        || old.oauth != new.oauth
+        || old.enabled != new.enabled
+}
+
 /// 一个 server 的两层状态：
 /// - `state`：进程/连接/rpc 执行态（大锁，可能被 120s 的 tools/call 长期持有）
 /// - `brief`：供 risk_for / tool_definitions / status / catalogs 读的轻量快照
+/// - `pending`：拿不到执行态锁时的待同步配置（不阻塞设置保存）
 struct ManagedServer {
     state: Mutex<ServerState>,
     brief: RwLock<ServerBrief>,
+    pending: Mutex<PendingCfg>,
 }
 
 impl ManagedServer {
     fn new(state: ServerState) -> Arc<Self> {
         let brief = ServerBrief::from_state(&state);
-        Arc::new(Self { state: Mutex::new(state), brief: RwLock::new(brief) })
+        Arc::new(Self {
+            state: Mutex::new(state),
+            brief: RwLock::new(brief),
+            pending: Mutex::new(PendingCfg::None),
+        })
+    }
+
+    /// 应用待同步配置。调用方必须持有 `state` 锁（ensure_online 等入口开头调）。
+    fn apply_pending(&self, st: &mut ServerState) {
+        let p = std::mem::take(&mut *self.pending.lock().unwrap_or_else(|e| e.into_inner()));
+        p.apply(st);
     }
 
     /// 改完执行态后同步快照（调用方必须持有 `state` 锁，避免读到半更新状态）。
@@ -198,45 +271,52 @@ pub fn split_full_name(full: &str) -> Option<(String, String)> {
 /// 下次工具调用/refresh 时按需重连（无 token 的 OAuth 服务会拿到「需要授权」人话）。
 pub fn force_offline(name: &str) {
     let Some(ms) = managed(name) else { return };
-    let mut st = ms.state.lock().unwrap_or_else(|e| e.into_inner());
-    st.reset_proc();
-    st.tools.clear();
-    ms.publish(&st);
+    let pending = match ms.state.try_lock() {
+        Ok(mut st) => {
+            st.reset_proc();
+            st.tools.clear();
+            ms.publish(&st);
+            PendingCfg::None
+        }
+        // 长调用在跑：不能阻塞撤销/停用，留待下一次交互时应用
+        Err(_) => PendingCfg::Remove,
+    };
+    *ms.pending.lock().unwrap_or_else(|e| e.into_inner()) = pending;
 }
 
 /// settings 加载/保存后同步配置：新增的占位、删除的杀进程下线。
 /// 不在这里主动 spawn（首次工具调用/refresh 时按需启动）。
 pub fn sync_configs(cfgs: &[McpServerCfg]) {
     let names: Vec<String> = cfgs.iter().map(|c| c.name.clone()).collect();
-    // 先在**全局表锁外**逐个改执行态：某个 server 正在跑长 rpc 时只会让本次同步等它，
-    // 不会把整张表（risk_for / tool_definitions 的入口）一起堵住。
+    // 在**全局表锁外**逐个改执行态。2026-11-10 修：拿得到执行态锁就地应用；
+    // 拿不到（该 server 正跑 120s 的 tools/call）绝不阻塞等待——只记 pending，
+    // 等它下一次调用/刷新时应用。原先阻塞式 lock 会把「保存设置/切换工作区/
+    // 外部配置重载」整条链挂住最长两分钟。
     for (name, ms) in all_managed() {
-        let mut st = ms.state.lock().unwrap_or_else(|e| e.into_inner());
-        if !names.contains(&name) {
-            st.reset_proc();
-            st.cfg = None;
-            st.tools.clear();
-        } else if let Some(c) = cfgs.iter().find(|c| c.name == name) {
-            let changed = st
-                .cfg
-                .as_ref()
-                .map(|old| {
-                    old.command != c.command
-                        || old.args != c.args
-                        || old.env != c.env
-                        || old.transport != c.transport
-                        || old.url != c.url
-                        || old.headers != c.headers
-                        || old.oauth != c.oauth
-                })
-                .unwrap_or(true);
-            if changed {
-                st.reset_proc(); // 命令/传输变了要重连
-                st.tools.clear();
+        let pending = if names.contains(&name) {
+            match cfgs.iter().find(|c| c.name == name) {
+                Some(c) => PendingCfg::Set(Box::new(c.clone())),
+                None => PendingCfg::Remove,
             }
-            st.cfg = Some(c.clone());
+        } else {
+            PendingCfg::Remove
+        };
+        match ms.state.try_lock() {
+            Ok(mut st) => {
+                pending.apply(&mut st);
+                ms.publish(&st);
+                *ms.pending.lock().unwrap_or_else(|e| e.into_inner()) = PendingCfg::None;
+            }
+            Err(_) => {
+                *ms.pending.lock().unwrap_or_else(|e| e.into_inner()) = pending;
+            }
         }
-        ms.publish(&st);
+    }
+    // 已从配置移除的 server：清掉管理器条目（原来只重置执行态不删键，进程存续期内
+    // 永久留僵尸条目；2026-11-10）。先在第一轮里 reset 过，这里安全移除。
+    {
+        let mut m = mgr().lock().unwrap_or_else(|e| e.into_inner());
+        m.retain(|name, _| names.contains(name));
     }
     // 新增的 server：只建占位（cfg 就位、工具清单空），第一次调用/refresh 时拉起。
     let mut m = mgr().lock().unwrap_or_else(|e| e.into_inner());
@@ -251,12 +331,22 @@ pub fn sync_configs(cfgs: &[McpServerCfg]) {
 /// 拉起（或重连）并握手（initialize → initialized → tools/list）。
 /// 已在线则直接返回；失败断开并返回 Err（离线）。两种 transport 共用同一握手序列。
 fn ensure_online(st: &mut ServerState) -> Result<(), String> {
+    // 2026-11-10 修：停用的 server 一律拒绝——工具清单/审批虽已过滤，但调用路径
+    // 原先只查 cfg 存在，完全访问档下仍能调用并把子进程拉起来（开关形同虚设）。
+    if let Some(cfg) = &st.cfg
+        && !cfg.enabled
+    {
+        return Err(format!(
+            "MCP server「{}」已停用：请在设置里打开开关后再调用",
+            cfg.name
+        ));
+    }
     // 先收割已退出的子进程（崩溃自愈：标记离线，走下方重连路径）
     if let Some(child) = st.child.as_mut()
         && matches!(child.try_wait(), Ok(Some(_))) {
             st.reset_proc();
         }
-    if st.online && (st.http.is_some() || st.sse.is_some() || (st.stdin.is_some() && st.reader.is_some())) {
+    if st.online && (st.http.is_some() || st.sse.is_some() || (st.stdin.is_some() && st.rx.is_some())) {
         return Ok(());
     }
     st.reset_proc();
@@ -291,10 +381,14 @@ fn ensure_online(st: &mut ServerState) -> Result<(), String> {
             "clientInfo": { "name": "agent-local", "version": env!("CARGO_PKG_VERSION") }
         }
     });
-    let init_resp = rpc_round(st, &init, Some(0), 15_000).map_err(|e| {
-        st.reset_proc();
-        format!("initialize 失败: {e}")
-    })?;
+    let init_resp = match rpc_round(st, &init, Some(0), 15_000) {
+        Ok(v) => v,
+        Err(e) => {
+            let hint = st.stderr_hint();
+            st.reset_proc();
+            return Err(format!("initialize 失败: {e}{hint}"));
+        }
+    };
     // 能力声明：决定要不要暴露 resources / prompts 相关工具（拿不到就按不支持处理）
     let caps = init_resp.get("capabilities").cloned().unwrap_or_else(|| json!({}));
     st.caps = (caps.get("resources").is_some(), caps.get("prompts").is_some());
@@ -307,10 +401,14 @@ fn ensure_online(st: &mut ServerState) -> Result<(), String> {
     );
     // —— tools/list ——
     let list_req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} });
-    let resp = rpc_round(st, &list_req, Some(1), 15_000).map_err(|e| {
-        st.reset_proc();
-        format!("tools/list 失败: {e}")
-    })?;
+    let resp = match rpc_round(st, &list_req, Some(1), 15_000) {
+        Ok(v) => v,
+        Err(e) => {
+            let hint = st.stderr_hint();
+            st.reset_proc();
+            return Err(format!("tools/list 失败: {e}{hint}"));
+        }
+    };
     let tools = resp
         .get("tools")
         .and_then(Value::as_array)
@@ -401,7 +499,7 @@ fn spawn_stdio(st: &mut ServerState, cfg: &McpServerCfg) -> Result<(), String> {
         .envs(sanitize_env(&cfg.env))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null()); // server 的日志走 stderr，丢弃避免干扰（Windows 句柄由 Child drop 关闭）
+        .stderr(Stdio::piped()); // 收进环形缓冲：握手失败时把真因带出来（2026-11-10）
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW：后台服务不起黑窗
@@ -416,8 +514,55 @@ fn spawn_stdio(st: &mut ServerState, cfg: &McpServerCfg) -> Result<(), String> {
     }
     let stdin = child.stdin.take().ok_or("无 stdin")?;
     let stdout = child.stdout.take().ok_or("无 stdout")?;
+    // stderr 尾部收集（环形 50 行，不阻塞主链）：旧实现 Stdio::null() 直接丢弃，
+    // npx 拉不起包 / server panic 时用户只看到「initialize 超时」。
+    if let Some(stderr) = child.stderr.take() {
+        st.stderr_tail.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let tail = st.stderr_tail.clone();
+        let _ = std::thread::Builder::new()
+            .name(format!("mcp-stderr-{}", cfg.name))
+            .spawn(move || {
+                let mut reader = BufReader::new(stderr);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            let mut t = tail.lock().unwrap_or_else(|e| e.into_inner());
+                            if t.len() >= 50 {
+                                t.pop_front();
+                            }
+                            t.push_back(line.trim_end().to_string());
+                        }
+                    }
+                }
+            });
+    }
+    // stdout 交给独立 reader 线程收行：rpc_round 侧用 recv_timeout 带超时接收，
+    // server 卡死不再永久阻塞（2026-11-10 P1）。线程随 EOF 或通道关闭自然退出；
+    // reset_proc 丢掉 rx 即视为断开，下一次 send 失败时线程自行收尾。
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::Builder::new()
+        .name(format!("mcp-stdout-{}", cfg.name))
+        .spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if tx.send(line.clone()).is_err() {
+                            break; // 主侧已断开（reset_proc 清掉了 rx）
+                        }
+                    }
+                }
+            }
+        })
+        .map_err(|e| format!("启动 stdout reader 线程失败: {e}"))?;
     st.stdin = Some(stdin);
-    st.reader = Some(BufReader::new(stdout));
+    st.rx = Some(rx);
     st.child = Some(child);
     st.job = job;
     Ok(())
@@ -446,30 +591,59 @@ fn rpc_round(
         return Ok(Value::Null); // 通知：stdio 侧无需等待
     };
 
-    let reader = st.reader.as_mut().ok_or("进程未启动")?;
+    // 读响应：带超时从 reader 线程的通道取行（2026-11-10 修：原 read_line 没有
+    // 超时，server 一行不发就永久阻塞并一直持有执行态锁——该 server 之后每次调用
+    // 都要等满超时、还每次泄漏一条阻塞线程）。超时/EOF 属传输故障：杀进程重建，
+    // 下一次调用冷启动；JSON-RPC 业务错误（server 明确回了 error）不杀连接。
+    let outcome = {
+        let rx = st.rx.as_ref().ok_or("进程未启动")?;
+        recv_stdio_response(rx, expect_id, timeout_ms)
+    };
+    match outcome {
+        Ok(v) => Ok(v),
+        Err((transport, msg)) => {
+            if transport {
+                st.reset_proc(); // 半死连接不留给下一次调用继续堵
+            }
+            Err(msg)
+        }
+    }
+}
+
+/// 从 reader 线程的通道里等 id 匹配的响应（带总超时）。
+/// `Err((transport, msg))`：transport=true 表示超时/EOF（连接已不可用，调用方应
+/// 杀进程重建）；false 表示 server 明确回了 JSON-RPC error（连接仍可用，不杀）。
+fn recv_stdio_response(
+    rx: &std::sync::mpsc::Receiver<String>,
+    expect_id: u64,
+    timeout_ms: u64,
+) -> Result<Value, (bool, String)> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     loop {
-        if std::time::Instant::now() > deadline {
-            return Err(format!("超时（{timeout_ms}ms）"));
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err((true, format!("超时（{timeout_ms}ms）")));
         }
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => return Err("server 已退出（EOF）".into()),
-            Ok(_) => {}
-            Err(e) => return Err(format!("读 stdout: {e}")),
-        }
+        let line = match rx.recv_timeout(remaining) {
+            Ok(l) => l,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return Err((true, format!("超时（{timeout_ms}ms）")))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err((true, "server 已退出（EOF）".to_string()))
+            }
+        };
         let v: Value = match serde_json::from_str(line.trim()) {
             Ok(v) => v,
             Err(_) => continue, // 非 JSON 行跳过
         };
-        let id = v.get("id").and_then(Value::as_u64);
-        if id != Some(expect_id) {
+        if v.get("id").and_then(Value::as_u64) != Some(expect_id) {
             continue; // notification / 日志 / 串扰行跳过（自愈）
         }
-        if let Some(err) = v.get("error") {
-            return Err(format!("server 错误: {err}"));
-        }
-        return Ok(v.get("result").cloned().unwrap_or(Value::Null));
+        return match v.get("error") {
+            Some(err) => Err((false, format!("server 错误: {err}"))),
+            None => Ok(v.get("result").cloned().unwrap_or(Value::Null)),
+        };
     }
 }
 
@@ -768,6 +942,7 @@ fn parse_sse_frames(body: &str) -> Vec<Value> {
 pub fn ensure_online_by_name(name: &str) -> Result<usize, String> {
     let ms = managed(name).ok_or("未知 server")?;
     let mut st = ms.state.lock().unwrap_or_else(|e| e.into_inner());
+    ms.apply_pending(&mut st);
     let r = ensure_online(&mut st);
     let n = st.tools.len();
     // 失败也要 publish：ensure_online 已把 online 置假/清了连接，快照不能还显示在线
@@ -922,6 +1097,8 @@ pub async fn call_tool(full_name: &str, args_json: &str) -> Result<String, Strin
     // 阻塞 IO 丢进 blocking 线程池；外层 timeout 到点放弃（残留行由 id 过滤自愈）
     let fut = tokio::task::spawn_blocking(move || {
         let mut st = ms.state.lock().unwrap_or_else(|e| e.into_inner());
+        // 保存设置时若本 server 正被上一次长调用占着，新配置记在 pending——这里应用
+        ms.apply_pending(&mut st);
         let out = (|| -> Result<String, String> {
             ensure_online(&mut st)?;
             let req = json!({
@@ -961,7 +1138,7 @@ pub async fn call_tool(full_name: &str, args_json: &str) -> Result<String, Strin
     });
     match tokio::time::timeout(std::time::Duration::from_secs(125), fut).await {
         Ok(r) => r.map_err(|e| format!("MCP 调用任务失败: {e}"))?,
-        Err(_) => Err("MCP 调用超时（120s）".into()),
+        Err(_) => Err("MCP 调用超时（125s）".into()),
     }
 }
 
@@ -972,6 +1149,7 @@ async fn call_resource_or_prompt(srv: &str, tool: &str, args: Value) -> Result<S
     let ms = managed(&srv).ok_or_else(|| format!("未知 server: {srv}"))?;
     let fut = tokio::task::spawn_blocking(move || -> Result<String, String> {
         let mut st = ms.state.lock().unwrap_or_else(|e| e.into_inner());
+        ms.apply_pending(&mut st);
         let out = (|| -> Result<String, String> {
         ensure_online(&mut st)?;
         let rpc = |st: &mut ServerState, method: &str, params: Value| -> Result<Value, String> {
@@ -1600,6 +1778,54 @@ data: \"result\":{\"n\":7}}";
         assert!(!m.get("deadhttp").unwrap().brief().online, "失败后不得留在「在线」态");
     }
 
+    /// 2026-11-10 审查：停用的 server 调用一律拒绝。工具清单/审批层虽已过滤，
+    /// 但调用入口原先只查 cfg 存在——完全访问档下模型仍能调用并把子进程拉起来。
+    #[test]
+    fn disabled_server_call_rejected() {
+        let cfg: McpServerCfg = serde_json::from_value(json!({
+            "name": "zz-disabled-mcp",
+            "enabled": false,
+            "transport": "stdio",
+            "command": "no-such-cmd-for-test"
+        }))
+        .expect("cfg");
+        let mut st = ServerState { cfg: Some(cfg), ..Default::default() };
+        let err = ensure_online(&mut st).unwrap_err();
+        assert!(err.contains("已停用"), "停用要给人话拒绝: {err}");
+        assert!(!st.online, "停用不许把连接拉起来");
+    }
+
+    /// 2026-11-10 修：stdio 响应读取必须带超时——server 不输出时返回超时错误
+    /// （旧实现 read_line 永久阻塞并一直持有执行态锁）。用通道直接模拟 reader 线程。
+    #[test]
+    fn stdio_response_read_has_timeout() {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        // 正常：id 匹配即返回
+        tx.send("{\"id\":7,\"result\":{\"ok\":true}}\n".into()).unwrap();
+        let v = recv_stdio_response(&rx, 7, 1000).expect("应取到响应");
+        assert_eq!(v["ok"], json!(true));
+        // 非 JSON / 串扰 id 跳过
+        tx.send("not json\n".into()).unwrap();
+        tx.send("{\"id\":8,\"result\":1}\n".into()).unwrap();
+        tx.send("{\"id\":7,\"result\":2}\n".into()).unwrap();
+        assert_eq!(recv_stdio_response(&rx, 7, 1000).unwrap(), json!(2), "只认 id 匹配的行");
+        // 超时（server 不发）：属传输错误，调用方会杀进程
+        let t0 = std::time::Instant::now();
+        let e = recv_stdio_response(&rx, 7, 100).unwrap_err();
+        assert!(e.0, "超时属传输错误: {e:?}");
+        assert!(e.1.contains("超时"), "{e:?}");
+        assert!(t0.elapsed() >= std::time::Duration::from_millis(80), "必须真的等满超时");
+        // EOF（reader 线程退出）：Disconnected
+        drop(tx);
+        let e = recv_stdio_response(&rx, 7, 1000).unwrap_err();
+        assert!(e.0 && e.1.contains("EOF"), "{e:?}");
+        // server 明确回 JSON-RPC error：业务错误，不杀连接
+        let (tx2, rx2) = std::sync::mpsc::channel::<String>();
+        tx2.send("{\"id\":3,\"error\":{\"message\":\"bad\"}}\n".into()).unwrap();
+        let e = recv_stdio_response(&rx2, 3, 1000).unwrap_err();
+        assert!(!e.0, "业务错误不该杀连接: {e:?}");
+    }
+
     /// 工具定义顺序必须确定：manager 是 HashMap（迭代顺序每进程随机），而 tools 数组
     /// 是提示前缀的一部分（Anthropic 协议里排在 system 之后、messages 之前）。
     /// 插入顺序打乱也必须是名字序——否则重启/重连一次缓存全丢。
@@ -1639,6 +1865,50 @@ data: \"result\":{\"n\":7}}";
 
     /// 2026-10-30：一个卡住的 server（tools/call 持执行态锁 120s）不许把
     /// risk_for / tool_definitions（异步 worker 上每一步审批都调）一起堵死。
+    /// 2026-11-10 修：保存设置时若某 server 正被长调用占着执行态锁，sync_configs
+    /// 必须立即返回（记 pending），不能再阻塞最长 120s；下一次交互时在锁内应用。
+    #[test]
+    fn sync_configs_does_not_block_on_running_call() {
+        let _g = test_lock();
+        let cfg: McpServerCfg =
+            serde_json::from_value(json!({ "name": "zz-busy", "enabled": true })).expect("cfg");
+        let mut st = ServerState { cfg: Some(cfg.clone()), online: true, ..Default::default() };
+        st.tools = vec![("tool".into(), "d".into(), json!({"type":"object"}))];
+        {
+            let mut m = mgr().lock().unwrap_or_else(|e| e.into_inner());
+            m.clear();
+            m.insert("zz-busy".into(), ManagedServer::new(st));
+        }
+        let ms = managed("zz-busy").expect("刚插入");
+        // 模拟 tools/call 正持锁跑长 rpc
+        let held = ms.state.lock().unwrap_or_else(|e| e.into_inner());
+        // 改配置（停用）→ 必须立即返回，不许等锁
+        let mut new_cfg = cfg.clone();
+        new_cfg.enabled = false;
+        let t0 = std::time::Instant::now();
+        sync_configs(&[new_cfg]);
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(500),
+            "保存设置不许阻塞等执行态锁"
+        );
+        let is_set = matches!(
+            &*ms.pending.lock().unwrap_or_else(|e| e.into_inner()),
+            PendingCfg::Set(_)
+        );
+        assert!(is_set, "拿不到锁应记 pending");
+        drop(held);
+        // 下一次调用（ensure_online 入口）先应用 pending：停用生效并下线连接
+        let mut st2 = ms.state.lock().unwrap_or_else(|e| e.into_inner());
+        ms.apply_pending(&mut st2);
+        assert_eq!(st2.cfg.as_ref().map(|c| c.enabled), Some(false), "停用配置已应用");
+        assert!(!st2.online, "配置变化要下线连接");
+        drop(st2);
+        {
+            let mut m = mgr().lock().unwrap_or_else(|e| e.into_inner());
+            m.clear();
+        }
+    }
+
     #[test]
     fn slow_server_does_not_block_risk_or_tool_definitions() {
         let _g = test_lock();

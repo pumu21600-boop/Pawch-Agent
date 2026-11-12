@@ -54,6 +54,11 @@ pub(super) async fn post_skills(
             if name.trim().is_empty() {
                 return Err(err("缺少技能名".into()));
             }
+            // 2026-11-10：先校验技能真实存在——旧实现什么名字都写进停用名单，
+            // 日后真建了同名技能会「生下来就是停用」（agent 路径早有校验，HTTP 漏了）。
+            if !crate::skills::list().iter().any(|s| s.name == name) {
+                return Err(err(format!("未找到技能「{name}」")));
+            }
             let now = {
                 // 2026-10-08 修：settings 写互斥（disabled_skills 读-改-写持锁，
                 // 锁序：settings_write → settings RwLock）

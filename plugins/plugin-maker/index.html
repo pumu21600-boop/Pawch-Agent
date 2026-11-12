@@ -7,42 +7,78 @@
 <style>
   :root { scrollbar-color: var(--line2, #454039) transparent; color-scheme: dark; }
   body {
-    --bg: #151412; --fg: #f3f1ec; --dim: #8a8478; --line: #332f2a;
-    --hover: #262320; --btn-line: #454039; --err: #e5534b; --ok: #4bb543;
+    /* --bg 只剩自绘下拉在用（页面本体透明，底色交给宿主玻璃弹窗）：
+       跟宿主浮层同调（g2），hover 用深一档 g3——否则菜单白/灰于弹窗、hover 糊进底色 */
+    --bg: #262320; --fg: #f3f1ec; --dim: #8a8478; --line: #332f2a;
+    --hover: #332f2a; --btn-line: #454039; --err: #e5534b; --ok: #4bb543;
     color-scheme: dark;
   }
-  /* 根元素也跟随主题：画布 color-scheme/兜底底色只认 html（body 被微调成透明时深色画布会露底） */
-  html.light { color-scheme: light; background: #fffefc; }
+  /* 根元素也跟随主题；背景交给宿主的玻璃弹窗（插件页透明，浮层底色才透得出来） */
+  html, body { background: transparent !important; }
+  html.light { color-scheme: light; }
   body.light {
     scrollbar-color: var(--line2, #d9d3c9) transparent;
-    --bg: #fffefc; --fg: #1f1d1a; --dim: #87827a; --line: #e7e2da;
-    --hover: #f3f0eb; --btn-line: #d9d3c9; --err: #b3261e; --ok: #1e7a3f;
+    --bg: #f3f0eb; --fg: #1f1d1a; --dim: #87827a; --line: #e7e2da;
+    --hover: #e7e2da; --btn-line: #d9d3c9; --err: #b3261e; --ok: #1e7a3f;
     color-scheme: light;
   }
   * { box-sizing: border-box; }
   body {
     margin: 0; padding: 0;
     font: 13px/1.65 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
-    background: var(--bg); color: var(--fg);
+    background: transparent; color: var(--fg);
   }
   #wrap { padding: 14px 16px 6px; }
   h3 { margin: 0 0 2px; font-size: 14px; font-weight: 650; }
   label { display: block; font-size: 12px; color: var(--dim); margin: 10px 0 4px; }
   textarea, select {
-    width: 100%; font: inherit; color: var(--fg); background: var(--bg);
-    border: 1px solid var(--btn-line); border-radius: 6px; padding: 6px 8px;
+    width: 100%; font: inherit; color: var(--fg); background: transparent;
+    border: 1.5px solid var(--btn-line); border-radius: 6px; padding: 6px 8px;
   }
   textarea { min-height: 110px; }
   textarea:focus, select:focus { outline: none; border-color: var(--fg); }
+  /* 原生下拉的弹出层不认根元素的 color-scheme，必须写在 select 元素自身
+     （同宿主 ui.css 的修法），option 也要显式配色，否则弹出层白底 */
+  select { color-scheme: dark; }
+  body.light select { color-scheme: light; }
+  select option { background: var(--bg); color: var(--fg); }
   .row { display: flex; gap: 8px; margin-top: 14px; }
   button {
     font: inherit; padding: 6px 16px; border-radius: 6px; cursor: pointer;
-    border: 1px solid var(--btn-line); background: transparent; color: var(--fg);
+    border: 1.5px solid var(--btn-line); background: transparent; color: var(--fg);
   }
-  button:hover { background: var(--hover); }
+  button:hover { background: transparent; border-color: var(--dim); }
   button.primary { border-color: var(--fg); }
   button:disabled { opacity: .5; cursor: default; }
   button:disabled:hover { background: transparent; }
+  /* —— 自绘工作区下拉：原生 select 的弹出层配色 WebView2 管不到（系统浅色就是白底），
+     换成 DOM 画的菜单才稳定跟随插件自己的深浅色 —— */
+  .ws-field { position: relative; }
+  .ws-btn {
+    width: 100%; font: inherit; color: var(--fg); background: transparent;
+    border: 1.5px solid var(--btn-line); border-radius: 6px; padding: 6px 8px;
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    cursor: pointer; text-align: left;
+  }
+  .ws-btn:hover { border-color: var(--dim); }
+  .ws-btn .caret { width: 14px; height: 14px; flex: none; opacity: .7; }
+  .ws-menu {
+    /* 往上弹（用户要求）：textarea 在上方，空间够，也不会被弹窗下缘裁 */
+    position: absolute; bottom: calc(100% + 4px); left: 0; right: 0; z-index: 20;
+    /* 和宿主下拉同款透明度（92% 玻璃）：底下是透明的插件页+宿主玻璃弹窗，透得出来 */
+    background: color-mix(in srgb, var(--bg) 92%, transparent);
+    border: 1px solid var(--btn-line); border-radius: 8px;
+    max-height: 220px; overflow: auto; padding: 4px;
+    /* 分层靠描边：阴影在浅色主题下就是一圈灰晕（用户圈出） */
+    box-shadow: none;
+  }
+  .ws-opt {
+    display: block; width: 100%; text-align: left; font: inherit; color: var(--fg);
+    background: transparent; border: none; border-radius: 6px; padding: 6px 8px; cursor: pointer;
+  }
+  .ws-opt:hover { background: var(--hover); }
+  .ws-opt.sel { font-weight: 650; }
+  .ws-opt .cur { color: var(--dim); }
   /* 空消息条不占位（否则弹窗下边缘和按钮之间白多一条 margin） */
   #msg:empty { display: none; }
   .msg { margin-top: 10px; font-size: 12px; white-space: pre-wrap; }
@@ -59,7 +95,13 @@
   <label for="req">插件制作要求</label>
   <textarea id="req"></textarea>
   <label for="ws">工作区</label>
-  <select id="ws"><option>读取中…</option></select>
+  <div class="ws-field">
+    <button type="button" id="ws" class="ws-btn">
+      <span id="ws-label">读取中…</span>
+      <svg class="caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <div id="ws-menu" class="ws-menu" hidden></div>
+  </div>
   <div class="row">
     <button id="go" class="primary" disabled>确定</button>
     <button id="clear">清空</button>
@@ -73,6 +115,7 @@ let seq = 0;
 const pending = new Map();
 let booted = false;
 let wsTouched = false; // 用户手选过工作区：切项目时保留他的选择，没手选过则跟随当前
+let wsValue = ''; let wsList = []; // 自绘下拉的状态（原生 select 弹出层配色不可控）
 
 window.addEventListener('message', (ev) => {
   const d = ev.data || {};
@@ -121,9 +164,23 @@ async function boot() {
     refresh();
     growReq();
   };
-  $('ws').onchange = () => {
-    wsTouched = true;
+  // 自绘下拉：开合/选择/点外收起
+  $('ws').onclick = (e) => {
+    e.stopPropagation();
+    const m = $('ws-menu');
+    m.hidden = !m.hidden;
   };
+  $('ws-menu').onclick = (e) => {
+    e.stopPropagation();
+    const b = e.target.closest('.ws-opt');
+    if (!b) return;
+    wsTouched = true;
+    wsValue = b.dataset.v;
+    renderWs();
+    $('ws-menu').hidden = true;
+    fit();
+  };
+  document.addEventListener('click', () => { $('ws-menu').hidden = true; });
   await loadWorkspaces();
   refresh();
   fit();
@@ -152,12 +209,8 @@ async function loadWorkspaces() {
     }
   }
   if (!list.length) list.push('');
-  const prev = $('ws').value;
-  $('ws').innerHTML = list
-    .map((w, i) => `<option value="${esc(w)}">${i === 0 ? '（当前）' : ''}${esc(w.split(/[\\/]/).filter(Boolean).pop() || w)}</option>`)
-    .join('');
   // 用户手选过的工作区还在表里就保留；否则回到当前（默认跟随当前项目）。
-  $('ws').value = wsTouched && prev && list.includes(prev) ? prev : current || list[0] || '';
+  setWs(list, wsTouched && wsValue && list.includes(wsValue) ? wsValue : current || list[0] || '');
 }
 
 // 需求框随输入长高（封顶 200，超出内部滚），长高后同步弹窗高度
@@ -171,6 +224,20 @@ function growReq() {
 // 内容高度上报（宿主 pawch:resize 协议）：弹窗下边缘贴着内容，不在按钮下方留空白。
 // 量 #wrap（内容驱动、不受视口钳制）——量 documentElement.scrollHeight 会导致框只能
 // 长大不能缩小（scrollHeight 不低于当前视口高度）。
+// 自绘下拉：置项/渲染。首项是当前项目，展示时带「（当前）」前缀；值存完整路径。
+function setWs(list, value) {
+  wsList = list;
+  wsValue = list.includes(value) ? value : (list[0] || '');
+  renderWs();
+}
+function renderWs() {
+  const base = (w) => w.split(/[\/]/).filter(Boolean).pop() || w;
+  $('ws-label').textContent = (wsValue && wsValue === wsList[0] ? '（当前）' : '') + (base(wsValue) || '读取中…');
+  $('ws-menu').innerHTML = wsList
+    .map((w) => `<button type="button" class="ws-opt${w === wsValue ? ' sel' : ''}" data-v="${esc(w)}">${w === wsList[0] ? '<span class="cur">（当前）</span>' : ''}${esc(base(w))}</button>`)
+    .join('');
+}
+
 function fit() {
   const h = Math.ceil(document.getElementById('wrap').getBoundingClientRect().height);
   parent.postMessage({ type: 'pawch:resize', height: h }, '*');
@@ -190,7 +257,7 @@ function showMsg(text, cls) {
 async function go() {
   const requirements = $('req').value.trim();
   if (!requirements) return;
-  const ws = $('ws').value;
+  const ws = wsValue;
   $('go').disabled = true;
   showMsg('正在新建对话…', '');
   try {

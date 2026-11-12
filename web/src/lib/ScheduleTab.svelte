@@ -10,26 +10,8 @@
   export let workspace = '';
   export let recentWorkspaces = [];
 
-  // —— 定时任务（cron 到点唤醒无头会话；结果走通知列表）——
+  // —— 定时任务（cron 到点唤醒无头会话；完成状态直接落卡片）——
   let schedulesData = [];
-  let scheduleNotices = [];
-  // 2026-10-05 真机实测：完成记录改成小字一行，右边给个 × 关掉——原来整行按钮太占地方，
-  // 「去查看」任务卡片上已有。× 关掉必须落盘：壳重启只重载 WebView（pawch-agent.exe 服务常驻），
-  // 设置弹窗每次重开也重建组件——只做内存过滤的话，叉掉的刷新一下就回来。
-  let dismissedNotices = {};
-  $: visibleNotices = scheduleNotices.filter((n) => !dismissedNotices[n.ts + n.task_id]);
-  function dismissNotice(key) {
-    // 本地先滤掉（即时消失），再调后端落盘；失败不吞，给人话反馈
-    dismissedNotices = { ...dismissedNotices, [key]: true };
-    fetch(`/api/schedules/notice?id=${encodeURIComponent(key)}`, { method: 'DELETE' })
-      .then((r) => r.json())
-      .then((r) => {
-        if (r.error) schedMsg = `关掉失败：${r.error}`;
-      })
-      .catch((e) => {
-        schedMsg = `关掉失败：${e.message || e}`;
-      });
-  }
   let schedMsg = '';
   // 操作类提示只在本页停留期间有效，下次进入本页（切页签/重开设置）就清
   $: if (tab === 'schedule') schedMsg = '';
@@ -47,17 +29,12 @@
   let schedEditor = null;
   // 高级选项（会话/审批/超时）默认折叠；编辑老任务时若与默认不同则自动展开，不藏已配置的东西
   let schedAdvOpen = false;
-  // cron 人话预览（输入即查，250ms 防抖；解析失败由界面提示）
-  let schedCronText = '';
-  let schedCronTimer = null;
   let schedReloadTimer = null;
-  // 2026-10-08 修：编辑中/点了「立即运行」后立刻关设置弹窗，组件已销毁但两个
-  // 定时器到点仍会对已销毁实例发 fetch 并写状态（Svelte4 不报错，纯浪费）。
+  // 2026-10-08 修：编辑中/点了「立即运行」后立刻关设置弹窗，组件已销毁但定时器
+  // 到点仍会对已销毁实例发 fetch 并写状态（Svelte4 不报错，纯浪费）。
   onDestroy(() => {
-    clearTimeout(schedCronTimer);
     clearTimeout(schedReloadTimer);
   });
-  let schedCronPending = false;
   // 三档（2026-11-08 与「高危」下拉合并成一个：无人值守没有人点允许，高危策略由
   // 档位推导——只读/自动命中审批一律拒绝并回喂，完全访问全免审，
   // 后端 schedule::unattended_on_approval；标签不带括号说明）
@@ -135,23 +112,6 @@
     }
     return opts;
   }
-  function previewCron() {
-    clearTimeout(schedCronTimer);
-    schedCronTimer = setTimeout(async () => {
-      if (!schedEditor) { schedCronText = ''; schedCronPending = false; return; }
-      const cron = (schedEditor.cron || '').trim();
-      if (!cron) { schedCronText = ''; schedCronPending = false; return; }
-      schedCronPending = true;
-      try {
-        const r = await fetch(`/api/schedules/cron-text?cron=${encodeURIComponent(cron)}`).then((r) => r.json());
-        schedCronText = r.ok ? r.text : '';
-      } catch {
-        schedCronText = '';
-      } finally {
-        schedCronPending = false;
-      }
-    }, 250);
-  }
   async function loadSchedules() {
     schedLoading = true;
     // 只清上一次加载留下的「读取失败」：操作反馈（已保存/触发失败…）留到下一次操作，
@@ -171,7 +131,6 @@
         context_length: c.context_length || 0,
       }));
       schedulesData = r.schedules || [];
-      scheduleNotices = r.notices || [];
     } catch (e) {
       schedMsg = `读取失败: ${e.message || e}`;
     } finally {
@@ -203,14 +162,14 @@
       model: '',
       isNew: true,
     };
-    previewCron();
   }
   function editSchedule(t) {
-    schedMsg = '';
+    // 已完成的单次任务：打开编辑即重新启用，保存后回到「待运行」（时间要改到将来）
+    const revive = t.once_ts > 0 && t.last_status === 'done' && t.enabled === false;
+    schedMsg = revive ? '已完成的单次任务：保存会重新启用，请把时间改到将来' : '';
     schedAdvOpen = schedAdvNonDefault(t);
     // 超时回显为空 + 占位符，不显示突兀的 0；保存时留空按 1800 发（见 saveSchedule）
-    schedEditor = { ...t, isNew: false, timeout_secs: Number(t.timeout_secs) || '', memory_days: t.memory_days || '', budget_tokens: t.budget_tokens ? Number(t.budget_tokens) : '', approval_mode: normApprovalMode(t.approval_mode), config_id: t.config_id || '', model: t.model || '' };
-    previewCron();
+    schedEditor = { ...t, enabled: revive ? true : t.enabled !== false, isNew: false, timeout_secs: Number(t.timeout_secs) || '', memory_days: t.memory_days || '', budget_tokens: t.budget_tokens ? Number(t.budget_tokens) : '', approval_mode: normApprovalMode(t.approval_mode), config_id: t.config_id || '', model: t.model || '' };
   }
   async function saveSchedule() {
     const e = schedEditor;
@@ -289,7 +248,7 @@
     runningIds = { ...runningIds, [id]: true };
     try {
       const r = await fetch(`/api/schedules/run?id=${encodeURIComponent(id)}`, { method: 'POST' }).then((r) => r.json());
-      schedMsg = r.ok ? '已触发，跑完会出现在下面的完成记录里' : `触发失败: ${r.error}`;
+      schedMsg = r.ok ? '已触发，完成后卡片状态会更新' : `触发失败: ${r.error}`;
       clearTimeout(schedReloadTimer);
       schedReloadTimer = setTimeout(loadSchedules, 1500);
     } catch (e) {
@@ -298,16 +257,33 @@
       runningIds = { ...runningIds, [id]: false };
     }
   }
-  function schedNextText(t) {
-    if (t.enabled === false) return '已停用';
-    return t.next_run_ts ? fmtTs(t.next_run_ts) : '无法计算';
-  }
   // unix 秒 → 本地时间字符串（定时任务的运行时间展示）
   function fmtTs(ts) {
     if (!ts) return '—';
     const d = new Date(ts * 1000);
     const p = (n) => String(n).padStart(2, '0');
     return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  }
+  /// 卡片状态：完成/失败/停用直接上卡片，不再单独堆一层「完成记录」。
+  function fmtShortTs(ts) {
+    const s = fmtTs(ts);
+    return s === '—' ? '' : s.slice(5);
+  }
+  function schedState(t) {
+    const st = t.last_status || '';
+    const at = fmtShortTs(Math.max(t.last_run_ts || 0, t.last_manual_ts || 0));
+    const tail = at ? ` · ${at}` : '';
+    if (t.enabled === false) {
+      // 单次任务跑完会自动停用：这里显示「已完成」而不是「已停用」
+      if (t.once_ts > 0 && st === 'done') return { cls: 'done', text: `已完成${tail}` };
+      return { cls: 'off', text: '已停用' };
+    }
+    if (st === 'done') return { cls: 'done', text: `上次完成${tail}` };
+    if (st === 'timeout') return { cls: 'warn', text: `上次超时${tail}` };
+    if (st === 'cancelled') return { cls: 'warn', text: `上次取消${tail}` };
+    if (st === 'skipped') return { cls: 'off', text: `上次跳过${tail}` };
+    if (st === 'error') return { cls: 'err', text: `上次出错${tail}` };
+    return { cls: 'run', text: '待运行' };
   }
   // 组件化回归修复（审计 02）：响应式声明必须在 <script> 顶层——原先缩进在 fmtTs
   // 函数体内被 Svelte 当普通 JS 标签编译，切页签永远不会自动拉列表
@@ -316,8 +292,13 @@
 
       {#if tab === 'schedule'}
         <div class="sub-row">
-          <button class="btn primary" on:click={newSchedule}>新建任务</button>
-          <button class="btn" on:click={loadSchedules}>刷新</button>
+          <button class="btn primary btn-plus" on:click={newSchedule}>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+            新建任务
+          </button>
+          <button class="icon-act" title="刷新" aria-label="刷新" on:click={loadSchedules}>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg>
+          </button>
           <span class="hint">{schedMsg}</span>
         </div>
         {#if schedEditor}
@@ -336,15 +317,12 @@
               />
               <label class="mcp-risk-label"><input type="checkbox" bind:checked={schedEditor.enabled} /> 启用</label>
             </div>
-            <div class="sub-row">
-              <ScheduleCronPicker bind:cron={schedEditor.cron} bind:onceTs={schedEditor.once_ts} on:change={previewCron} />
+            <div class="sub-row sched-time-row">
+              <!-- 行尾的 cron 人话预览已去掉（2026-11-12 用户：说明多余）——
+                   频率行自己的控件就是完整表达；旧格式提示由选择器内的 cp-hint 负责 -->
+              <ScheduleCronPicker bind:cron={schedEditor.cron} bind:onceTs={schedEditor.once_ts} />
               {#if (schedEditor.kind || 'message') === 'memory'}
                 <input placeholder="回顾天数" type="number" bind:value={schedEditor.memory_days} style="max-width:110px" />
-              {/if}
-              {#if schedCronText}
-                <span class="hint">{schedCronText}</span>
-              {:else if !schedCronPending && (schedEditor.cron || '').trim()}
-                <span class="hint" style="color: var(--tint-orange-fg)">没认出来，示例 0 9 * * * = 每天 09:00</span>
               {/if}
             </div>
             {#if (schedEditor.kind || 'message') === 'message'}
@@ -408,10 +386,11 @@
                   options={SCHED_MODES}
                   on:change={(e) => (schedEditor.approval_mode = e.detail)}
                 />
-                <input placeholder="超时（秒）" type="number" bind:value={schedEditor.timeout_secs} style="max-width:110px" />
+                <input placeholder="超时（秒）" type="number" min="0" bind:value={schedEditor.timeout_secs} style="max-width:110px" />
                 <input
                   placeholder="上下文上限"
                   type="number"
+                  min="0"
                   bind:value={schedEditor.budget_tokens}
                   style="max-width:150px"
                   title="本任务的上下文 token 预算。留空=跟全局设置或渠道的 context_length；要读更多历史、不想被过早裁剪就填大值。超过模型真实窗口会报错，按你渠道的量力填。"
@@ -429,44 +408,44 @@
           <div class="trace-empty">加载中…</div>
         {:else}
           {#each schedulesData as t (t.id)}
-            <div class="mcp-card">
-              <div class="mcp-head">
-                <span class="dot" class:haskey={t.enabled !== false}></span>
-                <b>{t.name}</b>
-                {#if t.kind === 'memory'}<span class="mcp-risk">记忆 · {t.memory_days || 3} 天</span>{/if}
-                <span class="mcp-status" title={t.cron}>{t.cron_text}</span>
-                {#if t.workspace}<span class="mcp-risk" title={t.workspace}>@ {wsLabel(t.workspace)}</span>
-                {:else if workspace}<span class="mcp-risk" title={`${workspace}（跟随当前工作区）`}>@ {wsLabel(workspace)}</span>{/if}
-                {#if t.config_id}<span class="mcp-risk" title={`用配置 ${schedConfigs.find((c) => c.id === t.config_id)?.name || t.config_id.slice(0, 8)} 跑${t.model ? `（${t.model}）` : ''}`}>◆ {schedConfigs.find((c) => c.id === t.config_id)?.name || t.config_id.slice(0, 8)}{t.model ? ` · ${t.model}` : ''}</span>{/if}
-                {#if t.budget_tokens}<span class="mcp-risk" title={`本任务上下文上限 ${Number(t.budget_tokens).toLocaleString()} tokens`}>⛨ {Number(t.budget_tokens).toLocaleString()} tokens</span>{/if}
-                <span class="flex-sp"></span>
-                <button class="btn ghost" disabled={runningIds[t.id]} on:click={() => runScheduleNow(t.id)}>{runningIds[t.id] ? '触发中…' : '立即运行'}</button>
-                <button class="btn ghost" on:click={() => editSchedule(t)}>编辑</button>
-                {#if t.last_session_id}<button class="btn ghost" on:click={() => dispatch('open-session', { id: t.last_session_id })}>去查看</button>{/if}
-                <button class="btn ghost danger" on:click={() => deleteSchedule(t.id)}>删除</button>
+            {@const st = schedState(t)}
+            {@const ws = t.workspace || workspace}
+            {@const cfg = t.config_id ? schedConfigs.find((c) => c.id === t.config_id) : null}
+            <div class="sched-card" class:done={st.cls === 'done'} class:err={st.cls === 'err'} class:off={st.cls === 'off'}>
+              <div class="sched-head">
+                <span class="sched-state {st.cls}"><span class="sched-dot"></span>{st.text}</span>
+                <b class="sched-name" title={t.name}>{t.name}</b>
+                {#if t.kind === 'memory'}<span class="sched-tag">记忆 · {t.memory_days || 3} 天</span>{/if}
+                <div class="sched-actions">
+                  <button class="sched-act" disabled={runningIds[t.id]} on:click={() => runScheduleNow(t.id)} title="立即运行" aria-label="立即运行">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m8 5 11 7-11 7Z"/></svg>
+                  </button>
+                  <button class="sched-act" on:click={() => editSchedule(t)} title="编辑" aria-label="编辑">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>
+                  </button>
+                  {#if t.last_session_id}
+                    <button class="sched-act" on:click={() => dispatch('open-session', { id: t.last_session_id })} title="去查看（上次运行的会话）" aria-label="去查看">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6"/><path d="M20 4 10 14"/><path d="M20 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h5"/></svg>
+                    </button>
+                  {/if}
+                  <button class="sched-act del" on:click={() => deleteSchedule(t.id)} title="删除" aria-label="删除">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
+                  </button>
+                </div>
               </div>
-              {#if t.kind === 'memory'}
-                <div class="mcp-cmd">到点回顾最近 {t.memory_days || 3} 天的对话，找出要跟进的事项</div>
-              {:else}
-                <div class="mcp-cmd">{t.message}</div>
-              {/if}
-              <div class="mcp-cmd">
-                下次运行 {schedNextText(t)}{t.last_status
-                  ? ` · 上次${t.last_status === 'done' ? '完成' : t.last_status === 'timeout' ? '超时' : t.last_status === 'cancelled' ? '取消' : '出错'}`
-                  : ''}
+              <div class="sched-line" title={t.kind === 'memory' ? `到点回顾最近 ${t.memory_days || 3} 天的对话` : t.message}>
+                {#if t.kind === 'memory'}到点回顾最近 {t.memory_days || 3} 天的对话，找出要跟进的事项{:else}{t.message}{/if}
+              </div>
+              <div class="sched-meta">
+                <span>{t.cron_text}</span>
+                {#if ws}<span title={ws}>@ {wsLabel(ws)}</span>{/if}
+                {#if cfg || t.config_id}<span title={`用配置 ${cfg?.name || t.config_id.slice(0, 8)} 跑${t.model ? `（${t.model}）` : ''}`}>◆ {cfg?.name || t.config_id.slice(0, 8)}{t.model ? ` · ${t.model}` : ''}</span>{/if}
+                {#if t.budget_tokens}<span title={`本任务上下文上限 ${Number(t.budget_tokens).toLocaleString()} tokens`}>⛨ {Number(t.budget_tokens).toLocaleString()} tokens</span>{/if}
+                {#if t.enabled !== false && t.next_run_ts}<span class="sched-next">下次 {fmtTs(t.next_run_ts)}</span>{/if}
               </div>
               {#if t.last_error}
-                <div class="mcp-cmd" style="color: var(--tint-orange-fg)">{t.last_error}</div>
+                <div class="sched-err" title={t.last_error}>{t.last_error}</div>
               {/if}
-            </div>
-          {/each}
-        {/if}
-        {#if visibleNotices.length}
-          <div class="field"><label>完成记录</label></div>
-          {#each visibleNotices as n (n.ts + n.task_id)}
-            <div class="mcp-cmd sched-notice">
-              <span class="sched-notice-text">{n.ts} · {n.title}{n.detail ? `：${n.detail}` : ''}</span>
-              <button class="notice-x" title="关掉这条记录" on:click={() => dismissNotice(n.ts + n.task_id)}>×</button>
             </div>
           {/each}
         {/if}
@@ -486,6 +465,12 @@
       {/if}
 
 <style>
+  /* 时间行：时间选择器下方可能带一行提示（选将来日期/勾星期），把行撑高后
+     center 对齐会让旁边的「回顾天数」视觉偏下（2026-11-10 真机反馈）。
+     该行改顶部对齐，时长输入框与日期/时间框顶部对齐。 */
+  .sched-time-row {
+    align-items: flex-start;
+  }
   .confirm-modal {
     min-width: 380px;
     max-width: 520px;
@@ -513,7 +498,7 @@
     font-family: Consolas, 'Courier New', monospace;
     font-size: 12.5px;
     line-height: 1.7;
-    background: var(--g1);
+    background: transparent; /* 描边无底色（2026-11-11 设置统一样式） */
     color: var(--g7);
     border: 1px solid var(--g3);
     border-radius: 8px;
@@ -524,28 +509,140 @@
     outline: none;
     border-color: var(--g4);
   }
-  .mcp-card {
+  /* 任务卡片：状态在卡片上，操作收成图标行，正文/元信息各一行 */
+  .sched-card {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
     border: 1px solid var(--g3);
     border-radius: 10px;
     padding: 10px 12px;
   }
-  .mcp-head {
+  .sched-card.done {
+    border-color: color-mix(in srgb, var(--tint-green-fg) 30%, var(--g3));
+  }
+  .sched-card.err {
+    border-color: color-mix(in srgb, var(--tint-red-fg) 35%, var(--g3));
+  }
+  .sched-card.off {
+    opacity: 0.82;
+  }
+  .sched-head {
     display: flex;
     align-items: center;
     gap: 8px;
-    flex-wrap: wrap;
+    min-width: 0;
+  }
+  .sched-state {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    line-height: 1.4;
+    white-space: nowrap;
+  }
+  .sched-state.done {
+    color: var(--tint-green-fg);
+    background: var(--tint-green-bg);
+  }
+  .sched-state.err {
+    color: var(--tint-red-fg);
+    background: var(--tint-red-bg);
+  }
+  .sched-state.warn {
+    color: var(--tint-orange-fg);
+    background: var(--tint-orange-bg);
+  }
+  .sched-state.off {
+    color: var(--g5);
+    background: var(--g2);
+  }
+  .sched-state.run {
+    color: var(--brand-text);
+    background: color-mix(in srgb, var(--brand) 12%, transparent);
+  }
+  .sched-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+    flex: none;
+  }
+  .sched-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     color: var(--g7);
   }
-  .mcp-status {
+  .sched-tag {
+    flex: none;
     font-size: 11px;
     color: var(--g5);
   }
-  .mcp-risk {
+  .sched-actions {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    margin-left: auto;
+  }
+  .sched-act {
+    display: grid;
+    place-items: center;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    border: 0;
+    border-radius: 7px;
+    background: transparent;
+    color: var(--g5);
+    cursor: pointer;
+  }
+  .sched-act svg {
+    width: 15px;
+    height: 15px;
+  }
+  .sched-act:hover {
+    background: var(--g2);
+    color: var(--g7);
+  }
+  .sched-act:disabled {
+    opacity: 0.45;
+    cursor: default;
+    background: transparent;
+  }
+  .sched-act.del:hover {
+    background: var(--tint-red-bg);
+    color: var(--tint-red-fg);
+  }
+  .sched-line {
+    font-size: 12px;
+    color: var(--g6);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .sched-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 3px 10px;
     font-size: 11px;
-    color: var(--tint-yellow-fg);
-    background: var(--tint-yellow-bg);
-    border-radius: 4px;
-    padding: 1px 6px;
+    color: var(--g5);
+  }
+  .sched-meta .sched-next {
+    color: var(--g6);
+  }
+  .sched-err {
+    font-size: 11.5px;
+    color: var(--tint-red-fg);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .mcp-cmd {
     font-family: Consolas, monospace;
@@ -557,44 +654,5 @@
   .mcp-risk-label {
     font-size: 12px;
     color: var(--g6);
-  }
-  /* 完成记录：小字一行 + 行尾 ×（关掉这条）。不放大字号、不加按钮——
-     「去查看」任务卡片上已有，这里只做记录本体 */
-  .sched-notice {
-    display: flex;
-    align-items: baseline;
-    gap: 8px;
-    margin: 2px 0;
-  }
-  .sched-notice-text {
-    flex: 1;
-    min-width: 0;
-  }
-  .notice-x {
-    flex: none;
-    border: none;
-    background: none;
-    color: var(--g5);
-    font-size: 13px;
-    line-height: 1;
-    padding: 2px 5px;
-    cursor: pointer;
-    border-radius: 4px;
-  }
-  .notice-x:hover {
-    color: var(--g7);
-    background: var(--g2);
-  }
-  .dot {
-    display: inline-block;
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    margin-right: 6px;
-    background: var(--g4);
-    vertical-align: middle;
-  }
-  .dot.haskey {
-    background: var(--tint-green-fg);
   }
 </style>

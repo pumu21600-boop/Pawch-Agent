@@ -23,10 +23,14 @@ const THINKING_BUDGET_MIN: u64 = 1024;
 /// 思考预算上限：预算取 max_tokens 一半，封顶 32k，防止大 max_tokens 时思考吃满一半。
 const THINKING_BUDGET_MAX: u64 = 32000;
 
-/// 是否 Anthropic 端点：provider_id=anthropic 或 base_url 的**主机名**是官方域。
+/// 是否 Anthropic 端点：provider_id=anthropic、base_url 的**主机名**是官方域，
+/// 或路径第一段是 `/anthropic`（2026-11-11：兼容网关习惯把 Anthropic 协议挂在
+/// `<host>/anthropic` 下——DeepSeek `api.deepseek.com/anthropic`、Moonshot
+/// `api.moonshot.ai/anthropic`。选别家预设只改 URL 也能自动走对协议）。
 /// 2026-10-08 修：原先是整串 URL 子串匹配——`anthropic.com.example.com`（攻击性
 /// 域名/误配的中继）或路径里恰好含该子串的地址都会被判成 Messages 协议，请求体
-/// 整体重写成 Messages 形状发给 OpenAI 形状中继 → 400。改按主机段匹配。
+/// 整体重写成 Messages 形状发给 OpenAI 形状中继 → 400。改按主机段匹配；
+/// 路径启发只认**首段精确等于** anthropic，不做子串。
 pub fn is_anthropic_endpoint(provider_id: Option<&str>, base_url: Option<&str>) -> bool {
     if provider_id == Some("anthropic") {
         return true;
@@ -35,8 +39,9 @@ pub fn is_anthropic_endpoint(provider_id: Option<&str>, base_url: Option<&str>) 
         let b = b.trim().to_lowercase();
         // 剥 scheme 后取主机段（到第一个 / ? # 为止），再判「等于官方域或以 .官方域 结尾」
         let after_scheme = b.split_once("://").map(|(_, r)| r).unwrap_or(&b);
-        let host = after_scheme
-            .split(['/', '?', '#'])
+        let host_and_path = after_scheme.split(['?', '#']).next().unwrap_or(after_scheme);
+        let mut segs = host_and_path.split('/');
+        let host = segs
             .next()
             .unwrap_or("")
             .rsplit('@')
@@ -45,11 +50,15 @@ pub fn is_anthropic_endpoint(provider_id: Option<&str>, base_url: Option<&str>) 
             .split(':')
             .next()
             .unwrap_or("");
-        host == "anthropic.com" || host.ends_with(".anthropic.com")
+        if host == "anthropic.com" || host.ends_with(".anthropic.com") {
+            return true;
+        }
+        segs.next() == Some("anthropic")
     })
 }
 
-/// Messages 端点 URL：已含 /messages 原样（兼容端点给全路径）；以 /v1 结尾补 /messages；其余补 /v1/messages。
+/// Messages 端点 URL（简单规则；「自动补后缀」不勾时整段跳过、按原路径直发）：
+/// 结尾 /messages 原样（全路径）；结尾 /v1 补 /messages；其余补 /v1/messages。
 pub fn messages_url(base_url: &str) -> String {
     let b = base_url.trim().trim_end_matches('/');
     if b.ends_with("/messages") {
@@ -61,7 +70,7 @@ pub fn messages_url(base_url: &str) -> String {
     }
 }
 
-/// 模型列表 URL（/v1/models，响应 data[].id 与 OpenAI 同形）。
+/// 模型列表 URL（与 messages_url 同一条规则，后缀换 /models；响应 data[].id 与 OpenAI 同形）。
 pub fn models_url(base_url: &str) -> String {
     let b = base_url.trim().trim_end_matches('/');
     if b.ends_with("/models") {
@@ -92,10 +101,63 @@ fn string_content(m: &Value) -> Option<String> {
     }
 }
 
-/// 本次请求是否携带工具结果（存在 role:"tool" 消息）。
-/// 是则不开思考：回放的 assistant tool_use 轮没有可用的官方签名 thinking 块。
-fn carries_tool_result(messages: &[Value]) -> bool {
-    messages.iter().any(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
+/// 工具轮能否安全开思考：开启 thinking 时，官方要求每个带 tool_use 的 assistant
+/// 消息都把 thinking / redacted_thinking 块原样带回。历史会话（开启回放之前产出的）
+/// 没有可按来源回放的块，这时宁可不发 thinking 字段（模型照常答，只是这轮不思考），
+/// 也不要整轮 400。
+fn tool_rounds_have_signed_thinking(messages: &[Value], model: &str, current_source: Option<&str>) -> bool {
+    messages.iter().all(|m| {
+        if m.get("role").and_then(Value::as_str) != Some("assistant") {
+            return true;
+        }
+        let has_tools = m
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .is_some_and(|a| !a.is_empty());
+        if !has_tools {
+            return true;
+        }
+        !replay_thinking_blocks(m, model, current_source).is_empty()
+    })
+}
+
+/// 可回放的 Anthropic 思考块（按保存顺序）：新消息用 `reasoning_blocks`（支持
+/// interleaved 多块与 redacted_thinking 密文块）；旧消息回落单个 legacy thinking 块。
+fn replay_thinking_blocks(m: &Value, model: &str, current_source: Option<&str>) -> Vec<Value> {
+    if !super::replay::reasoning_source_matches(m, model, current_source) {
+        return Vec::new();
+    }
+    if let Some(arr) = m.get("reasoning_blocks").and_then(Value::as_array) {
+        let mut out = Vec::new();
+        for b in arr {
+            match b.get("type").and_then(Value::as_str).unwrap_or("") {
+                "thinking" => {
+                    let text = b.get("thinking").and_then(Value::as_str).unwrap_or("");
+                    let sig = b.get("signature").and_then(Value::as_str).unwrap_or("");
+                    if !text.is_empty() && !sig.is_empty() {
+                        out.push(json!({ "type": "thinking", "thinking": text, "signature": sig }));
+                    }
+                }
+                "redacted_thinking" => {
+                    if let Some(d) = b.get("data").and_then(Value::as_str).filter(|d| !d.is_empty()) {
+                        out.push(json!({ "type": "redacted_thinking", "data": d }));
+                    }
+                }
+                _ => {}
+            }
+        }
+        return out;
+    }
+    // 旧消息：单个 thinking 块
+    if let (Some(sig), Some(text)) = (
+        m.get("reasoning_signature").and_then(Value::as_str),
+        m.get("reasoning_content").and_then(Value::as_str),
+    ) && !sig.is_empty()
+        && !text.is_empty()
+    {
+        return vec![json!({ "type": "thinking", "thinking": text, "signature": sig })];
+    }
+    Vec::new()
 }
 
 /// 思考预算：按档位取 max_tokens 比例（用户机制：Anthropic 档位 低/中/高），
@@ -200,6 +262,12 @@ pub fn build_body(
     compat: &Compat,
 ) -> Value {
     let arr = messages.as_array().cloned().unwrap_or_default();
+    // 当前端点指纹（来源守卫用）：params.base_url 由网关在发请求前写入实际地址；
+    // 老路径没带地址时退化为「只按模型名」判断（保持升级前行为）。
+    let current_source = params
+        .base_url
+        .as_deref()
+        .map(|b| super::replay::source_tag(super::Protocol::AnthropicMessages, b, model));
 
     // 句首孤儿剥除（2026-10-27 多选精确删除的配套）：删了 user 消息留下 assistant 时，
     // 消息列会以 assistant/tool 开头——Anthropic Messages 要求首条必须是 user，直接 400。
@@ -282,6 +350,13 @@ pub fn build_body(
             }
             "assistant" => {
                 let mut blocks: Vec<Value> = Vec::new();
+                // 思考回放（2026-11-11，对齐 ZCode）：按保存的块序列原序带回
+                // （thinking / redacted_thinking，支持 interleaved 多块），必须在
+                // 正文/tool_use 之前。签名由端点签发，跨端点/模型对不上——按
+                // 「来源指纹 + 模型」守卫；旧消息没有指纹时退回模型名守卫。
+                for b in replay_thinking_blocks(m, model, current_source.as_deref()) {
+                    blocks.push(b);
+                }
                 if let Some(t) = string_content(m)
                     && !t.is_empty()
                 {
@@ -315,6 +390,13 @@ pub fn build_body(
             }
         }
     }
+
+    // 相邻同角色合并（官方要求 user/assistant 交替；连续同角色直接 400）：
+    // 静默压缩的摘要消息（user）紧贴尾段首条 user、tool_result(user) 后接正文
+    // user、引导消息等场景都会产生连续同角色（2026-11-10 审查 P1：压缩后每条
+    // 请求都以 user+user 开头，Anthropic 渠道会话必死）。必须在挂 cache 断点之前，
+    // 合并后最后一条 user 仍能正常挂断点；正常交替序列此函数是 no-op（字节不变）。
+    merge_same_role(&mut out);
 
     // 提示缓存：本请求的三个断点标记（system / 工具尾 / 末消息），None=用户关缓存
     let cache_cc = cache_control(params, compat);
@@ -387,13 +469,14 @@ pub fn build_body(
         }
         body["tools"] = json!(defs);
     }
-    // 思考：开（非 off）且本请求不带工具结果才发 thinking 对象；默认档不发。
-    // 带工具结果不开思考：官方要求带签名 thinking 块回放，签名不可伪造——v1 确定性规避。
-    // 档位→预算比例见 thinking_budget（低/中/高=20%/50%/80%）。
+    // 思考：开（非 off）且工具轮都有可回放签名才发 thinking 对象；默认档不发。
+    // 带工具结果不再一律关思考（2026-11-11 签名回放落地后）：只要每个带 tool_use 的
+    // assistant 消息都有同模型签名，官方要求的「thinking 块原样带回」就满足；
+    // 历史会话缺签名时退回不发，避免官方 400。档位→预算见 thinking_budget。
     let requested = params.thinking.as_deref().map(str::trim).filter(|s| !s.is_empty());
     if let Some(t) = requested
         && t != "off"
-        && !carries_tool_result(&arr)
+        && tool_rounds_have_signed_thinking(&arr, model, current_source.as_deref())
         && let Some(budget) = thinking_budget(params.max_tokens.unwrap_or(8192), t)
     {
         body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
@@ -410,6 +493,37 @@ pub fn build_body(
     body
 }
 
+/// 合并相邻同角色消息（Anthropic Messages 要求 user/assistant 交替，连续同角色
+/// 官方直接 400）。content 统一成块数组后按序拼接；空内容补空 text 块
+/// （messages 的 content 不许为空）。tool_result 与正文 text 共存于同一条 user
+/// 是合法形状，顺序保持 tool_result 在前。正常交替序列下是 no-op，请求字节不变。
+/// 对齐 ZCode 的 Anthropic 出站按角色分组（连续同角色并成一条）。
+fn merge_same_role(out: &mut Vec<Value>) {
+    let mut i = 1;
+    while i < out.len() {
+        if out[i].get("role") == out[i - 1].get("role") {
+            let mut merged = content_blocks(out[i - 1].get("content"));
+            merged.extend(content_blocks(out[i].get("content")));
+            if merged.is_empty() {
+                merged.push(json!({ "type": "text", "text": "" }));
+            }
+            out[i - 1]["content"] = Value::Array(merged);
+            out.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn content_blocks(c: Option<&Value>) -> Vec<Value> {
+    match c {
+        Some(Value::String(s)) if s.is_empty() => Vec::new(),
+        Some(Value::String(s)) => vec![json!({ "type": "text", "text": s })],
+        Some(Value::Array(a)) => a.clone(),
+        _ => Vec::new(),
+    }
+}
+
 /// Anthropic SSE 事件翻译结果。
 pub enum Translated {
     /// 合成出的 OpenAI 形状分片（走下游既有处理）
@@ -418,6 +532,18 @@ pub enum Translated {
     Done,
     /// ping / signature_delta 等无需处理的事件
     Ignore,
+}
+
+/// 正在接收的思考块：块内只有 delta，content_block_stop 时才落成可回放块。
+/// interleaved thinking 一轮可能有多个块（thinking / redacted_thinking），按停止
+/// 顺序逐个产出，回放时原序带回。
+#[derive(Default)]
+struct ThinkingAcc {
+    index: usize,
+    kind: &'static str,
+    text: String,
+    signature: Option<String>,
+    data: Option<String>,
 }
 
 /// Anthropic SSE → OpenAI delta 合成器。
@@ -434,6 +560,8 @@ pub struct SseTranslator {
     /// cache_creation_input_tokens（写缓存也算输入，2026-10-08 修：原先整个丢掉）
     acc_cache_creation: Option<u64>,
     acc_completion: Option<u64>,
+    /// 当前正在接收的思考块
+    cur_thinking: Option<ThinkingAcc>,
 }
 
 impl SseTranslator {
@@ -475,18 +603,73 @@ impl SseTranslator {
             }
             "content_block_start" => {
                 let cb = data.get("content_block").cloned().unwrap_or(json!({}));
-                if cb.get("type").and_then(Value::as_str) == Some("tool_use") {
-                    let block_idx = data.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                    let id = cb.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-                    let name = cb.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-                    let call_idx = self.tool_blocks.len();
-                    self.tool_blocks.insert(block_idx, (call_idx, id.clone(), name.clone()));
-                    return Ok(Translated::Chunk(self.chunk(
-                        json!({ "tool_calls": [{ "index": call_idx, "id": id, "type": "function", "function": { "name": name, "arguments": "" } }] }),
-                        json!(null),
-                    )));
+                let block_idx = data.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                match cb.get("type").and_then(Value::as_str).unwrap_or("") {
+                    // 思考块：先记状态，块内 delta 累积，stop 时产出可回放块
+                    "thinking" => {
+                        self.cur_thinking = Some(ThinkingAcc {
+                            index: block_idx,
+                            kind: "thinking",
+                            ..Default::default()
+                        });
+                        Ok(Translated::Ignore)
+                    }
+                    // 安全拦截块：只有密文，没有 delta，原样存下来回放
+                    "redacted_thinking" => {
+                        let data = cb.get("data").and_then(Value::as_str).unwrap_or("").to_string();
+                        self.cur_thinking = Some(ThinkingAcc {
+                            index: block_idx,
+                            kind: "redacted_thinking",
+                            data: Some(data),
+                            ..Default::default()
+                        });
+                        Ok(Translated::Ignore)
+                    }
+                    "tool_use" => {
+                        self.cur_thinking = None;
+                        let id = cb.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+                        let name = cb.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                        let call_idx = self.tool_blocks.len();
+                        self.tool_blocks.insert(block_idx, (call_idx, id.clone(), name.clone()));
+                        Ok(Translated::Chunk(self.chunk(
+                            json!({ "tool_calls": [{ "index": call_idx, "id": id, "type": "function", "function": { "name": name, "arguments": "" } }] }),
+                            json!(null),
+                        )))
+                    }
+                    _ => {
+                        self.cur_thinking = None;
+                        Ok(Translated::Ignore)
+                    }
                 }
-                Ok(Translated::Ignore)
+            }
+            "content_block_stop" => {
+                let block_idx = data.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let Some(acc) = self.cur_thinking.take() else {
+                    return Ok(Translated::Ignore);
+                };
+                if acc.index != block_idx {
+                    return Ok(Translated::Ignore);
+                }
+                let block = match acc.kind {
+                    "thinking" => {
+                        if acc.text.is_empty() {
+                            return Ok(Translated::Ignore);
+                        }
+                        let mut b = json!({ "type": "thinking", "thinking": acc.text });
+                        if let Some(sig) = acc.signature.filter(|s| !s.is_empty()) {
+                            b["signature"] = json!(sig);
+                        }
+                        b
+                    }
+                    "redacted_thinking" => {
+                        let Some(d) = acc.data.filter(|d| !d.is_empty()) else {
+                            return Ok(Translated::Ignore);
+                        };
+                        json!({ "type": "redacted_thinking", "data": d })
+                    }
+                    _ => return Ok(Translated::Ignore),
+                };
+                Ok(Translated::Chunk(self.chunk(json!({ "reasoning_blocks": [block] }), json!(null))))
             }
             "content_block_delta" => {
                 let block_idx = data.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
@@ -503,6 +686,12 @@ impl SseTranslator {
                         let t = delta.get("thinking").and_then(Value::as_str).unwrap_or("");
                         if t.is_empty() {
                             return Ok(Translated::Ignore);
+                        }
+                        if let Some(acc) = &mut self.cur_thinking
+                            && acc.index == block_idx
+                            && acc.kind == "thinking"
+                        {
+                            acc.text.push_str(t);
                         }
                         Ok(Translated::Chunk(self.chunk(json!({ "reasoning_content": t }), json!(null))))
                     }
@@ -530,7 +719,21 @@ impl SseTranslator {
                             json!(null),
                         )))
                     }
-                    // signature_delta 等：思考签名不参与正文/思考通道
+                    "signature_delta" => {
+                        // 思考块签名：必须原样存下来，下一轮以 thinking 块回放（Anthropic
+                        // 校验签名；不带签名的思考块发回去会被拒）。
+                        let s = delta.get("signature").and_then(Value::as_str).unwrap_or("");
+                        if s.is_empty() {
+                            return Ok(Translated::Ignore);
+                        }
+                        if let Some(acc) = &mut self.cur_thinking
+                            && acc.index == block_idx
+                        {
+                            acc.signature = Some(s.to_string());
+                        }
+                        Ok(Translated::Chunk(self.chunk(json!({ "reasoning_signature": s }), json!(null))))
+                    }
+                    // 其余 delta 类型不参与正文/思考通道
                     _ => Ok(Translated::Ignore),
                 }
             }
@@ -641,6 +844,108 @@ mod tests {
         assert_eq!(b["messages"][1]["content"][0], json!({"type":"text","text":"hello"}), "assistant 统一内容块数组");
     }
 
+    /// 2026-11-10 审查 P1：静默压缩的摘要消息（user）紧贴尾段首条 user，
+    /// 旧实现产出连续两条 user —— Anthropic 要求角色交替，压缩后每条请求必 400。
+    /// 合并后 role 必须交替，摘要与尾段文本都在。
+    #[test]
+    fn body_merges_consecutive_user_after_compact() {
+        let msgs = json!([
+            {"role":"user","content":"【上下文已压缩】摘要正文"},
+            {"role":"user","content":"尾段第一条用户消息"},
+            {"role":"assistant","content":"回答"}
+        ]);
+        let b = build_body("claude-sonnet", &msgs, true, &params(), None, &compat());
+        let arr = b["messages"].as_array().unwrap();
+        assert_eq!(arr.len(), 2, "连续 user 必须合并: {arr:?}");
+        assert_eq!(arr[0]["role"], json!("user"));
+        let blocks = arr[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["text"], json!("【上下文已压缩】摘要正文"));
+        assert_eq!(blocks[1]["text"], json!("尾段第一条用户消息"));
+        assert_eq!(arr[1]["role"], json!("assistant"));
+    }
+
+    /// 思考回放（2026-11-11）：同模型产出的带签名 thinking 块原样带回，且排在正文前；
+    /// 换模型不回放（签名对不上，发回去会 400）。
+    #[test]
+    fn body_replays_signed_thinking_only_for_same_model() {
+        let msgs = json!([
+            {"role":"user","content":"1+1?"},
+            {"role":"assistant","content":"2","reasoning_content":"想一下","reasoning_signature":"sig-1","reasoning_model":"deepseek-flash"},
+            {"role":"user","content":"2+2?"}
+        ]);
+        let b = build_body("deepseek-flash", &msgs, false, &params(), None, &compat());
+        let arr = b["messages"].as_array().unwrap();
+        let asst = arr.iter().find(|m| m["role"] == json!("assistant")).unwrap();
+        assert_eq!(asst["content"][0], json!({"type":"thinking","thinking":"想一下","signature":"sig-1"}));
+        assert_eq!(asst["content"][1], json!({"type":"text","text":"2"}));
+
+        let b = build_body("other-model", &msgs, false, &params(), None, &compat());
+        let arr = b["messages"].as_array().unwrap();
+        let asst = arr.iter().find(|m| m["role"] == json!("assistant")).unwrap();
+        assert_eq!(asst["content"][0], json!({"type":"text","text":"2"}), "换模型不回放思考");
+        // 没有签名（旧消息/不支持签名渠道）也不回放
+        let msgs = json!([
+            {"role":"user","content":"1+1?"},
+            {"role":"assistant","content":"2","reasoning_content":"想一下","reasoning_model":"deepseek-flash"},
+            {"role":"user","content":"2+2?"}
+        ]);
+        let b = build_body("deepseek-flash", &msgs, false, &params(), None, &compat());
+        let arr = b["messages"].as_array().unwrap();
+        let asst = arr.iter().find(|m| m["role"] == json!("assistant")).unwrap();
+        assert_eq!(asst["content"][0], json!({"type":"text","text":"2"}), "无签名不回放");
+    }
+
+    /// tool_result 之后紧跟正文 user 也要合并（tool 视同 user 组），
+    /// tool_result 块在前、正文块在后——这是引导/压缩场景的常见形状。
+    #[test]
+    fn body_merges_tool_result_with_following_user_text() {
+        let msgs = json!([
+            {"role":"user","content":"【上下文已压缩】摘要"},
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"tc_1","type":"function","function":{"name":"read_file","arguments":"{}"}}
+            ]},
+            {"role":"tool","tool_call_id":"tc_1","content":"文件内容"},
+            {"role":"user","content":"补充一句"}
+        ]);
+        let b = build_body("claude-sonnet", &msgs, true, &params(), None, &compat());
+        let arr = b["messages"].as_array().unwrap();
+        let roles: Vec<_> = arr.iter().map(|m| m["role"].clone()).collect();
+        assert_eq!(
+            roles,
+            vec![json!("user"), json!("assistant"), json!("user")],
+            "角色必须交替: {arr:?}"
+        );
+        let last = arr[2]["content"].as_array().unwrap();
+        assert_eq!(last[0]["type"], json!("tool_result"), "tool_result 在前");
+        assert_eq!(last[1]["type"], json!("text"));
+        assert_eq!(last[1]["text"], json!("补充一句"));
+    }
+
+    /// 连续 assistant（异常序列）合并为一条；正常交替序列保持不变。
+    #[test]
+    fn body_merge_same_role_leaves_normal_sequence_untouched() {
+        let msgs = json!([
+            {"role":"user","content":"q"},
+            {"role":"assistant","content":"a1"},
+            {"role":"assistant","content":"a2"}
+        ]);
+        let b = build_body("claude-sonnet", &msgs, true, &params(), None, &compat());
+        assert_eq!(b["messages"].as_array().unwrap().len(), 2);
+        let normal = json!([
+            {"role":"user","content":"q1"},
+            {"role":"assistant","content":"a1"},
+            {"role":"user","content":"q2"}
+        ]);
+        let b2 = build_body("claude-sonnet", &normal, true, &params(), None, &compat());
+        let arr = b2["messages"].as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0]["role"], json!("user"));
+        assert_eq!(arr[1]["role"], json!("assistant"));
+        assert_eq!(arr[2]["role"], json!("user"));
+        assert_eq!(arr[0]["content"], json!("q1"), "正常序列内容不变");
+    }
+
     #[test]
     fn body_tool_round_trip() {
         let msgs = json!([
@@ -675,8 +980,125 @@ mod tests {
         // 工具定义翻译
         assert_eq!(b["tools"][0]["name"], json!("read_file"));
         assert_eq!(b["tools"][0]["input_schema"]["type"], json!("object"));
-        // 带工具结果的请求不开思考（签名不可回放）
+        // 历史工具轮没有签名 → 不开思考（开思考会要求回放签名 thinking 块，官方 400）
         assert!(b.get("thinking").is_none());
+    }
+
+    /// 工具轮的 assistant 带同模型签名后，工具结果请求也要继续开思考（2026-11-11）：
+    /// 签名回放已具备，thinking 块必须排在 tool_use 前面。
+    #[test]
+    fn body_thinking_enabled_on_tool_round_when_signature_present() {
+        let msgs = json!([
+            {"role":"user","content":"读文件"},
+            {"role":"assistant","content":null,"reasoning_content":"先读 a.txt","reasoning_signature":"sig-1","reasoning_model":"claude-sonnet","tool_calls":[
+                {"id":"tc_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.txt\"}"}}
+            ]},
+            {"role":"tool","tool_call_id":"tc_1","content":"文件内容"}
+        ]);
+        let mut p = params();
+        p.thinking = Some("on".into());
+        p.max_tokens = Some(8192);
+        let b = build_body("claude-sonnet", &msgs, true, &p, None, &compat());
+        assert_eq!(b["thinking"], json!({"type":"enabled","budget_tokens":4096}));
+        let asst = &b["messages"][1]["content"];
+        assert_eq!(asst[0], json!({"type":"thinking","thinking":"先读 a.txt","signature":"sig-1"}));
+        assert_eq!(asst[1]["type"], json!("tool_use"));
+        // 换模型：签名对不上，退回不开思考
+        let b = build_body("claude-opus", &msgs, true, &p, None, &compat());
+        assert!(b.get("thinking").is_none());
+    }
+
+    /// 多个思考块 + redacted_thinking：流式按块停止顺序产出，回放原序带回。
+    #[test]
+    fn sse_captures_multiple_thinking_blocks_and_redacted() {
+        let mut tr = SseTranslator::default();
+        let mut blocks: Vec<Value> = Vec::new();
+        let mut feed = |tr: &mut SseTranslator, v: Value| {
+            if let Translated::Chunk(c) = tr.translate(&v).unwrap()
+                && let Some(arr) = c.pointer("/choices/0/delta/reasoning_blocks").and_then(Value::as_array)
+            {
+                blocks.extend(arr.clone());
+            }
+        };
+        // 思考块 1
+        feed(&mut tr, json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}));
+        feed(&mut tr, json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"第一段"}}));
+        feed(&mut tr, json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-1"}}));
+        feed(&mut tr, json!({"type":"content_block_stop","index":0}));
+        // redacted 块（只有密文）
+        feed(&mut tr, json!({"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"enc-abc"}}));
+        feed(&mut tr, json!({"type":"content_block_stop","index":1}));
+        // 思考块 2
+        feed(&mut tr, json!({"type":"content_block_start","index":2,"content_block":{"type":"thinking","thinking":""}}));
+        feed(&mut tr, json!({"type":"content_block_delta","index":2,"delta":{"type":"thinking_delta","thinking":"第二段"}}));
+        feed(&mut tr, json!({"type":"content_block_delta","index":2,"delta":{"type":"signature_delta","signature":"sig-2"}}));
+        feed(&mut tr, json!({"type":"content_block_stop","index":2}));
+
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0], json!({"type":"thinking","thinking":"第一段","signature":"sig-1"}));
+        assert_eq!(blocks[1], json!({"type":"redacted_thinking","data":"enc-abc"}));
+        assert_eq!(blocks[2], json!({"type":"thinking","thinking":"第二段","signature":"sig-2"}));
+    }
+
+    /// 块序列回放：多块 + redacted 按原序插在正文/工具前；换端点（来源指纹不符）不回放。
+    #[test]
+    fn body_replays_block_sequence_in_order_and_guards_source() {
+        let blocks = json!([
+            {"type":"thinking","thinking":"一","signature":"s1"},
+            {"type":"redacted_thinking","data":"enc"},
+            {"type":"thinking","thinking":"二","signature":"s2"}
+        ]);
+        let msgs = json!([
+            {"role":"user","content":"hi"},
+            {"role":"assistant","content":"答","reasoning_content":"一二","reasoning_model":"claude-sonnet",
+             "reasoning_source":"anthropic|https://api.anthropic.com|claude-sonnet","reasoning_blocks":blocks}
+        ]);
+        let mut p = params();
+        p.base_url = Some("https://api.anthropic.com/".into());
+        let b = build_body("claude-sonnet", &msgs, true, &p, None, &compat());
+        let content = b["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(content[0], json!({"type":"thinking","thinking":"一","signature":"s1"}));
+        assert_eq!(content[1], json!({"type":"redacted_thinking","data":"enc"}));
+        assert_eq!(content[2], json!({"type":"thinking","thinking":"二","signature":"s2"}));
+        assert_eq!(content[3]["type"], json!("text"));
+        // 换端点：来源指纹不符 → 全部不回放（签名跨端点无效）
+        p.base_url = Some("https://relay.example.com".into());
+        let b = build_body("claude-sonnet", &msgs, true, &p, None, &compat());
+        let content = b["messages"][1]["content"].as_array().unwrap();
+        assert!(
+            content.iter().all(|c| c["type"] != "thinking" && c["type"] != "redacted_thinking"),
+            "{content:?}"
+        );
+        // 旧消息（无来源指纹）保持升级前行为：只按模型名回放
+        let legacy = json!([
+            {"role":"user","content":"hi"},
+            {"role":"assistant","content":"答","reasoning_content":"旧","reasoning_signature":"sig-old","reasoning_model":"claude-sonnet"}
+        ]);
+        let b = build_body("claude-sonnet", &legacy, true, &p, None, &compat());
+        assert_eq!(
+            b["messages"][1]["content"][0],
+            json!({"type":"thinking","thinking":"旧","signature":"sig-old"})
+        );
+    }
+
+    /// 只有 redacted 块的工具轮也算「有可回放块」：工具结果回来时可以继续开思考。
+    #[test]
+    fn tool_round_with_redacted_block_keeps_thinking() {
+        let msgs = json!([
+            {"role":"user","content":"读文件"},
+            {"role":"assistant","content":null,"reasoning_model":"claude-sonnet",
+             "reasoning_source":"anthropic|https://api.anthropic.com|claude-sonnet",
+             "reasoning_blocks":[{"type":"redacted_thinking","data":"enc"}],
+             "tool_calls":[{"id":"tc_1","type":"function","function":{"name":"read_file","arguments":"{}"}}]},
+            {"role":"tool","tool_call_id":"tc_1","content":"ok"}
+        ]);
+        let mut p = params();
+        p.thinking = Some("on".into());
+        p.max_tokens = Some(8192);
+        p.base_url = Some("https://api.anthropic.com".into());
+        let b = build_body("claude-sonnet", &msgs, true, &p, None, &compat());
+        assert!(b.get("thinking").is_some(), "redacted 块也是合法回放块");
+        assert_eq!(b["messages"][1]["content"][0], json!({"type":"redacted_thinking","data":"enc"}));
     }
 
     #[test]
@@ -745,7 +1167,15 @@ mod tests {
         assert_eq!(c["choices"][0]["delta"]["tool_calls"][0]["index"], json!(0), "参数增量跟随重编号");
         assert_eq!(c["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"], json!("{\"pa"));
         // signature_delta 忽略
-        assert!(matches!(tr.translate(&json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"x"}})), Ok(Translated::Ignore)));
+        // signature_delta：思考签名要随分片带出（下一轮 thinking 块回放用）
+        let c = match tr
+            .translate(&json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-1"}}))
+            .unwrap()
+        {
+            Translated::Chunk(c) => c,
+            _ => panic!("预期签名分片"),
+        };
+        assert_eq!(c["choices"][0]["delta"]["reasoning_signature"], json!("sig-1"));
         // message_delta：stop_reason 映射 + output usage
         let c = feed(&mut tr, json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":55}})).unwrap();
         assert_eq!(c["choices"][0]["finish_reason"], json!("tool_calls"));
@@ -1088,6 +1518,70 @@ mod b20261008_tests {
         assert!(!is_anthropic_endpoint(None, Some("https://relay.example.com/anthropic.com/v1")));
         assert!(!is_anthropic_endpoint(None, Some("https://evil.com/?x=anthropic.com")));
         assert!(!is_anthropic_endpoint(None, Some("https://open.bigmodel.cn/api/paas/v4")));
+    }
+
+    /// 路径启发（2026-11-11）：首段 /anthropic = 兼容网关的 Anthropic 协议挂载点
+    /// （DeepSeek/Moonshot 命名习惯）。只认首段精确等于，子串/深路径不误判。
+    #[test]
+    fn endpoint_match_recognizes_anthropic_path_mount() {
+        assert!(is_anthropic_endpoint(None, Some("https://api.deepseek.com/anthropic")));
+        assert!(is_anthropic_endpoint(
+            None,
+            Some("https://api.deepseek.com/anthropic/v1/messages")
+        ));
+        assert!(is_anthropic_endpoint(None, Some("https://api.moonshot.ai/anthropic")));
+        assert!(is_anthropic_endpoint(None, Some("https://relay.example.com/anthropic")));
+        // 非首段/子串不误判：OpenAI 形状中继不能被重写成 Messages 协议
+        assert!(!is_anthropic_endpoint(None, Some("https://api.deepseek.com/v1")));
+        assert!(!is_anthropic_endpoint(
+            None,
+            Some("https://relay.example.com/v1/anthropic-proxy")
+        ));
+        assert!(!is_anthropic_endpoint(None, Some("https://relay.example.com/x/anthropic")));
+        assert!(!is_anthropic_endpoint(None, Some("https://host.example.com/anthropic2")));
+        // 大小写不敏感（与既有 host 匹配同口径）
+        assert!(is_anthropic_endpoint(None, Some("https://api.deepseek.com/Anthropic")));
+    }
+
+    /// 后缀规则（2026-11-11「自动补后缀」勾选框的勾选态，默认勾）：
+    /// /messages 全路径原样；/v1 结尾补 /messages；其余（含 …/anthropic 挂载）补
+    /// /v1/messages。不勾时整个函数不参与——Base URL 即最终地址（见 endpoint_url_with）。
+    #[test]
+    fn messages_url_suffix_rules() {
+        assert_eq!(
+            messages_url("https://api.anthropic.com"),
+            "https://api.anthropic.com/v1/messages",
+            "只给主机=补官方惯例后缀"
+        );
+        assert_eq!(
+            messages_url("https://relay.example.com"),
+            "https://relay.example.com/v1/messages",
+            "自建根挂载同样补"
+        );
+        assert_eq!(
+            messages_url("https://api.deepseek.com/anthropic"),
+            "https://api.deepseek.com/anthropic/v1/messages",
+            "默认勾选按惯例补；deepseek 实测挂载无 /v1 后缀 → 取消勾选原样直发"
+        );
+        assert_eq!(
+            messages_url("https://api.deepseek.com/anthropic/"),
+            "https://api.deepseek.com/anthropic/v1/messages",
+            "尾斜杠不影响"
+        );
+        assert_eq!(
+            messages_url("https://api.anthropic.com/v1"),
+            "https://api.anthropic.com/v1/messages",
+            "/v1 结尾只补 /messages"
+        );
+        assert_eq!(
+            messages_url("https://x.example.com/anthropic/v1/messages"),
+            "https://x.example.com/anthropic/v1/messages",
+            "全路径原样"
+        );
+        assert_eq!(
+            models_url("https://api.anthropic.com"),
+            "https://api.anthropic.com/v1/models"
+        );
     }
 
     /// 2026-10-08 修：start 行丢失（JSON 解析失败被吞）时 input_json_delta 的兜底

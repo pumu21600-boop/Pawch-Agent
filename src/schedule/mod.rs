@@ -92,7 +92,8 @@ pub struct ScheduleTask {
     pub budget_tokens: u64,
     #[serde(default)]
     pub created_ts: i64,
-    /// 上次**自动**触发时间（排期基准；手动运行不动它）
+    /// 上次**自动**运行完成时间（下一轮排期基准；手动运行不动它）。
+    /// 长任务会顺延下一轮周期、错过的槽静默丢弃——「上一轮没跑完就跳过」的既定语义。
     #[serde(default)]
     pub last_run_ts: Option<i64>,
     /// 上次手动运行时间（仅展示）
@@ -129,7 +130,12 @@ impl ScheduleTask {
                 return Err("单次任务的时间要设在将来".into());
             }
         } else {
-            cron::parse(&self.cron).map_err(|e| format!("cron 表达式：{e}"))?;
+            let spec = cron::parse(&self.cron).map_err(|e| format!("cron 表达式：{e}"))?;
+            // 2026-11-10：日期不存在（如「2 月 30 日」）保存成功但永远不跑，界面只
+            // 显示「下次运行：无法计算」——保存时直接拒绝，给人话。
+            if spec.next_after(chrono::Local::now()).is_none() {
+                return Err("这个 cron 永远不会有触发时间（不存在的日期组合，如 2 月 30 日）".into());
+            }
         }
         match self.kind.as_str() {
             "" | "message" => {

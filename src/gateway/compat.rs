@@ -61,6 +61,9 @@ pub enum Protocol {
     OpenAiCompletions,
     /// Anthropic Messages（/v1/messages：system 顶层、tool_use/tool_result 块、x-api-key 鉴权）
     AnthropicMessages,
+    /// OpenAI Responses（/responses：instructions+input 条目、function_call/function_call_output、
+    /// 事件流 response.output_text.delta 等；2026-11-11 新增适配）
+    OpenAiResponses,
 }
 
 impl Protocol {
@@ -68,6 +71,15 @@ impl Protocol {
         match self {
             Protocol::OpenAiCompletions => "openai-completions",
             Protocol::AnthropicMessages => "anthropic-messages",
+            Protocol::OpenAiResponses => "openai-responses",
+        }
+    }
+    /// 设置字段词表（「API 格式」三选）：openai | anthropic | responses
+    pub fn as_settings_str(&self) -> &'static str {
+        match self {
+            Protocol::OpenAiCompletions => "openai",
+            Protocol::AnthropicMessages => "anthropic",
+            Protocol::OpenAiResponses => "responses",
         }
     }
 }
@@ -212,19 +224,34 @@ fn endpoint_class(provider_id: Option<&str>, base_url: Option<&str>) -> &'static
 /// 推导端点兼容档（上游 resolveOpenAICompletionsCompatDefaults 的本产品版）。
 /// `provider_id`/`base_url` 供域名判定；`model_id` 供模型族判定（gpt-5* 等）；
 /// `format_override`：providers.json/渠道配置显式指定（优先级最高）。
+#[allow(dead_code)] // 4 参便捷形态：anthropic/responses 模块的单测在用
 pub fn resolve(
     provider_id: Option<&str>,
     base_url: Option<&str>,
     model_id: &str,
     format_override: Option<ThinkingFormat>,
 ) -> Compat {
+    resolve_with_protocol(provider_id, base_url, model_id, format_override, None)
+}
+
+/// 同 resolve，但接受配置里的**显式协议锁定**（`protocol` 字段）：Some 时探测让位。
+/// auto/None = 端点探测（provider_id、官方域、`/anthropic` 路径段启发）。
+pub fn resolve_with_protocol(
+    provider_id: Option<&str>,
+    base_url: Option<&str>,
+    model_id: &str,
+    format_override: Option<ThinkingFormat>,
+    protocol_override: Option<Protocol>,
+) -> Compat {
     let class = endpoint_class(provider_id, base_url);
-    // 传输协议：provider_id=anthropic 或官方域 → Messages 协议，其余 OpenAI Completions
-    let protocol = if super::anthropic::is_anthropic_endpoint(provider_id, base_url) {
-        Protocol::AnthropicMessages
-    } else {
-        Protocol::OpenAiCompletions
-    };
+    // 传输协议：显式锁定 > 探测（provider_id=anthropic、官方域或 /anthropic 路径段 → Messages）
+    let protocol = protocol_override.unwrap_or_else(|| {
+        if super::anthropic::is_anthropic_endpoint(provider_id, base_url) {
+            Protocol::AnthropicMessages
+        } else {
+            Protocol::OpenAiCompletions
+        }
+    });
     let openai_official = is_openai_official(provider_id, base_url);
 
     // 显式覆盖优先（providers.json 预设或渠道配置）

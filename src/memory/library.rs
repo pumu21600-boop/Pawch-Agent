@@ -941,8 +941,10 @@ mod tests {
             "library.jsonl",
             format!("lib-{}", uuid::Uuid::new_v4()),
         );
+        // 2026-11-10：只填主机的 base_url 现在补 /v1/embeddings（与聊天/模型列表同款
+        // 根路径判定），mock 路由跟着挂到 /v1 下
         let app = Router::new().route(
-            "/embeddings",
+            "/v1/embeddings",
             post(|Json(b): Json<serde_json::Value>| async move {
                 let inputs: Vec<String> = b
                     .get("input")

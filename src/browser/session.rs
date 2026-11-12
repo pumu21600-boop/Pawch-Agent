@@ -766,6 +766,12 @@ pub(crate) async fn sync_shell_visibility(session: &Arc<BrowserSession>, tabs: &
     // WebView2 隐藏即暂停渲染、帧流就断了——而是**移出屏幕外继续渲染**：弹窗底下
     // 前端走帧流（同无头模式），画面实时垫在弹窗下（对照 ZCode 观感）。
     // suppress 翻转时 set_shell_suppress 会清 shell_shown 强制走一遍重放置。
+    // 可见性不再看焦点：窗口部分可见（侧并排）时页面照常渲染，跟 ZCode 一致；
+    // 「看不见」（被前台窗口完全盖住/最小化）时不藏 webview 而是**冻结页面动画**——
+    // 藏（IsVisible=false）会让切回前台时页面重新铺开，观感突兀（2026-11-09 用户反馈），
+    // 冻结只是停住 rAF，窗口内容保持最后一帧，切回来无缝。见下 want_pause。
+    let agent_shown = session.agent_tab_now().as_deref() == shell_tab.as_deref();
+    let keep_for_agent = agent_shown && session.agent_active_recently(600_000);
     let want_label: Option<String> = if session.showing() && rect_sane {
         match shell_tab.as_deref() {
             Some(vid) => tabs.iter().find(|t| t.id == vid).and_then(|t| t.shell_label.clone()),
@@ -774,6 +780,17 @@ pub(crate) async fn sync_shell_visibility(session: &Arc<BrowserSession>, tabs: &
     } else {
         None
     };
+    // 冻结判定：窗口看不见（见 shell::window_visible）才冻；agent 正在操作的那一页
+    // 不冻——自动化点完按钮要看到页面真的在响应（截图也依赖页面能出帧）。
+    // 冻结状态挂在 tab 上（raf_paused_applied），只在翻转时发一次 CDP。
+    let want_pause =
+        !shell::window_visible() && want_label.is_some() && !keep_for_agent;
+    if let Some(tab) = tabs.iter().find(|t| t.shell_label.as_deref() == want_label.as_deref())
+        && tab.raf_paused_applied.load(Ordering::Relaxed) != want_pause
+    {
+        set_raf_paused(tab, want_pause).await;
+        tab.raf_paused_applied.store(want_pause, Ordering::Relaxed);
+    }
     let cur = session.shell_shown.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let suppressed = session.shell_suppressed();
     let applied = *session.shell_suppress_applied.lock().unwrap_or_else(|e| e.into_inner());
@@ -850,6 +867,18 @@ pub(crate) async fn suspend_tab(tab: &Arc<WebTab>) {
     }
     tab.suspended.store(true, Ordering::Relaxed);
     log("browser.tab.suspend", json!({ "id": tab.id }));
+}
+
+/// 冻结/恢复页面动画（窗口被完全遮挡或最小化时省渲染）：调页面注入的
+/// `__pawchSetRafPaused` 钩子停/续 rAF。不藏 webview——藏了切回前台时页面要
+/// 重新铺开（2026-11-09 用户反馈观感突兀），冻结只是停住动画，最后一帧还在，
+/// 切回来无缝；截图也照常（页面可见，captureScreenshot 不挂）。
+/// 页面没注入钩子（无头模式/旧页）时调用无害（表达式短路）。
+pub(crate) async fn set_raf_paused(tab: &Arc<WebTab>, paused: bool) {
+    let expr = format!("window.__pawchSetRafPaused && window.__pawchSetRafPaused({})", paused);
+    if let Err(e) = tab.cdp.call("Runtime.evaluate", json!({ "expression": expr, "returnByValue": true })).await {
+        log("browser.raf_pause.fail", json!({ "id": tab.id, "paused": paused, "err": e }));
+    }
 }
 
 /// 恢复一个被挂起的标签页：解冻 + 重放视口覆盖 + 补一刀 Page.enable。

@@ -33,6 +33,11 @@
     font: inherit; width: 100%; padding: 5px 8px; border-radius: 6px; cursor: pointer;
     border: 1px solid var(--btn-line); background: var(--bg); color: var(--fg);
   }
+  /* 原生下拉的弹出层不认根元素的 color-scheme，必须写在 select 元素自身
+     （同宿主 ui.css 的修法），option 也要显式配色，否则弹出层白底 */
+  select { color-scheme: dark; }
+  body.light select { color-scheme: light; }
+  select option { background: var(--bg); color: var(--fg); }
   button { font: inherit; padding: 5px 12px; border-radius: 6px; cursor: pointer; border: 1px solid var(--btn-line); background: transparent; color: var(--fg); }
   button:hover { background: var(--hover); }
   .dim { color: var(--dim); font-size: 12px; }

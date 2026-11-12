@@ -7,6 +7,8 @@
   // 导入**：静态 import 时它们进首包，每次开应用都要多下 1MB，而大多数会话压根
   // 不打开文档预览。调用点都在 async 函数里，await import 零行为变化。
   import ImagePreview from './lib/ImagePreview.svelte';
+  // 输入框附件预览（2026-11-10）：图片/音视频浮层直看，文档给系统程序打开
+  import AttachmentPreview from './lib/AttachmentPreview.svelte';
   // 助手消息 markdown 渲染（「星号太多」：escape-first 安全渲染）
   import { md, highlightText } from './lib/md.js';
   // 聊天展示层纯逻辑（2026-10-30 UI 轮）：分段/合并/工具人话化。
@@ -54,14 +56,18 @@
   import ScheduleTab from './lib/ScheduleTab.svelte';
   import DataTab from './lib/DataTab.svelte';
   import TerminalPanel from './lib/TerminalPanel.svelte';
-  import { fmtBytes, relTime, fmtTok, norm, configLabel, gitStatusLabel, normPath, relShort, contentText, webNormalizeUrl, riskLabelFor } from './lib/format.js';
-  import { parseCssColor, parsedToHex, rgbToHex, rgbAlpha, hexWithAlpha, gradientFirstColor, rebuildGradient, resolveCssVars, findBgSource, structuralSelector, pathOf, findByPath, makeUid, ELEMENT_ALIASES, escalateCss, microCss } from './lib/dom.js';
+  import Select from './Select.svelte'; // git 面板范围选择器（自绘下拉：选中态可走统一口径，原生 select 弹层画不了）
+  import { fmtBytes, relTime, fmtTok, norm, configLabel, cfgMediaBadge, gitStatusLabel, normPath, relShort, contentText, webNormalizeUrl, riskLabelFor } from './lib/format.js';
+  import { parseCssColor, parsedToHex, rgbToHex, rgbAlpha, hexWithAlpha, gradientFirstColor, rebuildGradient, resolveCssVars, findBgSource, structuralSelector, pathOf, findByPath, makeUid, ELEMENT_ALIASES, escalateCss, microCss, parseInsetRing } from './lib/dom.js';
 
   // —— 配置（改动即自动保存即时生效）——
   let providers = [];
   let configs = [];
   let activeConfigId = '';
   let providerId = 'deepseek';
+  // 「API 格式」三选与「自动补后缀」勾选（模型配置页，随激活配置回显）
+  let protocol = 'openai';
+  let autoSuffix = true;
   let baseUrl = '';
   let model = '';
   let apiKey = '';
@@ -92,14 +98,11 @@
   // 圆环分母的唯一事实源。不能跟着某一轮的 context_usage 走——跑着的时候改设置，
   // 那一轮手里还是旧窗口，每个 step 的 context_usage 会把圆环打回旧值（真机 2026-11-07）。
   let ctxWindow = 0;
-  let ctxLen = 0; // 当前模型上下文长度（0=默认）
-  let maxOut = 0; // 当前模型最大输出长度（0=默认）
   let compactPercent = 85; // 上下文压缩线（% 窗口，40–85；settings.compact_percent 缺省=85）
-  let temperature = null; // 采样温度（null=渠道默认）
-  let topP = null; // 核采样（null=渠道默认）
   let thinking = ''; // 思考开关：''=渠道默认 / on / off
   let thinkingStyle = 'auto'; // 生效的思考参数形态（thinkingFormat 词表）
-  let capabilities = { tools: true, vision: false, video: false, audio: false }; //  模型能力标记（纯手动勾选）
+  let capabilities = { tools: true, vision: false, video: false, audio: false }; //  模型能力标记（配置级：未覆盖模型的继承值）
+  let modelParams = {}; // 每模型参数覆盖（键=模型 id）：同渠道不同模型各自调参
   let roles = {}; //  角色路由映射
   // 内置功能开关（插件页「内置」组功能行；后端 settings.features，缺省全开）
   let features = { roles: true, css_tool: true, galaxy: true, computer: true };
@@ -232,6 +235,11 @@
       delete composerNotices[k];
       pushMsg(k, { id: nextId(), role: 'system', content: pend });
     }
+    // 切走会话：临时留白不跨会话
+    if (scrollFreeze && scrollFreeze.key !== k) {
+      scrollFreeze = null;
+      scrollSpacerPx = 0;
+    }
   }
   function setMsgs(key, arr) {
     sessionMsgs = { ...sessionMsgs, [key]: arr };
@@ -319,6 +327,9 @@
   let pendingAttachments = []; // 待发送附件列表 [{ name, mime, data, size }]
   let fileInput; // 隐藏文件选择器引用
   let previewImageModal = null; // 放大预览的图片 dataUrl
+  // 输入框附件预览浮层（2026-11-10）：点 chip 打开；文档类走 /api/attachments/open
+  let attPreview = null;
+  let attPreviewErr = '';
 
   function onFileSelect(e) {
     const files = e.target.files;
@@ -408,6 +419,45 @@
 
   function removeAttachment(index) {
     pendingAttachments = pendingAttachments.filter((_, i) => i !== index);
+  }
+
+  // 输入框附件预览（2026-11-10）：图片/视频/音频浮层直接看；文档类在浮层里给
+  // 「用系统程序打开」（后端写临时文件 + 默认关联程序）。
+  function openAttPreview(att) {
+    attPreviewErr = '';
+    attPreview = att;
+  }
+  async function openAttachmentExternal(att) {
+    attPreviewErr = '';
+    try {
+      const body = att.data
+        ? { name: att.name, mime: att.mime, data: att.data }
+        : { name: att.name, mime: att.mime, path: att.path };
+      const r = await fetch('/api/attachments/open', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) {
+        const e = await r.json().catch(() => ({}));
+        attPreviewErr = e.error || `打开失败（${r.status}）`;
+      }
+    } catch (e) {
+      attPreviewErr = e.message || '打开失败';
+    }
+  }
+
+  // 视频解码兜底（2026-11-11）：H.265/HEVC 这类 WebView2 缺解码器的视频，容器元数据
+  // 读得动（时长显示正常）但一帧都解不出——元素渲染成空画面+底部播放条，还撑一大块空白。
+  // loadedmetadata 时 videoWidth===0 即「没有可解码画面」：降级成文件条，点击用系统播放器打开。
+  let vidNoFrame = {};
+  function vidNoFrameKey(m, a) {
+    return (m.id || '') + '|' + (a.name || '') + '|' + (a.path || '');
+  }
+  function vidMetaFail(m, a, e) {
+    const v = e && e.currentTarget;
+    if (v && v.videoWidth) return;
+    vidNoFrame = { ...vidNoFrame, [vidNoFrameKey(m, a)]: true };
   }
 
   function handlePaste(e) {
@@ -665,6 +715,8 @@
       rvDiff = {};
       rvWarn = '';
       rpFiles = [];
+      rpSelPath = '';
+      artMenu = null;
       rpArtifactsNote = '';
       rpWarn = '';
       manualBaseline = ''; // 重拍的基线只属于当时的会话/工作区，切走即作废
@@ -684,22 +736,153 @@
   }
 
   afterUpdate(() => {
-    // 只有用户本来就钉在底部时才自动滚屏；上滑阅读时不打断。
-    // 拖拽期（侧栏/右面板/终端三个手柄）整个跳过：这行读 scrollHeight 会把刚写进的
-    // 宽度样式再强制同步布局一遍（写完读→写完还触发 scroll 事件再读），每帧多出一轮
-    // 全量 reflow，拖拽就跟不上手——真机实测拖拽帧 p95 41ms、22% 掉到 30fps 以下。
-    // 拖拽中用户也不看消息区，停手后下一次 flush 自然补上滚动位置与微调标记。
     const dragging = resizing || rpResizing || termResizing;
-    // compactScrollHold：压缩标记出现/落定这类更新不钉底——标记只是背景工作的痕迹，
-    // 为它把正在看的视口往上推一截，看起来就是「对话区弹一下」
-    if (!dragging && chatPinned && !compactScrollHold && chatBody) chatBody.scrollTop = chatBody.scrollHeight;
+    // 结构更新（压缩重建/回滚/编辑）的视口锚定：在 DOM 更新后、绘制前把
+    // 更新前那条可见消息放回同一位置。这比「整表重建后按高度差猜、再钉底」稳：
+    // 高度差会被 content-visibility 的估位和图片加载打乱，猜不准就会弹。
+    if (pendingScrollAnchor) {
+      applyScrollAnchor(pendingScrollAnchor);
+      pendingScrollAnchor = null;
+    } else if (!dragging && chatPinned && chatBody) {
+      // 只有用户本来就钉在底部时才自动滚屏；上滑阅读时不打断。
+      // 拖拽期（侧栏/右面板/终端三个手柄）整个跳过：这行读 scrollHeight 会把刚写进的
+      // 宽度样式再强制同步布局一遍（写完读→写完还触发 scroll 事件再读），每帧多出一轮
+      // 全量 reflow，拖拽就跟不上手——真机实测拖拽帧 p95 41ms、22% 掉到 30fps 以下。
+      // 拖拽中用户也不看消息区，停手后下一次 flush 自然补上滚动位置与微调标记。
+      chatBody.scrollTop = chatBody.scrollHeight;
+    }
     // 单元素微调标记：Svelte 重渲染会重建节点，这里按存下的路径补盖 data-mt
     if (!dragging) stampMicroUids();
+    if (!dragging) syncScrollFreeze();
   });
 
   function onChatScroll() {
     if (!chatBody) return;
     chatPinned = chatBody.scrollTop + chatBody.clientHeight >= chatBody.scrollHeight - 60;
+  }
+
+  // —— 结构更新的滚动锚定（2026-11-11）——
+  // 压缩重建 / 后台重载会换掉消息数组；这里抓视口顶部可见消息的 id + 偏移，
+  // DOM 更新后把同一条消息放回同一像素位置；只有更新前就在底部的人，才滚到底。
+  // 编辑/回滚不再走整表重载（本地只删尾部），所以不需要截断点锚。
+  let pendingScrollAnchor = null;
+  let scrollSettleToken = 0;
+  // 编辑/回滚把可视区之后的消息删掉后，列表会变短、scrollTop 被浏览器钳位，
+  // 看起来就是「往上弹」。这里只在列表末尾补一块**视口高度以内的**临时留白，
+  // 让 scrollTop 保持原值；新内容长出来时留白自动收掉。不是钉底。
+  let scrollSpacerPx = 0;
+  let scrollFreeze = null; // { top, key }
+  let scrollFreezeAbort = null;
+  // 自己刚截断的会话：sessions_changed 会带着新的 count 回来，别再按文件重载一次——
+  // 本地视图已经是截断后的正确状态，重载会整表重建并把刚冻结的视口拽走（编辑上弹）。
+  let selfTruncatedAt = 0;
+  let selfTruncatedKey = '';
+  // 自己刚做完压缩的会话：压缩只补一行标记、消息内容没变，本地已经就地收尾；
+  // 随后的 sessions_changed 不能再整表重载（压缩前后上弹的根源，同编辑/回滚）。
+  let selfCompactedAt = 0;
+  let selfCompactedKey = '';
+
+  function beginScrollFreeze(key) {
+    if (chatPinned || !chatBody) return;
+    // truncated=false：整段保存（编辑框收起 → 截断 → 重发）共用同一个冻结，
+    // 收窄编辑框造成的高度变化先补一块留白；真截断前 need=0 也不许提前取消。
+    scrollFreeze = { top: chatBody.scrollTop, key, armed: true, truncated: false };
+    if (scrollFreezeAbort) {
+      chatBody.removeEventListener('wheel', scrollFreezeAbort, true);
+      chatBody.removeEventListener('touchstart', scrollFreezeAbort, true);
+      chatBody.removeEventListener('mousedown', scrollFreezeAbort, true);
+    }
+    scrollFreezeAbort = () => {
+      scrollFreeze = null;
+      scrollSpacerPx = 0;
+    };
+    chatBody.addEventListener('wheel', scrollFreezeAbort, { once: true, capture: true });
+    chatBody.addEventListener('touchstart', scrollFreezeAbort, { once: true, capture: true });
+    chatBody.addEventListener('mousedown', scrollFreezeAbort, { once: true, capture: true });
+  }
+
+  function syncScrollFreeze() {
+    if (!scrollFreeze || !scrollFreeze.armed || !chatBody || scrollFreeze.key !== curKey()) return;
+    const natural = chatBody.scrollHeight - scrollSpacerPx;
+    const need = Math.max(0, scrollFreeze.top + chatBody.clientHeight - natural);
+    if (need !== scrollSpacerPx) scrollSpacerPx = need;
+    if (need === 0) {
+      // 截断前 need=0 只是「列表还很高」，不是「内容已经长回来了」
+      if (scrollFreeze.truncated) {
+        // 收留白前先把 scrollTop 放回原位（此时 natural 已够高，放得下），
+        // 否则留白一收、max 变小，浏览器会把视口钳上去——最后这一下就是残留上弹
+        chatBody.scrollTop = scrollFreeze.top;
+        scrollFreeze = null;
+      }
+      return;
+    }
+    if (Math.abs(chatBody.scrollTop - scrollFreeze.top) > 0.5) chatBody.scrollTop = scrollFreeze.top;
+  }
+
+  function captureScrollAnchor() {
+    if (!chatBody) return { bottom: false, ids: [] };
+    const top = chatBody.getBoundingClientRect().top;
+    const ids = [];
+    for (const el of chatBody.querySelectorAll('[data-mid]')) {
+      const r = el.getBoundingClientRect();
+      if (r.bottom > top + 1) {
+        ids.push({ id: el.getAttribute('data-mid'), offset: r.top - top });
+        if (ids.length >= 3) break;
+      }
+    }
+    return { bottom: false, ids };
+  }
+
+  function findMsgEl(id) {
+    if (!chatBody || !id) return null;
+    const esc = window.CSS && CSS.escape ? CSS.escape(id) : String(id).replace(/["\\]/g, '\\$&');
+    return chatBody.querySelector(`[data-mid="${esc}"]`);
+  }
+
+  function applyScrollAnchor(a) {
+    if (!chatBody || !a) return;
+    if (a.bottom) {
+      chatBody.scrollTop = chatBody.scrollHeight;
+      return;
+    }
+    const top = chatBody.getBoundingClientRect().top;
+    for (const it of a.ids) {
+      const el = findMsgEl(it.id);
+      if (!el) continue;
+      const delta = el.getBoundingClientRect().top - top - it.offset;
+      if (Math.abs(delta) > 0.5) chatBody.scrollTop += delta;
+      return;
+    }
+    // 可视区的消息全被删了（编辑/回滚截到这一点）：保持 scrollTop 让浏览器按新高度
+    // 钳位，不主动跳到别处；强行钉底正是「回滚后往上弹一截」的来源。
+  }
+
+  // content-visibility 的估位要几帧才换成真实高度：短窗口内持续把锚点放回原位，
+  // 高度连续稳定就收手；用户滚轮/触摸立即让位。
+  function settleScrollAnchor(a, key) {
+    const token = ++scrollSettleToken;
+    const start = performance.now();
+    let lastH = -1;
+    let stable = 0;
+    const abort = () => {
+      if (token === scrollSettleToken) scrollSettleToken++;
+    };
+    if (chatBody) {
+      chatBody.addEventListener('wheel', abort, { once: true, capture: true });
+      chatBody.addEventListener('touchstart', abort, { once: true, capture: true });
+    }
+    const step = () => {
+      if (token !== scrollSettleToken || key !== curKey() || !chatBody) return;
+      applyScrollAnchor(a);
+      if (chatBody.scrollHeight === lastH) {
+        if (++stable >= 3) return;
+      } else {
+        stable = 0;
+        lastH = chatBody.scrollHeight;
+      }
+      if (performance.now() - start < 800) requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
   }
 
   // —— 上下文圆环——
@@ -1108,8 +1291,6 @@
     if (!editingField('baseUrl')) baseUrl = s.base_url || '';
     model = s.model || '';
     if (!editingField('configName')) configName = s.name || '';
-    if (!editingField('ctxLen')) ctxLen = s.context_length || 0;
-    if (!editingField('maxOut')) maxOut = s.max_output_tokens || 0;
     if (!editingField('compactPercent')) compactPercent = s.compact_percent || 85;
     // 圆环分母 = 当前生效的上下文窗口（服务端算好：渠道 context_length > 全局预算）。
     // 之前只看 s.context_length：跑着的时候改设置，那一轮每个 step 的 context_usage
@@ -1125,13 +1306,14 @@
           usageBySession = { ...usageBySession, [k]: { ...usageBySession[k], ctx: { ...usageBySession[k].ctx, window: win } } };
       }
     }
-    if (!editingField('temperature')) temperature = s.temperature ?? null;
-    if (!editingField('topP')) topP = s.top_p ?? null;
     providerId = s.provider_id || 'deepseek';
+    protocol = s.protocol || 'openai';
+    autoSuffix = s.auto_suffix !== false;
     savedModels = s.models || [];
     thinking = s.thinking || '';
     thinkingStyle = s.thinking_style || 'auto';
     capabilities = s.capabilities || { tools: true, vision: false, video: false, audio: false };
+    modelParams = s.model_params || {};
     roles = s.roles || {};
     features = s.features || { roles: true, css_tool: true, galaxy: true, computer: true };
     workspaceAliases = s.workspace_aliases || {};
@@ -1261,6 +1443,9 @@
   // —— 获取模型 ——
   async function fetchModels() {
     settingsMsg = '获取模型中…';
+    // 刚勾完「自动补后缀」/改完协议 500ms 内点获取模型，后端可能还拿着旧值——
+    // 先把挂起的设置落盘，保证本次请求按屏幕上这组参数发（2026-11-11）
+    await flushPendingSave();
     try {
       const r = await fetch('/api/models', {
         method: 'POST',
@@ -1783,6 +1968,28 @@
   }
   let rpLoading = false;
   let rpPreviewPath = ''; // 最近预览的文件（产物列表高亮用）
+  let rpSelPath = ''; // 产物列表当前选中行（单击只选中不打开，双击才预览——同项目文件树）
+  let artMenu = null; // 产物行右键菜单 { x, y, path }
+  /// 产物相对路径 → 绝对路径（多文件夹项目的额外根本身就是绝对路径，原样返回）
+  function wsAbs(p) {
+    if (/^[a-zA-Z]:[\\/]/.test(String(p)) || String(p).startsWith('\\\\')) return p;
+    if (!workspace) return p;
+    const sep = workspace.includes('\\') ? '\\' : '/';
+    return workspace.replace(/[\\/]+$/, '') + sep + String(p).replace(/\//g, sep);
+  }
+  function openArtMenu(e, path) {
+    // 边缘收进来：菜单 7 项约 220px 高、宽约 150px，右面板贴边时别开出屏幕外
+    artMenu = {
+      x: Math.max(4, Math.min(e.clientX, window.innerWidth - 160)),
+      y: Math.max(4, Math.min(e.clientY, window.innerHeight - 240)),
+      path,
+    };
+  }
+  async function artInsert(path) {
+    try {
+      await insertAtCursor('@' + path + ' ');
+    } catch { /* 输入框不可用时静默：插入不是关键操作 */ }
+  }
   let rpPreviewCache = {}; // path → { loading, content, error, editing, draft, base, editNote, saving, savedAt }（标签切换不重拉）
 
   // —— 文件预览的未保存修改：刷新/关标签/重开程序都不丢 ——
@@ -1876,9 +2083,12 @@
   function toggleThink(key, currentlyOpen) {
     thinkOpenMap = { ...thinkOpenMap, [key]: !currentlyOpen };
   }
-  // 思考框自动跟随：新分片贴底；滚轮往上滚 → 暂停跟随（出「回到底部」按钮）
+  // 流式滚动区自动跟随（思考框 / 工具参数区同一套）：新分片贴底；
+  // 滚轮往上滚 → 暂停跟随（出「回到底部」按钮）
   let thinkFollowMap = {}; // `${msgId}:${blockIndex}:${itemIndex}` → 是否跟随
   let thinkBoxEls = {}; // 同上 → 思考滚动容器（bind:this）
+  let toolFollowMap = {}; // 同上 → 工具参数区是否跟随（写入类工具的参数是流式补长的）
+  let toolPreEls = {}; // 同上 → 工具参数滚动容器（bind:this）
   // 工具详情折叠（`${msgId}:${toolIndex}` → true=展开）：默认收起，点行展开参数/结果
   let toolFold = {};
   // —— 任务清单 dock（贴输入框上方、展开向上、与提问上下堆叠）——
@@ -1934,14 +2144,14 @@
       question: m.question && m.question.answered === null ? { ...m.question, answered: { dismissed: true } } : m.question,
     };
   }
-  /// 思考框自动跟随：内容增长时贴底；用户上滚 → 停（followchange 通知界面）；
-  /// 滚回最底 → 恢复。只在流式思考（active=true）时启动——历史里展开一段长思考
-  /// 应该从顶部读起，不能一打开就跳到底。
+  /// 流式滚动区自动跟随（思考框、工具参数区共用）：内容增长时贴底；用户上滚 →
+  /// 停（followchange 通知界面）；滚回最底 → 恢复。只在流式（active=true）时启动——
+  /// 历史里展开一段长内容应该从顶部读起，不能一打开就跳到底。
   /// 2026-10-31 修「上滑被强行拽回」：靠「是否贴底」判意图在流式下永远输——
   /// MutationObserver 每次新内容都把位置拽回底部，scroll 事件到达时几何上总在
   /// 底部。改为滚轮/触摸一出手立即停跟（同步，先于任何拽回），scroll 事件只按
   /// 方向判（向上=用户、向下到底=恢复），跟随拽回不误伤。
-  function thinkFollow(node, active = true) {
+  function followScroll(node, active = true) {
     let following = true;
     let live = !!active;
     let lastTop = node.scrollTop;
@@ -1992,8 +2202,8 @@
       },
     };
   }
-  function jumpThink(key) {
-    const el = thinkBoxEls[key];
+  /// 回到底部（思考框 / 工具参数区共用）：滚到底后 scroll 事件会自行恢复跟随
+  function jumpScroll(el) {
     if (el) el.scrollTop = el.scrollHeight;
   }
   /// 复制到剪贴板：优先异步 Clipboard API，拒绝/不可用时退回 execCommand
@@ -2300,8 +2510,15 @@
       if (document.activeElement !== addrEl) {
         webAddress = act ? (act.url === 'about:blank' ? '' : act.url || '') : '';
       }
-      // 上报可见页：后端据此只给这一页跑 screencast 帧流、挂起其余后台页
-      if (webActiveId) webActivate(webActiveId);
+      // 上报可见页：后端据此只给这一页跑 screencast 帧流、挂起其余后台页。
+      // 空白页不上报「在看」而是上报隐藏：原生托管下 activate 会让壳把 webview 显示到
+      // 这块区域上，about:blank 在深色下画成一块黑，把「网页 / 粘贴 URL」空态引导整个盖住
+      //（2026-11-12 用户截图「一片黑，没有网页标识」——旧逻辑只在 webShowShot 翻转时补发
+      //  隐藏，新建标签页后它仍是 false，隐藏信号永远等不到）。微调也顺带恢复：空态是宿主
+      // DOM，能右击；真页面是原生窗口，页内本来就够不到。
+      const actBlank = !act || !act.url || act.url === 'about:blank';
+      if (webActiveId && !actBlank) webActivate(webActiveId);
+      else if (webNative) webNotifyHidden();
     } catch (e) {
       webTabs = [];
       webError = String((e && e.message) || e);
@@ -2841,6 +3058,8 @@
     rvDiff = {};
     rvWarn = '';
     rpFiles = [];
+    rpSelPath = '';
+    artMenu = null;
     rpArtifactsNote = '';
     rpBackfilled = false;
     rpWarn = '';
@@ -3433,6 +3652,15 @@
             if (cur.matches(a.sel)) return { name: a.name, sel: a.sel, el: cur };
           } catch (e) {}
         }
+        // 没登记别名、但元素自己有语义类名（.process 这类）：用类名当选择器，
+        // 别退到 div:nth-of-type 结构链——结构链只锚位置，同类没法用、DOM 一挪就漂
+        const cls = (typeof cur.className === 'string' ? cur.className : '')
+          .split(/\s+/)
+          .filter((c) => c && !/^s-/.test(c) && !/^svelte-/i.test(c) && !GENERIC_CLASSES.has(c));
+        if (cls.length) {
+          const anchor = cls.find((c) => c.includes('-')) || cls[0];
+          return { name: anchor, sel: `.${CSS.escape(anchor)}`, el: cur };
+        }
         return { name: '', sel: structuralSelector(cur), el: cur };
       }
       cur = cur.parentElement;
@@ -3516,6 +3744,22 @@
     // 已存规则优先（面板显示与实际生效一致）；但老存量里"渐变按钮上的实色微调"
     // 是被渐变盖住看不见的死值，现场读到渐变时以现场为准（带 bgImage 的新规则除外）
     const savedBgValid = saved && saved.bg != null && (!bgGradient || !!saved.bgImage);
+    // 描边读数（2026-11-12）：border 为 0 但画着 inset 环的元素（选中态描边都是
+    // box-shadow 环，v2 定稿为免布局位移），「描边」读写走环——不认环的话面板显示
+    // 0px 而线照画（用户圈出）。border 与环并存时按老规矩只认 border。
+    const liveRing = parseInsetRing(cs.boxShadow);
+    const liveBorderW = Math.round(parseFloat(cs.borderTopWidth) || 0);
+    const ringEl = saved?.border == null && (saved?.ring != null || (liveBorderW === 0 && !!liveRing));
+    const borderNow = saved?.ring != null
+      ? Math.round(parseFloat(saved.ring) || 0)
+      : ringEl && liveRing
+        ? liveRing.width
+        : liveBorderW;
+    const borderColorNow =
+      saved?.ringColor ||
+      saved?.borderColor ||
+      (ringEl && liveRing ? rgbToHex(liveRing.color) : rgbToHex(cs.borderTopColor)) ||
+      '#000000';
     microPanel = {
       // 位置：右侧留出面板宽度，下方至少留 340px 可用高度（面板自身 max-height 按 y 计算，
       // 配合内部滚动，保证底部「应用/重置/取消」始终可见可点）
@@ -3538,20 +3782,42 @@
       bgOpacity: savedBgValid && saved.bgOpacity != null ? saved.bgOpacity : bgAlphaPct,
       bgGradient: bgGradient || null,
       radius: numOf(saved?.radius, Math.round(parseFloat(cs.borderTopLeftRadius) || 0)),
-      // 描边：宽度 + 颜色（用户显式改过才落盘；只改颜色时尊重元素原有边框样式）
-      border: numOf(saved?.border, Math.round(parseFloat(cs.borderTopWidth) || 0)),
-      borderColor: saved?.borderColor || rgbToHex(cs.borderTopColor) || '#000000',
+      // 描边：宽度 + 颜色（用户显式改过才落盘；只改颜色时尊重元素原有边框样式）。
+      // 环元素（ringEl）的宽色实际是 box-shadow inset 环；ringOthers 记录环外的
+      // 其余 shadow 层，预览重建时保留
+      border: numOf(saved?.border, borderNow),
+      borderColor: borderColorNow,
       borderDirty: false,
       borderColorDirty: false,
+      ringEl,
+      ringOthers: ringEl && liveRing ? liveRing.others : [],
       blur: numOf(saved?.blur, blurNow),
       fontSize: numOf(saved?.fontSize, Math.round(parseFloat(cs.fontSize) || 14)),
       // 自身透明但上层有实底时，面板给出"背景其实由上级绘制"的跳转入口
       bgHost: !paintsBg(el) ? findBgHost(el) : null,
+      // 状态：常态 / 悬停（2026-11-12）。悬停规则用独立 key（后缀 ' ::hover'）——
+      // 同一元素的常态与悬停是两条规则，悬停底色/描边这类以前只能改常态、一 hover 就盖回去
+      state: / ::hover$/.test(key) ? 'hover' : 'normal',
       // 作用范围：默认「同类全部」（同类的就该一起变，行内代码
       // 调一个全跟着透明）。已存的"仅此元素"规则且点的正是那个元素时保持不变；
-      // 点的是同类里别的元素 → 默认「同类全部」，应用后整类统一（含旧那个）
-      scope: saved && saved.uid && el.getAttribute && el.getAttribute('data-mt') === saved.uid ? 'only' : 'all',
+      // 点的是同类里别的元素 → 默认「同类全部」，应用后整类统一（含旧那个）。
+      // 悬停态只支持同类：单元素规则靠 data-mt 标记，一个元素只能挂一个
+      scope: / ::hover$/.test(key)
+        ? 'all'
+        : saved && saved.uid && el.getAttribute && el.getAttribute('data-mt') === saved.uid
+          ? 'only'
+          : 'all',
     };
+  }
+
+  // 常态/悬停切换：换 key 重开面板（悬停 key 带 ' ::hover'），读数按对应规则回放
+  function setMicroState(st) {
+    const p = microPanel;
+    if (!p || p.extName) return;
+    if ((st === 'hover') === (p.state === 'hover')) return;
+    clearMicroInline(p.el);
+    const baseKey = p.key.replace(/ ::hover$/, '');
+    openMicroPanel(p.x, p.y, p.name, p.sel, p.el, st === 'hover' ? baseKey + ' ::hover' : baseKey);
   }
 
   // 跳到真正绘制背景的上级（用户右键在透明内容层时的救急入口）
@@ -3596,12 +3862,27 @@
     const el = microPanel.el;
     if (!el || !el.isConnected) return;
     if (prop === 'border') {
+      // 环元素：描边写 box-shadow inset 环（写 border 会让选中态跳 2px 布局，
+      // 正是当初选中描边改用环的原因）；环外的其余 shadow 层原样保留
+      if (microPanel.ringEl) {
+        const c = microPanel.borderColor;
+        const layers = [...(microPanel.ringOthers || [])];
+        if (value > 0) layers.push(`inset 0px 0px 0px ${value}px ${c}`);
+        el.style.boxShadow = layers.length ? layers.join(', ') : 'none';
+        return;
+      }
       // 拖宽度必须同时给 border-style，否则 border:none 的元素看不出变化
       el.style.borderStyle = 'solid';
       el.style.borderWidth = `${value}px`;
       return;
     }
     if (prop === 'borderColor') {
+      if (microPanel.ringEl) {
+        const layers = [...(microPanel.ringOthers || [])];
+        if (microPanel.border > 0) layers.push(`inset 0px 0px 0px ${microPanel.border}px ${value}`);
+        el.style.boxShadow = layers.length ? layers.join(', ') : 'none';
+        return;
+      }
       el.style.borderStyle = 'solid';
       el.style.borderColor = value;
       return;
@@ -3631,7 +3912,7 @@
 
 
   function clearMicroInline(el) {
-    for (const k of ['color', 'backgroundColor', 'backgroundImage', 'borderRadius', 'backdropFilter', 'fontSize', 'borderWidth', 'borderColor', 'borderStyle']) el.style[k] = '';
+    for (const k of ['color', 'backgroundColor', 'backgroundImage', 'borderRadius', 'backdropFilter', 'fontSize', 'borderWidth', 'borderColor', 'borderStyle', 'boxShadow']) el.style[k] = '';
   }
 
   function applyMicro() {
@@ -3697,8 +3978,12 @@
     const fontSizeN = num('fontSize') ?? p.fontSize;
     // 只落盘用户亲手改过的属性（dirty 标记），但保留该元素上一次已存的其他属性——
     // 老存量/别次改的背景不会因为"这次只改圆角"就被弄丢；没动背景就不碰 bg，透明底元素不会再被误写黑底
-    const prev = microTweaks[p.key] && typeof microTweaks[p.key] === 'object' ? microTweaks[p.key] : {};
-    const entry = { sel: p.sel, name: p.name };
+    // 悬停态：独立 key 存（同一元素可有常态+悬停两条），选择器加 :hover 后缀
+    const isHover = p.state === 'hover';
+    const baseKey = p.key.replace(/ ::hover$/, '');
+    const saveKey = isHover ? baseKey + ' ::hover' : baseKey;
+    const prev = microTweaks[saveKey] && typeof microTweaks[saveKey] === 'object' ? microTweaks[saveKey] : {};
+    const entry = isHover ? { sel: p.sel + ':hover', name: p.name } : { sel: p.sel, name: p.name };
     if (p.colorDirty) entry.color = color;
     else if (prev.color) entry.color = prev.color;
     if (p.bgTransparent) {
@@ -3720,13 +4005,22 @@
     }
     if (p.radiusDirty) entry.radius = `${radiusN}px`;
     else if (prev.radius) entry.radius = prev.radius;
-    // 描边：宽度/颜色各自独立落盘；只改颜色时尊重原有边框样式
+    // 描边：宽度/颜色各自独立落盘；只改颜色时尊重原有边框样式。
+    // 环元素落盘成 ring/ringColor（microCss 输出 box-shadow）——落成 border 会让
+    // 选中态跳 2px 布局，违背当初用环的定稿
     const borderN = num('border') ?? p.border;
     const borderColorV = val('borderColor') ?? p.borderColor;
-    if (p.borderDirty) entry.border = `${borderN}px`;
-    else if (prev.border) entry.border = prev.border;
-    if (p.borderColorDirty) entry.borderColor = borderColorV;
-    else if (prev.borderColor) entry.borderColor = prev.borderColor;
+    if (p.ringEl) {
+      if (p.borderDirty) entry.ring = `${borderN}px`;
+      else if (prev.ring) entry.ring = prev.ring;
+      if (p.borderColorDirty) entry.ringColor = borderColorV;
+      else if (prev.ringColor) entry.ringColor = prev.ringColor;
+    } else {
+      if (p.borderDirty) entry.border = `${borderN}px`;
+      else if (prev.border) entry.border = prev.border;
+      if (p.borderColorDirty) entry.borderColor = borderColorV;
+      else if (prev.borderColor) entry.borderColor = prev.borderColor;
+    }
     // 毛玻璃护栏：背景不透明（opacity>=85%）时存 blur 没有视觉意义，反而会在弹窗/遮罩下发灰叠影；
     // 这种组合直接丢弃 blur，只保留其他属性。想要毛玻璃先把背景透明度降下来。
     const bgEffOpaque = p.bgTransparent
@@ -3741,8 +4035,23 @@
     if (p.fontSizeDirty) entry.fontSize = `${fontSizeN}px`;
     else if (prev.fontSize) entry.fontSize = prev.fontSize;
     // 作用范围：仅此元素 → 盖唯一标记并记结构路径（重渲染后按路径补盖）；
-    // 同类全部 → 清掉标记字段，规则改回元素选择器
-    if (p.scope === 'all') {
+    // 同类全部 → 清掉标记字段，规则改回元素选择器。
+    // 「同类」需要稳定类名：结构选择器（div:nth-of-type 链 / 含 > 的路径）天生只锚一个
+    // 位置——存成同类规则既命中不到兄弟，DOM 一挪还会漂到别的元素或啥都不中，用户看到的
+    // 就是「同类没生效 / 调完又反弹」（2026-11-12，工具卡别名过期时最常踩）。降级成单元素。
+    const wantAll = isHover ? true : p.scope === 'all';
+    const selStable = !!p.sel && !/^[a-z]/i.test(p.sel) && !p.sel.includes('>');
+    // 悬停态必须有稳定类名：没有就没法落规则（也不能退单元素），直接取消并说明
+    if (isHover && !selStable) {
+      clearMicroInline(p.el);
+      microPanel = null;
+      toast('这个元素没有稳定类名：悬停态无法可靠匹配，已取消');
+      return;
+    }
+    const useAll = wantAll && selStable;
+    if (isHover) {
+      // 悬停态只落同类规则（不加 data-mt：一个元素只能挂一个标记，会跟常态规则打架）
+    } else if (useAll) {
       if (prev.uid) {
         const old = document.querySelector(`[data-mt="${prev.uid}"]`);
         if (old) old.removeAttribute('data-mt');
@@ -3759,11 +4068,12 @@
     }
     clearMicroInline(p.el);
     const cur = { ...microTweaks };
-    cur[p.key] = entry;
+    cur[saveKey] = entry;
     microTweaks = cur;
     localStorage.setItem('microTweaks', JSON.stringify(cur));
     applyCustomCss();
     microPanel = null;
+    if (!isHover && p.scope === 'all' && !selStable) toast('这个元素没有稳定类名：同类无法可靠命中，已只作用于这一个元素');
   }
 
   function resetMicro() {
@@ -3782,13 +4092,14 @@
       return;
     }
     clearMicroInline(p.el);
-    const prevUid = microTweaks[p.key] && microTweaks[p.key].uid;
+    const saveKey = p.state === 'hover' ? p.key.replace(/ ::hover$/, '') + ' ::hover' : p.key;
+    const prevUid = microTweaks[saveKey] && microTweaks[saveKey].uid;
     if (prevUid) {
       const stamped = document.querySelector(`[data-mt="${prevUid}"]`);
       if (stamped) stamped.removeAttribute('data-mt');
     }
     const cur = { ...microTweaks };
-    delete cur[p.key];
+    delete cur[saveKey];
     microTweaks = cur;
     localStorage.setItem('microTweaks', JSON.stringify(cur));
     applyCustomCss();
@@ -4086,7 +4397,7 @@
   let cssImportInput;
   const CSS_RULES_KIND = 'agent-ui-css-rules';
 
-  function exportCssRules() {
+  async function exportCssRules() {
     const payload = {
       type: CSS_RULES_KIND,
       version: 1,
@@ -4094,7 +4405,24 @@
       customCss,
       microTweaks,
     };
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const text = JSON.stringify(payload, null, 2);
+    const n = Object.keys(microTweaks || {}).length;
+    const summary = `微调 ${n} 条${customCss.trim() ? ' + 手写 CSS' : ''}`;
+    // 走服务端写文件：浏览器下载落哪前端拿不到，用户要看到真实路径（2026-11-12）
+    try {
+      const r = await fetch('/api/micro/export', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ json: text, filename: 'ui-css-rules.json' }),
+      }).then((x) => x.json());
+      if (r && r.ok && r.path) {
+        settingsMsg = `已导出 CSS 规则（${summary}）→ ${r.path}`;
+        return;
+      }
+    } catch (e) {
+      /* 旧服务没有这个端点：回落浏览器下载 */
+    }
+    const blob = new Blob([text], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -4103,8 +4431,7 @@
     a.click();
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
-    const n = Object.keys(microTweaks || {}).length;
-    settingsMsg = `已导出 CSS 规则（微调 ${n} 条${customCss.trim() ? ' + 手写 CSS' : ''}）`;
+    settingsMsg = `已导出 CSS 规则（${summary}）→ 浏览器默认下载目录（ui-css-rules.json）`;
   }
 
   function onImportCssRules(e) {
@@ -4650,7 +4977,7 @@
                 // 总线先到时这里再插一条同 id 的，旧的那条永远转圈（settle 只收敛最后一条）。
                 const cmId = 'cm-' + d.compact_started.id;
                 if (!((sessionMsgs[skey] || []).some((x) => x.id === cmId))) {
-                  holdCompactScroll(() => pushMsg(skey, { id: cmId, role: 'system', kind: 'compact_marker', content: d.compact_started.text || '————正在压缩上下文————', state: 'running', ts: Date.now() }));
+                  pushMsg(skey, { id: cmId, role: 'system', kind: 'compact_marker', content: d.compact_started.text || '————正在压缩上下文————', state: 'running', ts: Date.now() });
                 }
               } else if (d.compact_done) {
                 settleCompactMarker(skey, d.compact_done.id, d.compact_done.text, 'done');
@@ -4900,19 +5227,49 @@
   //    重建冲掉）就落到任意一条 running 标记上，一条都没有就补一行——事件不许静默丢失。
   // ② withRunningCompacts：按文件重建视图时，压缩还在后台跑（文件里还没有标记行）
   //    就把本地 running 行接回去；文件里已有完成标记则让位（以文件为真源）。
-  // 压缩标记的滚动守卫：标记行插入/文本落定不触发钉底跟随（见 afterUpdate 注释）。
-  // 标志只在一帧内有效，afterUpdate 消费后由 rAF 复位。
-  let compactScrollHold = false;
-  function holdCompactScroll(fn) {
-    compactScrollHold = true;
+  // 压缩标记的滚动跟随交给 afterUpdate 的统一规则：钉底就跟随、没钉底不动。
+  // （旧的 compactScrollHold 单帧压制已经删除——它对没钉底的人本来就不起作用，
+  //  对钉底的人只会造成「这一帧不跟、下一帧再补」的两段式上弹。）
+  // 压缩失败态（刷新后从文件重建的标记行没有 state，靠文案识别；2026-11-10）
+  function compactFailed(m) {
+    return !!m && m.kind === 'compact_marker'
+      && (m.state === 'failed' || (typeof m.content === 'string' && m.content.includes('压缩失败')));
+  }
+  // 失败后手动重试：清服务端的「暂停自动压缩」标记，下轮收尾重新走触发判定。
+  async function retryCompact(m) {
+    const sid = currentSessionId;
+    if (!sid) return;
     try {
-      fn();
-    } finally {
-      requestAnimationFrame(() => { compactScrollHold = false; });
-    }
+      const r = await fetch('/api/compact/retry', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: sid }),
+      });
+      if (!r.ok) return;
+      updMsgs(sid, (a) => a.map((x) => (
+        x.kind === 'compact_marker' && x.id === m.id && x.content === m.content
+          ? { ...x, state: 'retried', content: '已恢复自动压缩：下轮结束后会再尝试' }
+          : x
+      )));
+    } catch {}
   }
   function settleCompactMarker(key, jobId, text, state) {
-    holdCompactScroll(() => updMsgs(key, (a) => {
+    // 压缩完成走「本地就地收尾」，和编辑/重发同一种状态：不整表重载。
+    // 压缩不改任何消息内容，只往会话末尾补一行完成标记（旧标记一并清掉，文件里
+    // 也是 retain 旧标记 + 插在 after_id 之后 ≈ 末尾）。后端随后的 sessions_changed
+    // 要对当前会话跳过重载（见 refreshSessionsAndDropStale 的 selfCompacted 守卫）——
+    // 整表重建正是「压缩前后上弹」的根源（2026-11-11 真机：压缩完视口被拽走）。
+    if (state === 'done') {
+      selfCompactedKey = key;
+      selfCompactedAt = Date.now();
+      updMsgs(key, (a) => {
+        const next = a.filter((m) => m.kind !== 'compact_marker');
+        next.push({ id: 'cm-' + jobId, role: 'system', kind: 'compact_marker', content: text, state, ts: Date.now() });
+        return next;
+      });
+      return;
+    }
+    updMsgs(key, (a) => {
       const wantId = 'cm-' + jobId;
       const byId = a.some((m) => m.id === wantId);
       let hit = false;
@@ -4934,7 +5291,7 @@
         }
       }
       return next;
-    }));
+    });
   }
   function withRunningCompacts(key, arr) {
     const running = (sessionMsgs[key] || []).filter((m) => m.kind === 'compact_marker' && m.state === 'running');
@@ -4952,25 +5309,29 @@
   // 「压缩完瞬间弹到页面上面」。锚定替换前的视口：scrollTop 加上高度差，
   // 钉底的依旧钉底、阅读中的停在原内容上。
   async function swapMsgsKeepScroll(key, arr) {
-    const el = chatBody;
-    const prevTop = el ? el.scrollTop : 0;
-    const prevH = el ? el.scrollHeight : 0;
-    const pinned = chatPinned;
-    compactScrollHold = true; // afterUpdate 的钉底跟随让位给下面的精确锚定
+    // 只对当前显示的会话做视口锚定；后台会话的列表更新不影响当前滚动
+    if (key !== curKey() || !chatBody) {
+      setMsgs(key, arr);
+      return;
+    }
+    // 更新前就在底部的人继续贴底；正在读历史的人锚住视口顶部那条消息。
+    const anchor = chatPinned ? { bottom: true, ids: [] } : captureScrollAnchor();
+    pendingScrollAnchor = anchor; // afterUpdate 在 DOM 更新后、绘制前应用
     setMsgs(key, arr);
     await tick();
-    const fix = () => {
-      if (!el) return;
-      if (pinned) el.scrollTop = el.scrollHeight;
-      else if (prevH > 0) el.scrollTop = Math.max(0, prevTop + (el.scrollHeight - prevH));
-    };
-    fix();
-    // 第二帧再校准一次：content-visibility 块的估位要一帧才换成真实高度，
-    // 第一次读 scrollHeight 可能带着估位误差（压缩完成重建时表现为「弹一下」）
-    requestAnimationFrame(() => {
-      fix();
-      compactScrollHold = false;
-    });
+    applyScrollAnchor(anchor); // 兜底（afterUpdate 已应用过一次）
+    settleScrollAnchor(anchor, key); // 估位落定的短窗口内持续校正
+  }
+
+  /// 本地截断到某条消息之前（不含目标）：服务端已经截完，视图只删尾部，
+  /// 不再从服务器整表重载。整表重载会把前面几十条 DOM 全部重建，是编辑/回滚
+  /// 「往上弹」的根源（2026-11-11 真机复现：编辑第 21 轮，视口被整表重建拽走）。
+  function truncateViewBefore(key, targetId) {
+    const arr = sessionMsgs[key] || [];
+    const idx = arr.findIndex((m) => m.id === targetId);
+    if (idx < 0) return false;
+    setMsgs(key, arr.slice(0, idx));
+    return true;
   }
 
   async function rollbackMsg(m) {
@@ -4979,12 +5340,49 @@
     if (!(await confirmAsk(m.cp
       ? '回滚到这条消息？\n工作区文件会恢复到它发出前的检查点状态，这条和它之后的所有消息都会删除，不可恢复。'
       : '回滚到这条消息？\n这条消息没有文件基线记录（旧会话），只回滚对话、文件不动；这条和它之后的所有消息都会删除。'))) return;
+    const wasPinned = chatPinned;
+    if (!wasPinned) beginScrollFreeze(key); // 点确认时的视口就是标准
     await ensureIdle(key);
     try {
       await truncateRequest(key, fileUserIndex(key, m), 'rollback', m.cp || '', contentText(m.content).trim().slice(0, 80));
-      await reloadSessionView(key);
+      // 截断前先垫一屏留白：setMsgs 那一帧新高度还没算，没留白浏览器会先钳一次
+      if (scrollFreeze && chatBody) {
+        scrollSpacerPx = chatBody.clientHeight;
+        await tick();
+        scrollFreeze.truncated = true;
+      }
+      // 只删尾部，前面已渲染的消息不动；回滚点就是新的末尾
+      if (truncateViewBefore(key, m.id)) {
+        selfTruncatedKey = key;
+        selfTruncatedAt = Date.now();
+        if (wasPinned) chatPinned = true;
+        loadSessions();
+      } else if (scrollFreeze) {
+        scrollFreeze = null;
+      }
     } catch (e) {
+      scrollFreeze = null;
+      scrollSpacerPx = 0;
       pushMsg(key, { id: nextId(), role: 'error', content: `[回滚失败] ${e.message || e}` });
+    }
+  }
+
+  /// 从这条用户消息分叉：复制到这条消息（含）为止的消息到新会话，原对话不动。
+  /// 附件随消息 JSON 原样带过去（工作区相同，.attachments/ 相对路径能直接读回）。
+  async function forkMsg(m) {
+    const key = curKey();
+    if (!key) return;
+    try {
+      const r = await fetch('/api/sessions/fork', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: key, user_index: fileUserIndex(key, m) }),
+      }).then((x) => x.json());
+      if (!r.id) throw new Error(r.error || '分叉失败');
+      await loadSessions();
+      await loadSession(r.id);
+    } catch (e) {
+      await confirmAsk(`分叉失败：${e.message || e}`, true);
     }
   }
 
@@ -5003,22 +5401,73 @@
   }
 
   function beginEdit(m) {
-    editingMsg = { id: m.id, text: m.content };
+    editingMsg = { id: m.id, text: m.content, attachments: m.attachments || [] };
+  }
+
+  /// 消息上的附件 → 可发送的附件对象（编辑重发用）：本轮消息自带 data；
+  /// 刷新/重开后只剩 path，按 path 从工作区把文件读回来（2026-11-10）
+  async function attachmentsForSend(list) {
+    const out = [];
+    for (const a of list || []) {
+      if (a.data) {
+        out.push({ name: a.name, mime: a.mime, data: a.data });
+        continue;
+      }
+      if (!a.path) continue;
+      try {
+        const r = await fetch('/api/workspace/raw?path=' + encodeURIComponent(a.path));
+        if (!r.ok) continue;
+        const blob = await r.blob();
+        const dataUrl = await new Promise((res) => {
+          const fr = new FileReader();
+          fr.onload = () => res(String(fr.result || ''));
+          fr.onerror = () => res('');
+          fr.readAsDataURL(blob);
+        });
+        if (dataUrl) out.push({ name: a.name, mime: a.mime || blob.type, data: dataUrl });
+      } catch {}
+    }
+    return out;
   }
 
   async function saveEdit() {
     const key = curKey();
     const text = (editingMsg?.text || '').trim();
     const target = (sessionMsgs[key] || []).find((x) => x.id === editingMsg?.id);
+    const wasPinned = chatPinned;
+    // 点保存这一刻的视口就是标准：编辑框收起、截断、重发全过程都用它
+    if (!wasPinned) beginScrollFreeze(key);
+    // 编辑重发不能把附件丢掉（2026-11-10）：原消息上的附件随这条一起重发
+    const atts = await attachmentsForSend(editingMsg?.attachments || target?.attachments || []);
     editingMsg = null;
-    if (!text || !target) return;
+    if (!text || !target) {
+      scrollFreeze = null;
+      scrollSpacerPx = 0;
+      return;
+    }
     await ensureIdle(key);
     try {
       await truncateRequest(key, fileUserIndex(key, target), 'rollback', '', contentText(target.content).trim().slice(0, 80));
-      await reloadSessionView(key);
+      // 截断前先垫一屏留白：setMsgs 那一帧新高度还没算，没留白浏览器会先钳一次
+      if (scrollFreeze && chatBody) {
+        scrollSpacerPx = chatBody.clientHeight;
+        await tick();
+        scrollFreeze.truncated = true;
+      }
+      // 本地只删尾部：编辑点之前的消息 DOM 原样保留，新消息接在编辑点位置
+      if (truncateViewBefore(key, target.id)) {
+        selfTruncatedKey = key;
+        selfTruncatedAt = Date.now();
+        if (wasPinned) chatPinned = true;
+        loadSessions();
+      } else if (scrollFreeze) {
+        scrollFreeze = null;
+      }
       // 编辑后的文本走正常发送路（时间戳/流式/落盘全在既有链路上）
-      await deliver(key, text, [], {});
+      await deliver(key, text, atts, {});
     } catch (e) {
+      scrollFreeze = null;
+      scrollSpacerPx = 0;
       pushMsg(key, { id: nextId(), role: 'error', content: `[编辑重发失败] ${e.message || e}` });
     }
   }
@@ -5244,6 +5693,11 @@
     for (const id of changed) if (!streams[id] && id !== cur) delete next[id];
     sessionMsgs = next;
     if (cur && changed.includes(cur) && !streams[cur]) {
+      // 自己刚做的编辑/回滚：本地已截断，重载只会整表重建、把视口拽走
+      if (scrollFreeze) return;
+      if (selfTruncatedKey === cur && Date.now() - selfTruncatedAt < 8000) return;
+      // 自己刚收到的压缩完成：标记行已就地收尾，同样不重载（压缩前后上弹）
+      if (selfCompactedKey === cur && Date.now() - selfCompactedAt < 8000) return;
       try {
         const r = await fetch(`/api/session?id=${encodeURIComponent(cur)}`).then((x) => x.json());
         if (Array.isArray(r.messages) && r.messages.length) {
@@ -5705,8 +6159,8 @@
         ? items
         : items.slice(0, showAllFlags[path] ? items.length : CONV_PREVIEW);
       for (const s of capped) rows.push({ type: 'conv', s });
-      if (!searchQ && items.length > CONV_PREVIEW && !showAllFlags[path]) {
-        rows.push({ type: 'more', path, rest: items.length - CONV_PREVIEW });
+      if (!searchQ && items.length > CONV_PREVIEW) {
+        rows.push({ type: 'more', path, rest: items.length - CONV_PREVIEW, all: !!showAllFlags[path] });
       }
     };
     for (const p of projectList) pushGroup(p.path, p.name, p.active, sessionsByProject[p.path] || []);
@@ -6002,13 +6456,36 @@
 
   function rebuildFromSession(msgs) {
     const out = [];
+    // 稳定 id（2026-11-11）：整表重建时沿用同一份落盘消息的 id，让 keyed each
+    // 复用原有 DOM。旧实现每次 reload 都 nextId()，所有消息节点重建——
+    // content-visibility 的估位随之重置，压缩/回滚/编辑后滚动位置必抖。
+    const seen = new Map();
+    const stableId = (m) => {
+      const sig = [
+        m.role || '',
+        m.ts || '',
+        m.kind || '',
+        contentText(m.content).slice(0, 120),
+        (m.tool_calls || []).map((tc) => tc.id || '').join(','),
+      ].join('|');
+      let h = 2166136261;
+      for (let i = 0; i < sig.length; i++) {
+        h ^= sig.charCodeAt(i);
+        h = Math.imul(h, 16777619);
+      }
+      const base = 'srv-' + (h >>> 0).toString(36);
+      const n = seen.get(base) || 0;
+      seen.set(base, n + 1);
+      return n ? `${base}-${n}` : base;
+    };
     for (const m of msgs) {
       if (m.role === 'user') {
         // steered=引导消息（2026-10-22）：渲染成「已引导」轻量行，不占气泡位
-        out.push({ id: nextId(), role: 'user', content: contentText(m.content), steered: !!m.steered, interrupted: !!m.interrupted, ts: m.ts, cp: m.cp });
+        // attachments：刷新后气泡上的附件预览靠它还原（2026-11-10）
+        out.push({ id: stableId(m), role: 'user', content: contentText(m.content), attachments: m.attachments || undefined, steered: !!m.steered, interrupted: !!m.interrupted, ts: m.ts, cp: m.cp });
       } else if (m.role === 'assistant') {
         const asst = {
-          id: nextId(),
+          id: stableId(m),
           role: 'assistant',
           content: contentText(m.content),
           // 027：思考内容已随消息落盘（reasoning_content），切回会话时恢复
@@ -6040,7 +6517,7 @@
         out.push(asst);
       } else if (m.role === 'system') {
         // 通知/错误随会话落盘（display_only），重启/切回会话后气泡还在
-        out.push({ id: nextId(), role: 'system', content: contentText(m.content), kind: m.kind, ts: m.ts });
+        out.push({ id: stableId(m), role: 'system', content: contentText(m.content), kind: m.kind, ts: m.ts });
       } else if (m.role === 'tool') {
         const asst = [...out].reverse().find(
           (x) => x.role === 'assistant' && (x.tools || []).some((t) => t.id === m.tool_call_id)
@@ -6178,6 +6655,23 @@
     if (themeMode === 'system') applyThemeMode('system'); // 走同一条路：换肤 + 通知插件
   });
   applyThemeMode(themeMode); // 首屏即应用（组件初始化阶段，早于首帧渲染）
+
+  // —— 选中态口径（2026-11-12 用户拍板）：hl=文字高亮（默认）/ bg=背景高亮。
+  // 所有选中态样式只引用 --sel-fg/--sel-bg 变量（ui.css），这里只切根属性并让插件 iframe 跟随
+  let selStyle = localStorage.getItem('selStyle') === 'bg' ? 'bg' : 'hl';
+  function applySelStyle(m) {
+    selStyle = m === 'bg' ? 'bg' : 'hl';
+    localStorage.setItem('selStyle', selStyle);
+    document.documentElement.dataset.sel = selStyle;
+    // 项目文件树等插件 iframe 跟着换口径：重发 init（payload.selStyle）
+    if (extsBridgeReady) {
+      for (const name of Object.keys(extFrameEls)) {
+        const ext = extList.find((e) => e.name === name);
+        postToNameBoth(name, { type: 'pawch:init', payload: extInitPayload(ext) });
+      }
+    }
+  }
+  applySelStyle(selStyle); // 首屏即应用（组件初始化阶段，早于首帧渲染）
 
   // —— 自定义背景壁纸（dataURL 存 localStorage；选图时降采样防超配额）——
   let wallpaper = localStorage.getItem('wallpaper') || '';
@@ -6702,7 +7196,7 @@
     settings_changed: {
       kind: 'settings_changed', title: '（内部）设置变更同步', risk: 'safe', internal: true,
       args: 'keys: 变更键清单（仅通知用）',
-      run() { loadExt(); loadSettings(); },
+      run() { loadExt(); loadSettings(); loadSkills(); loadMcp(); },
     },
     // 会话用量快照更新（压缩收尾广播）：聊天流此时可能已死（用户中途刷新过），
     // 流上的 context_usage 会丢——圆环直接按事件落新快照，不用再刷一次界面
@@ -6736,7 +7230,7 @@
         if (!id || !sessionMsgs[id]) return; // 没加载的会话：下次打开从文件重建
         const mid = 'cm-' + m.id;
         if ((sessionMsgs[id] || []).some((x) => x.id === mid)) return;
-        holdCompactScroll(() => pushMsg(id, { id: mid, role: 'system', kind: 'compact_marker', content: m.text || '————正在压缩上下文————', state: 'running', ts: Date.now() }));
+        pushMsg(id, { id: mid, role: 'system', kind: 'compact_marker', content: m.text || '————正在压缩上下文————', state: 'running', ts: Date.now() });
       },
     },
     compact_done: {
@@ -7133,12 +7627,14 @@
           // embedding/budget/subagent）——漏一个键，插件每存一次就静默抹掉那条路由
           // （真机验收时漏了多模态三个，settings.json 里的 vision 被冲掉，实测）。
           // PUT /api/settings 对 roles 是全量替换，所以这里先把现有 roles 合进来再发。
-          const allow = ['summary', 'vision', 'video', 'audio', 'embedding', 'budget', 'subagent'];
+          const allow = ['summary', 'vision', 'video', 'audio', 'embedding', 'budget', 'subagent', 'subagent_mode'];
           const next = { ...roles };
           for (const k of allow) {
             if (params.roles[k] === null) delete next[k];
             else if (typeof params.roles[k] === 'string') next[k] = params.roles[k];
           }
+          // fallbacks 是数组，单独按数组覆盖（旧白名单漏了它，插件配一次被静默抹掉）
+          if (Array.isArray(params.roles.fallbacks)) next.fallbacks = params.roles.fallbacks.slice();
           patch.roles = next;
         }
         if (!Object.keys(patch).length) return reply(false, '没有可写的字段');
@@ -7758,6 +8254,7 @@
       root: appVersion?.root || '',
       theme: theme, // 已解析的实际主题（dark/light），system 模式也下发真值，插件别自己猜
       theme_mode: themeMode,
+      selStyle: selStyle, // 选中态口径（hl=文字高亮/bg=背景高亮），插件树选中行同口径
       sessionId: currentSessionId,
       title: displayTitle,
       // 告诉扩展「你是谁」（权限 / 插槽声明它自己在 manifest 里写）
@@ -8084,16 +8581,17 @@
 {#if wallpaper}
   {#if wallpaperKind === 'video'}
     <!-- 视频背景：静音自动循环，定位与遮罩口径同图片壁纸。
-         浅色主题淡出到 1/4：壁纸图多是按深色底挑的，浅色下全强度会压碎可读性
-         （2026-11-04 浅色走查定稿：浅色以可读为先，壁纸隐约透一点即可） -->
-    <video class="wallpaper wallpaper-video" src={wallpaper} autoplay muted loop playsinline style="opacity:{(wallpaperOpacity / 100) * (theme === 'light' ? 0.25 : 1)}"></video>
+         不透明度滑杆两主题同权（2026-11-12 用户：浅色拉满还泛白——
+         旧「浅色淡出到 1/4」的保读法上限撤掉，浅色下壁纸也能全强度显示） -->
+    <video class="wallpaper wallpaper-video" src={wallpaper} autoplay muted loop playsinline style="opacity:{wallpaperOpacity / 100}"></video>
   {:else}
-    <div class="wallpaper" style="background-image:url('{wallpaper}'); opacity:{(wallpaperOpacity / 100) * (theme === 'light' ? 0.25 : 1)}"></div>
+    <div class="wallpaper" style="background-image:url('{wallpaper}'); opacity:{wallpaperOpacity / 100}"></div>
   {/if}
 {/if}
 
 <div
   class="app"
+  class:micro-on={editMode}
   on:dragenter={onDragEnter}
   on:dragover={onDragOver}
   on:dragleave={onDragLeave}
@@ -8108,7 +8606,7 @@
       <div class="brand-row">
         <span class="brand-mark" aria-hidden="true"><img src="/pawch-icon.svg" alt="" /></span>
         <span class="brand-name">Pawch Agent</span>
-        <button class="icon-btn" title="收起侧栏" on:click={() => (sidebarCollapsed = true)}>
+        <button class="icon-btn" class:on={true} title="收起侧栏" on:click={() => (sidebarCollapsed = true)}>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4.5" width="18" height="15" rx="3.2"/><line x1="9.8" y1="4.5" x2="9.8" y2="19.5"/></svg>
         </button>
         <!-- 重新加载界面（铁律 1 配套，2026-10-31）：前端换新构建后点一下丢旧代码。
@@ -8273,10 +8771,6 @@
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M16.8 3.7a2.1 2.1 0 0 1 3 3L7.3 19.2 3 20.3l1.1-4.3Z"/><path d="M13.5 20h7"/></svg>
                   重命名
                 </button>
-                <button on:click|stopPropagation={() => forkSession(s.id)}>
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M5 6.5h11"/><circle cx="18.3" cy="6.5" r="1.7"/><path d="M5 6.5c5.5 0 3.5 11 9.5 11"/><circle cx="18.3" cy="17.5" r="1.7"/></svg>
-                  分叉会话
-                </button>
                 <button on:click|stopPropagation={() => deleteSessionRow(s)}>
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
                   删除会话
@@ -8285,8 +8779,8 @@
             {/if}
           </div>
         {:else if row.type === 'more'}
-          <button class="expand-more" on:click={() => (showAllFlags = { ...showAllFlags, [row.path]: true })}>
-            展开其余 {row.rest} 个会话
+          <button class="expand-more" on:click={() => (showAllFlags = { ...showAllFlags, [row.path]: !row.all })}>
+            {row.all ? '收起会话' : `展开其余 ${row.rest} 个会话`}
           </button>
         {:else}
           <div class="side-empty">{searchQ ? '没有匹配的会话' : '暂无会话，点上方「新对话」开始'}</div>
@@ -8301,7 +8795,10 @@
         记忆库
       </button>
       {/if}
-      <button class="foot-btn" on:click={() => (settingsOpen = true)}>设置</button>
+      <button class="foot-btn galaxy-btn" on:click={() => (settingsOpen = true)}>
+        <svg class="settings-gear" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09A1.7 1.7 0 0 0 9 19.4a1.7 1.7 0 0 0-1.88.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.34-1.88l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 9 4.6h.09A1.7 1.7 0 0 0 10 3.05V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.88-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 19.4 9v.09a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1.01z"/></svg>
+        设置
+      </button>
     </div>
     <div class="resize-handle" on:pointerdown={startResize}></div>
   </aside>
@@ -8312,7 +8809,9 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4.5" width="18" height="15" rx="3.2"/><line x1="9.8" y1="4.5" x2="9.8" y2="19.5"/></svg>
       </button>
     {/if}
-    <header class="chat-head" data-tauri-drag-region>
+    <!-- 微调模式摘掉拖拽属性（2026-11-12）：壳的拖拽区会吞鼠标事件，右击选不中顶栏；
+         退出微调恢复，窗口照常拖 -->
+    <header class="chat-head" data-tauri-drag-region={editMode ? undefined : ''}>
       <div class="head-main">
         <div class="chat-title">{displayTitle}</div>
       </div>
@@ -8406,7 +8905,7 @@
               <span class="steer-line-text">{m.content}</span>
             </div>
           {:else}
-          <div class="msg user" class:selecting={msgSelectMode} on:click={() => selectRow(m)}>
+          <div class="msg user" data-mid={m.id} class:selecting={msgSelectMode} on:click={() => selectRow(m)}>
             {#if msgSelectMode && !m.queued}
               <span class="msg-check" title="选中这条消息">
                 <input type="checkbox" checked={msgSelected.includes(m.id)} tabindex="-1" />
@@ -8417,8 +8916,11 @@
               <!-- 编辑态：原位变输入框；保存=回滚到这条之前+以新文本重发（先停输出） -->
               <div class="bubble user-bubble edit-box">
                 <textarea class="edit-area" bind:value={editingMsg.text} rows="3"></textarea>
+                {#if editingMsg.attachments && editingMsg.attachments.length > 0}
+                  <div class="edit-att-hint">附件 {editingMsg.attachments.length} 个会随这条一起重发</div>
+                {/if}
                 <div class="edit-actions">
-                  <button class="btn primary" on:click={saveEdit}>保存并重发</button>
+                  <button class="btn primary" on:click={saveEdit} on:mousedown|preventDefault>保存并重发</button>
                   <button class="btn ghost" on:click={() => (editingMsg = null)}>取消</button>
                   <span class="edit-hint">保存会先停止正在跑的输出</span>
                 </div>
@@ -8428,20 +8930,45 @@
               {#if m.attachments && m.attachments.length > 0}
                 <div class="msg-attachments">
                   {#each m.attachments as a}
+                    <!-- 本轮消息带 data（data URL，即时显示）；刷新/重开会话后只剩元数据，
+                         走 /api/workspace/raw 从 .attachments/ 读回（2026-11-10 修「刷新丢附件」） -->
+                    {@const src = a.data || (a.path ? `/api/workspace/raw?path=${encodeURIComponent(a.path)}` : '')}
                     {#if a.mime && a.mime.startsWith('image/')}
                       <img
                         class="msg-att-img"
-                        src={a.data}
+                        {src}
                         alt={a.name}
                         title="点击查看原图"
-                        on:click={() => (previewImageModal = a.data)}
+                        on:click={() => (previewImageModal = src)}
                       />
                     {:else if a.mime && a.mime.startsWith('video/')}
-                      <video class="msg-att-video" controls src={a.data}>
-                        <track kind="captions" />
-                      </video>
+                      {#if vidNoFrame[vidNoFrameKey(m, a)]}
+                        <!-- 解不出画面（多为 H.265，本机 WebView2 缺解码器）：降级成文件条，
+                             点击用系统默认播放器打开——预览不了不等于用不了 -->
+                        <button
+                          class="msg-att-file msg-att-file-act"
+                          title="该视频的编码本机无法预览画面（多为 H.265/HEVC），点击用系统播放器打开"
+                          on:click|stopPropagation={() => openAttachmentExternal(a)}
+                        ><svg class="att-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m8 12.5 6.5-6.5a2.8 2.8 0 0 1 4 4L9 19.5a4.5 4.5 0 0 1-6.4-6.4l8.5-8.5"/></svg> {a.name}</button>
+                      {:else}
+                        <!-- preload=metadata + playsinline：帧信息尽早加载、内联播放（2026-11-10）。
+                             src 带 #t=0.1：强制解码并显示首帧——有些环境（WebView2+手机录屏 mp4）
+                             元数据读得到却不出首帧，渲染成空画面+底部播放条（2026-11-11）。
+                             data URL 不能带 fragment，只对 http src 追加。 -->
+                        <video
+                          class="msg-att-video"
+                          controls
+                          preload="metadata"
+                          playsinline
+                          src={src.startsWith('data:') ? src : src + '#t=0.1'}
+                          on:loadedmetadata={(e) => vidMetaFail(m, a, e)}
+                          on:error={() => (vidNoFrame = { ...vidNoFrame, [vidNoFrameKey(m, a)]: true })}
+                        >
+                          <track kind="captions" />
+                        </video>
+                      {/if}
                     {:else if a.mime && a.mime.startsWith('audio/')}
-                      <audio class="msg-att-audio" controls src={a.data}></audio>
+                      <audio class="msg-att-audio" controls {src}></audio>
                     {:else}
                       <div class="msg-att-file"><svg class="att-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m8 12.5 6.5-6.5a2.8 2.8 0 0 1 4 4L9 19.5a4.5 4.5 0 0 1-6.4-6.4l8.5-8.5"/></svg> {a.name}</div>
                     {/if}
@@ -8481,6 +9008,9 @@
                   <button class="msg-act" title="编辑并重发（会先停止正在跑的输出）" aria-label="编辑" on:click|stopPropagation={() => beginEdit(m)}>
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
                   </button>
+                  <button class="msg-act" title="从这条消息分叉：复制到这条消息为止的对话到新会话，原对话不动" aria-label="分叉" on:click|stopPropagation={() => forkMsg(m)}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M5 6.5h11"/><circle cx="18.3" cy="6.5" r="1.7"/><path d="M5 6.5c5.5 0 3.5 11 9.5 11"/><circle cx="18.3" cy="17.5" r="1.7"/></svg>
+                  </button>
                   <button class="msg-act" title="删除这条消息（同一问答的另一半保留；不可恢复）" aria-label="删除" on:click|stopPropagation={() => deleteMsg(m)}>
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
                   </button>
@@ -8496,7 +9026,7 @@
           {/if}
         {:else if m.role === 'assistant'}
           {@const shots = shotsFromParts(messageParts(m))}
-          <div class="msg assistant" class:selecting={msgSelectMode} on:click={() => selectRow(m)}>
+          <div class="msg assistant" data-mid={m.id} class:selecting={msgSelectMode} on:click={() => selectRow(m)}>
             {#if msgSelectMode && !m.streaming}
               <span class="msg-check" title="选中这条回复">
                 <input type="checkbox" checked={msgSelected.includes(m.id)} tabindex="-1" />
@@ -8581,12 +9111,12 @@
                                 <div
                                   class="think-text"
                                   class:streaming={m.streaming && !it.done}
-                                  use:thinkFollow={m.streaming && !it.done}
+                                  use:followScroll={m.streaming && !it.done}
                                   bind:this={thinkBoxEls[ik]}
                                   on:followchange={(e) => (thinkFollowMap = { ...thinkFollowMap, [ik]: e.detail.following })}
                                 >{it.text}</div>
                                 {#if thinkFollowMap[ik] === false}
-                                  <button class="think-jump" title="回到底部（继续跟随）" on:click={() => jumpThink(ik)}>
+                                  <button class="think-jump" title="回到底部（继续跟随）" on:click={() => jumpScroll(thinkBoxEls[ik])}>
                                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v13"/><path d="m6 12 6 6 6-6"/></svg>
                                   </button>
                                 {/if}
@@ -8645,7 +9175,20 @@
                                   {#if it.args}
                                     <div class="tool-sec">
                                       <div class="tool-sec-label">参数</div>
-                                      <pre class="tool-pre">{@html highlightText(prettyArgs(it.args), 'json')}</pre>
+                                      <!-- 参数是流式补长的（模型边吐边涨，写入类工具最长），
+                                           和思考框同一套跟随：默认贴底，上滑固定 -->
+                                      <pre
+                                        class="tool-pre"
+                                        use:followScroll={m.streaming && it.status === 'running'}
+                                        bind:this={toolPreEls[ik]}
+                                        on:followchange={(e) =>
+                                          (toolFollowMap = { ...toolFollowMap, [ik]: e.detail.following })}
+                                      >{@html highlightText(prettyArgs(it.args), 'json')}</pre>
+                                      {#if m.streaming && it.status === 'running' && toolFollowMap[ik] === false}
+                                        <button class="tool-jump" title="回到底部（继续跟随）" on:click={() => jumpScroll(toolPreEls[ik])}>
+                                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v13"/><path d="m6 12 6 6 6-6"/></svg>
+                                        </button>
+                                      {/if}
                                     </div>
                                   {/if}
                                   {#if it.preview}
@@ -8705,24 +9248,33 @@
             </div>
           </div>
         {:else if m.role === 'system' && m.kind === 'compact_marker'}
-          <!-- 静默压缩标记行（2026-11-07）：「正在压缩→压缩后」同位更新，全程唯一可见痕迹 -->
-          <div class="compact-divider" class:running={m.state === 'running'} class:failed={m.state === 'failed'}>{m.content}</div>
+          <!-- 静默压缩标记行（2026-11-07）：「正在压缩→压缩后」同位更新，全程唯一可见痕迹；
+               失败态带原因 +「重试」按钮（2026-11-10） -->
+          <div class="compact-divider" data-mid={m.id} class:running={m.state === 'running'} class:failed={compactFailed(m)}>
+            {m.content}{#if compactFailed(m)}<button class="compact-retry" on:click|stopPropagation={() => retryCompact(m)}>重试</button>{/if}
+          </div>
         {:else if m.role === 'error'}
           <!-- 报错行：与重启后落盘恢复的 [错误] 系统消息同款灰字（
                实时红气泡和重启后灰字两副面孔太突兀，统一成后者）。
                落盘侧已带 [错误] 前缀（server 落 [错误] {e}），实时侧这里补齐前缀 -->
-          <div class="msg system"><div class="sys-text">[错误] {m.content}</div></div>
+          <div class="msg system" data-mid={m.id}><div class="sys-text">[错误] {m.content}</div></div>
         {:else if m.role === 'cp'}
           <!-- 检查点消息只给改动条提供基线（dockCp），不渲染 -->
         {:else}
-          <div class="msg system"><div class="sys-text">{m.content ?? ''}</div></div>
+          <div class="msg system" data-mid={m.id}><div class="sys-text">{m.content ?? ''}</div></div>
         {/if}
         {/each}
         </div>
       {/each}
       {#if tailCompactMarker}
         <!-- 压缩标记作为最后一条：移出分块单独渲染，零高度浮在底部留白区（见样式注释） -->
-        <div class="compact-divider tail" class:running={tailCompactMarker.state === 'running'} class:failed={tailCompactMarker.state === 'failed'}>{tailCompactMarker.content}</div>
+        <div class="compact-divider tail" data-mid={tailCompactMarker.id} class:running={tailCompactMarker.state === 'running'} class:failed={compactFailed(tailCompactMarker)}>
+          {tailCompactMarker.content}{#if compactFailed(tailCompactMarker)}<button class="compact-retry" on:click|stopPropagation={() => retryCompact(tailCompactMarker)}>重试</button>{/if}
+        </div>
+      {/if}
+      {#if scrollSpacerPx > 0}
+        <!-- 编辑/回滚后的临时底部留白：保住 scrollTop 不被浏览器钳位；内容长出来自动收掉 -->
+        <div class="scroll-spacer" style:height={`${scrollSpacerPx}px`}></div>
       {/if}
     </div>
 
@@ -8894,7 +9446,19 @@
         {#if pendingAttachments.length > 0}
           <div class="composer-attachments">
             {#each pendingAttachments as att, idx}
-              <div class="att-chip" title={`${att.name} (${fmtBytes(att.size)})`}>
+              <div
+                class="att-chip"
+                title={`${att.name} (${fmtBytes(att.size)}) · 点击预览`}
+                role="button"
+                tabindex="0"
+                on:click={() => openAttPreview(att)}
+                on:keydown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    openAttPreview(att);
+                  }
+                }}
+              >
                 {#if att.mime.startsWith('image/')}
                   <img class="att-thumb" src={att.data} alt={att.name} />
                 {:else if att.mime.startsWith('video/')}
@@ -8906,7 +9470,7 @@
                 {/if}
                 <span class="att-name">{att.name}</span>
                 <span class="att-size">{fmtBytes(att.size)}</span>
-                <button class="att-del" on:click={() => removeAttachment(idx)} title="移除" aria-label="移除"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+                <button class="att-del" on:click|stopPropagation={() => removeAttachment(idx)} title="移除" aria-label="移除"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
               </div>
             {/each}
           </div>
@@ -9161,7 +9725,7 @@
                       class:active={cfg.id === activeConfigId}
                       on:click={() => (menuExpandedCfg = menuExpandedCfg === cfg.id ? '' : cfg.id)}
                     >
-                      <span>{configLabel(cfg)}{cfg.id === activeConfigId ? ' · 当前' : ''}</span>
+                      <span>{configLabel(cfg)}{cfg.id === activeConfigId ? ' · 当前' : ''}{cfgMediaBadge(cfg)}</span>
                       <svg class="caret-ico" class:open={menuExpandedCfg === cfg.id} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg>
                     </button>
                     {#if menuExpandedCfg === cfg.id}
@@ -9306,6 +9870,26 @@
     </div>
   {/if}
 
+  {#if artMenu}
+    <!-- 产物行右键菜单：与项目文件树同款动作（预览/复制/插入），外加产物特有的「审查改动」 -->
+    <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+    <div class="rv-menu-back" on:click={() => (artMenu = null)} role="presentation"></div>
+    <!-- svelte-ignore a11y-no-static-element-interactions -->
+    <div class="rv-menu" style="left:{artMenu.x}px; top:{artMenu.y}px" on:click|stopPropagation role="menu">
+      <button title="在右侧栏新标签页预览" on:click={() => { openPreviewTab(artMenu.path); artMenu = null; }}>在新标签页预览</button>
+      {#if gitInfo && gitInfo.is_repo && !gitMissing}
+        <!-- 不是 git 仓库 / 没装 git 时没有 diff 可审，菜单里不该出现这一项（2026-11-12 用户质问） -->
+        <button title="打开 git 面板并展开这个文件的 diff" on:click={() => { openReviewDiff(artMenu.path, dockCp ? dockCp.id : ''); artMenu = null; }}>审查改动</button>
+      {/if}
+      <div class="rv-menu-sep"></div>
+      <button title="复制工作区相对路径" on:click={() => { putClipboard(artMenu.path); artMenu = null; }}>复制相对路径</button>
+      <button title="复制绝对路径" on:click={() => { putClipboard(wsAbs(artMenu.path)); artMenu = null; }}>复制绝对路径</button>
+      <button title="复制文件名" on:click={() => { putClipboard(String(artMenu.path).split('/').pop() || artMenu.path); artMenu = null; }}>复制文件名</button>
+      <div class="rv-menu-sep"></div>
+      <button title="以 @路径 插入输入框（模型自行读取）" on:click={() => { artInsert(artMenu.path); artMenu = null; }}>插入到输入框</button>
+    </div>
+  {/if}
+
   {#if rightPanelOpen}
     <aside class="right-panel" class:resizing={rpResizing} style="width:{rpWidth}px">
       <div class="rp-resize" title="拖拽调整宽度" on:pointerdown={startRpResize}></div>
@@ -9424,7 +10008,21 @@
                     <div class="rp-note">旧会话：按检查点回溯，可能不全</div>
                   {/if}
                   {#each rpFiles as f (f.path)}
-                    <button class="rp-file" class:sel={f.path === rpPreviewPath} title={f.path} on:click={() => openPreviewTab(f.path)}>
+                    <!-- 单击只选中、双击才预览、右键出菜单（2026-11-12 用户：和项目文件树同款交互） -->
+                    <button
+                      class="rp-file"
+                      class:sel={f.path === rpSelPath}
+                      title={f.path}
+                      on:click={() => (rpSelPath = f.path)}
+                      on:dblclick={() => openPreviewTab(f.path)}
+                      on:contextmenu={(e) => {
+                        // 拦下冒泡：根上的微调右键（onMicroContext）不能再抢这个事件
+                        e.preventDefault();
+                        e.stopPropagation();
+                        rpSelPath = f.path;
+                        openArtMenu(e, f.path);
+                      }}
+                    >
                       {f.path}
                     </button>
                   {/each}
@@ -9439,7 +10037,8 @@
                     <!-- 缺 git 明说：撤销/检查点/改动/提交/审查 diff 都用不了 -->
                     <div class="git-missing-note">没检测到 git：撤销、检查点、改动清单、提交、审查 diff 都用不了。{GIT_INSTALL_HINT}。</div>
                   {:else if gitInfo && !gitInfo.is_repo}
-                    <div class="git-missing-note">当前工作区不是 git 仓库：撤销、改动清单、提交、审查 diff 都用不了。</div>
+                    <!-- 只说事实不列功能清单（2026-11-12 用户：后面那串去掉） -->
+                    <div class="git-missing-note">当前工作区不是 git 仓库</div>
                   {:else if gitInfo && gitInfo.is_repo}
                     <div class="git-status">
                       <span class="git-ref" title={gitInfo.upstream ? `上游：${gitInfo.upstream}` : '未设置上游分支'}>
@@ -9453,21 +10052,24 @@
                   {/if}
                   <!-- svelte-ignore a11y-label-has-associated-control -->
                   <div class="rv-head">
-                    <select
-                      class="rv-src"
-                      aria-label="切换范围"
-                      bind:value={rvSource}
-                      title="切换范围"
-                      on:change={() => {
-                        rvFiles = [];
-                        rvOpen = {};
-                        rvDiff = {};
-                        loadReview();
-                      }}
-                    >
-                      <option value="task">本任务改动</option>
-                      <option value="work">未提交改动</option>
-                    </select>
+                    <!-- 自绘下拉（2026-11-12）：原生 select 的弹出层是系统画的，
+                         选中项灰底高亮改不了——换 Select 组件走统一选中口径 -->
+                    <div class="rv-src">
+                      <Select
+                        bind:value={rvSource}
+                        options={[
+                          { value: 'task', label: '本任务改动' },
+                          { value: 'work', label: '未提交改动' },
+                        ]}
+                        title="切换范围"
+                        on:change={() => {
+                          rvFiles = [];
+                          rvOpen = {};
+                          rvDiff = {};
+                          loadReview();
+                        }}
+                      />
+                    </div>
                     {#if rvFiles.length}
                       <span class="rv-totals">
                         <b>{rvFiles.length}</b> 个文件<span class="rv-tsep">·</span><span class="review-add">+{rvFiles.reduce((s, f) => s + (f.adds || 0), 0)}</span><span class="rv-tsep">·</span><span class="review-del">-{rvFiles.reduce((s, f) => s + (f.dels || 0), 0)}</span>
@@ -9968,14 +10570,26 @@
       </div>
       {#if !microPanel.extName}
         <div class="micro-row">
+          <label>状态</label>
+          <div class="scope-opts">
+            <button class="scope-opt" class:active={microPanel.state !== 'hover'} on:click={() => setMicroState('normal')}>常态</button>
+            <button class="scope-opt" class:active={microPanel.state === 'hover'} on:click={() => setMicroState('hover')}>悬停</button>
+          </div>
+        </div>
+        <div class="micro-row">
           <label>作用范围</label>
           <div class="scope-opts">
-            <button class="scope-opt" class:active={microPanel.scope !== 'all'} on:click={() => (microPanel = { ...microPanel, scope: 'only' })}>仅此元素</button>
-            <button class="scope-opt" class:active={microPanel.scope === 'all'} on:click={() => (microPanel = { ...microPanel, scope: 'all' })}>同类全部</button>
+            <button
+              class="scope-opt"
+              class:active={microPanel.state !== 'hover' && microPanel.scope !== 'all'}
+              disabled={microPanel.state === 'hover'}
+              on:click={() => (microPanel = { ...microPanel, scope: 'only' })}>仅此元素</button
+            >
+            <button class="scope-opt" class:active={microPanel.state === 'hover' || microPanel.scope === 'all'} on:click={() => (microPanel = { ...microPanel, scope: 'all' })}>同类全部</button>
           </div>
         </div>
       {/if}
-      <div class="micro-hint">改动实时预览；「应用」只保存你动过的属性。{microPanel.extName ? '插件面板的改动按选择器整类生效，规则随面板重载自动回放。' : '作用范围默认「同类全部」，同类元素一起变；只想改这一个就切「仅此元素」。'}生成的规则见下方 CSS 注入器里的只读预览，手写 CSS 永远优先。</div>
+      <div class="micro-hint">改动实时预览；「应用」只保存你动过的属性。{microPanel.extName ? '插件面板的改动按选择器整类生效，规则随面板重载自动回放。' : microPanel.state === 'hover' ? '悬停态：预览按"一直显示"的效果看，应用后只在鼠标悬停时生效（悬停固定同类，不能只改一个）。' : '作用范围默认「同类全部」，同类元素一起变；只想改这一个就切「仅此元素」。'}生成的规则见下方 CSS 注入器里的只读预览，手写 CSS 永远优先。</div>
     </div>
     <div class="micro-foot">
       <div class="micro-actions">
@@ -10018,6 +10632,8 @@
         tab={settingsTab}
         {themeMode}
         {applyThemeMode}
+        {selStyle}
+        {applySelStyle}
         {wallpaper}
         bind:wallpaperOpacity
         {wallpaperMsg}
@@ -10042,6 +10658,8 @@
         {newConfig}
         {deleteConfig}
         bind:providerId
+        bind:protocol
+        bind:autoSuffix
         {onProviderChange}
         bind:baseUrl
         bind:apiKey
@@ -10050,13 +10668,11 @@
         bind:configName
         bind:model
         {savedModels}
+        bind:modelParams
         {fetchModels}
-        bind:ctxLen
-        bind:maxOut
-        bind:temperature
-        bind:topP
         bind:capabilities
         {autoSave}
+        confirm={confirmAsk}
       />
       <RolesTab tab={settingsTab} rolesShown={features.roles} {configs} {configLabel} bind:roles {autoSave} />
       <MemoryTab tab={settingsTab} />
@@ -10303,6 +10919,13 @@
   />
 
 <ImagePreview src={previewImageModal} on:close={() => (previewImageModal = null)} />
+<!-- 输入框附件预览（2026-11-10）：图片/音视频浮层直看，文档给系统程序打开 -->
+<AttachmentPreview
+  att={attPreview}
+  err={attPreviewErr}
+  on:close={() => (attPreview = null)}
+  on:open-external={(e) => openAttachmentExternal(e.detail)}
+/>
 
 {#if statsModal}
   <!-- 消息信息卡（2026-10-26）：这条回复从哪来、多快、多少 token -->
@@ -10317,8 +10940,8 @@
         <span>来源配置</span><b>{statsModal.stats?.config || '—'}</b>
         <span>供应商</span><b>{statsModal.stats?.provider_id || '—'}</b>
         <span>首 token 延迟</span><b>{fmtMs(statsModal.stats?.ttft_ms)}</b>
-        <span>输出耗时</span><b>{fmtMs(statsModal.stats?.gen_ms)}</b>
-        <span>输出速度</span><b>{statsModal.stats?.completion_tokens && statsModal.stats?.gen_ms ? (statsModal.stats.completion_tokens / (statsModal.stats.gen_ms / 1000)).toFixed(1) + ' tokens/秒' : '—'}</b>
+        <span>输出耗时</span><b title="首包到达 → 本次输出结束（含思考与工具参数）">{fmtMs(statsModal.stats?.decode_ms)}</b>
+        <span>输出速度</span><b title="输出 tokens ÷ 输出耗时（同一口径，含思考与工具参数）">{statsModal.stats?.completion_tokens && statsModal.stats?.decode_ms ? (statsModal.stats.completion_tokens / (statsModal.stats.decode_ms / 1000)).toFixed(1) + ' tokens/秒' : '—'}</b>
         <span>输入 tokens</span><b>{statsModal.stats?.prompt_tokens ?? '—'}</b>
         <span>输出 tokens</span><b>{statsModal.stats?.completion_tokens ?? '—'}</b>
         <span>缓存输入</span><b>{statsModal.stats?.cached_tokens ?? '—'}{statsModal.stats?.prompt_tokens > 0 && statsModal.stats?.cached_tokens != null ? `（命中 ${((statsModal.stats.cached_tokens / statsModal.stats.prompt_tokens) * 100).toFixed(1)}%）` : ''}</b>
@@ -10377,29 +11000,10 @@
   }
   :global(body.has-wallpaper) .process,
   :global(body.has-wallpaper) .tool-detail,
-  :global(body.has-wallpaper) .tool-pre,
   :global(body.has-wallpaper) .approval-box,
   :global(body.has-wallpaper) .ctx-card {
     background: color-mix(in srgb, var(--g1) 66%, transparent);
     border-color: color-mix(in srgb, var(--g3) 50%, transparent);
-  }
-  :global(body.has-wallpaper) .new-chat {
-    background: color-mix(in srgb, var(--g1) 66%, transparent);
-  }
-  :global(body.has-wallpaper) .conv.active {
-    background: color-mix(in srgb, var(--g2) 66%, transparent);
-  }
-  :global(body.has-wallpaper) .conv:hover {
-    background: color-mix(in srgb, var(--g1) 55%, transparent);
-  }
-  :global(body.has-wallpaper) .proj,
-  :global(body.has-wallpaper) .side-search {
-    background: color-mix(in srgb, var(--g2) 60%, transparent);
-  }
-  /* 自绘下拉的弹出菜单：壁纸模式下同样半透明，保持与其他浮层一致 */
-  :global(body.has-wallpaper) .csel-menu {
-    background: color-mix(in srgb, var(--g1) 80%, transparent);
-    border-color: color-mix(in srgb, var(--g3) 60%, transparent);
   }
   /* 右侧产物/预览面板：整块 g0 实色，之前漏了壁纸半透明，表现为"改了内部元素透明度还是黑" */
   :global(body.has-wallpaper) .right-panel {
@@ -10414,8 +11018,9 @@
     width: 300px;
     box-sizing: border-box; /*  修复：宽=sidebarW 语义对齐（渲染宽不再多出 padding+border 25px，拖拽手柄贴手指） */
     flex: none;
-    background: var(--g0);
-    border-right: 1px solid var(--g1);
+    /* 2026-11-11 全局透明+描边：面板玻璃化（壁纸透出，文字仍有底） */
+    background: var(--glass-panel);
+    border-right: 1px solid var(--g3);
     display: flex;
     flex-direction: column;
     padding: 14px 12px 10px;
@@ -10498,8 +11103,9 @@
     color: var(--g7);
   }
   .icon-btn.on {
-    background: var(--g3);
-    color: var(--g7);
+    /* 开关型图标钮（侧栏收起钮/搜索/管理等）选中=橙色高亮无底色（2026-11-12 统一口径） */
+    background: var(--sel-bg);
+    color: var(--sel-fg);
   }
   .icon-btn:disabled {
     opacity: 0.45;
@@ -10517,8 +11123,8 @@
     width: 100%;
     height: 40px;
     border-radius: 10px;
-    border: 1px solid var(--g3);
-    background: var(--g2);
+    border: 1.5px solid var(--g3);
+    background: transparent;
     color: var(--g7);
     font-size: 13.5px;
     font-weight: 600;
@@ -10526,8 +11132,8 @@
     transition: background 0.15s ease, border-color 0.15s ease;
   }
   .new-chat:hover {
-    background: var(--g3);
-    border-color: var(--g4);
+    background: transparent;
+    border-color: var(--g5);
   }
   .new-chat:disabled {
     opacity: 0.5;
@@ -10559,9 +11165,32 @@
     border-radius: 8px;
     color: var(--g5);
   }
-  .section-tools .icon-btn:hover,
-  .section-tools .icon-btn.on {
+  .section-tools .icon-btn:hover {
     color: var(--g7);
+  }
+  .section-tools .icon-btn.on {
+    /* 工作区行三钮（搜索/管理）：开=橙色高亮无底色（2026-11-12 用户拍板） */
+    color: var(--sel-fg);
+  }
+  /* 侧栏这排钮（搜索/管理/添加项目）与顶部两钮（收起侧栏/重新加载）：输入栏那份同名
+     .icon-btn 的边框和 hover 背景会渗过来——排内统一钉死：
+     ① 常态/悬停一律不描边（用户两次圈选）；
+     ② 选中态按全局口径铺 --sel-bg（高亮模式=透明，底色模式=浅底）；
+     ③ 悬停不许刷掉选中底——第二份 .icon-btn:hover 的 transparent 比 .icon-btn.on 更靠后，
+        不在排内用更高特异性压住，鼠标停在选中钮上底色就没了（2026-11-12 底色模式实测） */
+  .section-tools .icon-btn,
+  .section-tools .icon-btn:hover,
+  .side-head .icon-btn,
+  .side-head .icon-btn:hover {
+    border: none;
+  }
+  .section-tools .icon-btn.on,
+  .section-tools .icon-btn.on:hover,
+  .side-head .icon-btn.on,
+  .side-head .icon-btn.on:hover {
+    border: none;
+    background: var(--sel-bg);
+    color: var(--sel-fg);
   }
   .section-tools .icon-btn svg {
     width: 18px;
@@ -10571,8 +11200,8 @@
     margin: 2px 2px 8px;
     width: calc(100% - 4px);
     box-sizing: border-box;
-    background: var(--g1);
-    border: 1px solid var(--g2);
+    background: transparent;
+    border: 1.5px solid var(--g3);
     border-radius: 10px;
     color: var(--g7);
     font-size: 14px;
@@ -10580,7 +11209,7 @@
     outline: none;
   }
   .side-search:focus {
-    border-color: var(--g3);
+    border-color: var(--g6);
   }
   .manage-bar {
     display: flex;
@@ -10619,11 +11248,9 @@
     background: color-mix(in srgb, var(--err, #e5697a) 12%, transparent);
   }
   .m-btn.primary {
-    background: linear-gradient(180deg,
-      color-mix(in srgb, var(--brand) 72%, #fff),
-      color-mix(in srgb, var(--brand-deep) 64%, #fff));
-    color: var(--brand-ink);
-    border-color: transparent;
+    background: transparent;
+    border-color: var(--g3);
+    color: var(--g7);
     font-weight: 620;
   }
   .side-scroll {
@@ -10643,13 +11270,8 @@
     cursor: pointer;
     color: var(--g7);
     font-size: 15.5px;
-    transition: background 0.15s ease;
-  }
-  .proj:hover {
-    background: var(--g1);
-  }
-  .proj.expanded {
-    background: var(--g2);
+    /* 2026-11-12 用户拍板：项目/会话条目一律不加底色描边（hover/展开/选中都是），
+       高亮只走文字（选中项橙色加粗，见 .proj.active/.conv.active） */
   }
   .proj > svg {
     width: 19px;
@@ -10674,8 +11296,9 @@
     border-radius: 6px;
   }
   .proj-toggle:hover {
+    /* 只提亮不铺底（2026-11-12 用户：收起展开瞬间条目/文件夹闪背景色）——
+       钮在光标下随行重排忽有忽无，有底色就表现为闪烁 */
     color: var(--g7);
-    background: var(--g3);
   }
   .proj-toggle svg {
     width: 19px;
@@ -10687,7 +11310,13 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .proj.active {
+    /* 选中口径统一（2026-11-12）：默认文字高亮；底色模式下铺 --sel-bg */
+    background: var(--sel-bg);
+  }
   .proj.active .proj-name {
+    /* 项目名同会话条目一样走橙色高亮（2026-11-12 用户：所有选中态统一，不再「橙只留会话」） */
+    color: var(--sel-fg);
     font-weight: 600;
   }
   /* 当前项目的小圆点标记 */
@@ -10726,8 +11355,9 @@
     color: var(--g7);
   }
   .row-btn.on {
-    border-color: var(--g7);
-    color: var(--g7);
+    /* 底色模式要跟着铺底（2026-11-12）；高亮模式 --sel-bg 是透明 */
+    background: var(--sel-bg);
+    color: var(--sel-fg);
   }
   .row-btn svg {
     width: 17px;
@@ -10746,12 +11376,11 @@
     font-size: 14.5px;
     transition: background 0.15s ease, color 0.15s ease;
   }
-  .conv:hover {
-    background: var(--g1);
-  }
   .conv.active {
-    background: color-mix(in srgb, var(--brand) 11%, var(--g2));
-    color: var(--g7);
+    /* 选中口径统一：橙字加粗无底色；底色模式下铺 --sel-bg（同 .proj.active） */
+    color: var(--sel-fg);
+    background: var(--sel-bg);
+    font-weight: 600;
   }
   /* 运行中：会话行/项目行前的小转圈（本页的流即时，服务端在跑的靠 3 秒轮询补） */
   .conv-spin {
@@ -10854,7 +11483,7 @@
   }
   .expand-more:hover {
     color: var(--g6);
-    background: var(--g1);
+    background: var(--veil);
   }
   .side-empty {
     color: var(--g4);
@@ -10865,8 +11494,8 @@
     position: absolute;
     z-index: 40;
     min-width: 172px;
-    background: var(--g1);
-    border: 1px solid var(--g2);
+    background: var(--glass-float);
+    border: 1px solid var(--g3);
     border-radius: 14px;
     padding: 6px;
     box-shadow: 0 12px 32px var(--overlay);
@@ -10901,7 +11530,8 @@
     white-space: nowrap;
   }
   .side-menu button:hover {
-    background: var(--g2);
+    /* 菜单底子已是 g2 系玻璃：hover 要深/浅一档（g3）才看得见 */
+    background: var(--g3);
   }
   .side-menu button svg {
     width: 17px;
@@ -10968,6 +11598,11 @@
     width: 15px;
     height: 15px;
   }
+  /* 齿轮线框比记忆库的球体显大，缩半档对齐视觉大小 */
+  .galaxy-btn .settings-gear {
+    width: 13px;
+    height: 13px;
+  }
   .chat {
     flex: 1;
     display: flex;
@@ -10984,7 +11619,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    border: 2px dashed color-mix(in srgb, var(--brand) 72%, transparent);
+    border: 2px dashed color-mix(in srgb, var(--g5) 70%, transparent);
     border-radius: 14px;
     background: color-mix(in srgb, var(--g1) 76%, transparent);
     color: var(--g7);
@@ -11027,7 +11662,7 @@
     bottom: calc(100% + 12px);
     right: -8px;
     width: 300px;
-    background: var(--g1);
+    background: var(--glass-float);
     border: 1px solid var(--g3);
     border-radius: 10px;
     padding: 12px 14px;
@@ -11110,10 +11745,16 @@
     align-items: center;
     gap: 12px;
     padding: 12px 20px;
-    border-bottom: 1px solid var(--g2);
-    background: var(--g1);
+    border-bottom: 1px solid var(--g3);
+    background: var(--glass-chrome);
     /* 无边框壳：头部空白处可拖拽移动窗口（data-tauri-drag-region 已加） */
     -webkit-app-region: drag;
+  }
+  /* 微调模式让出拖拽区（2026-11-12 用户：顶栏右击没反应）：
+     -webkit-app-region:drag 的区域 Chromium 不分发鼠标事件——连右键都被窗口拖拽吞掉，
+     打开微调时临时改成 no-drag，右击才能选中顶栏本身；退出微调即恢复拖动 */
+  .app.micro-on .chat-head {
+    -webkit-app-region: no-drag;
   }
   .chat-head button, .chat-head input, .chat-head .plug-chip {
     -webkit-app-region: no-drag;
@@ -11133,6 +11774,8 @@
     align-items: center;
     justify-content: center;
     border-radius: 6px;
+    border: 1px solid transparent;
+    background: transparent;
     color: var(--g5);
   }
   .rp-win-gap { width: 8px; flex: none; }
@@ -11152,7 +11795,8 @@
     height: 17px;
   }
   .win-btn:hover {
-    background: var(--g3);
+    background: transparent;
+    border: 1px solid var(--g5);
     color: var(--g7);
   }
   .win-close:hover {
@@ -11211,12 +11855,15 @@
   }
   .head-btn:hover {
     color: var(--g7);
-    background: var(--g2);
+    background: transparent;
+    border-color: transparent;
   }
   .head-btn.active {
-    color: var(--brand-text);
-    border-color: var(--g3);
-    background: var(--g2);
+    /* 顶栏开关（终端/右侧栏）：选中=橙色高亮，无描边无底色（2026-11-12 用户拍板）；
+       底色口径下铺 --sel-bg（默认透明） */
+    color: var(--sel-fg);
+    border-color: transparent;
+    background: var(--sel-bg);
   }
   /* —— 右侧栏：产物 / 预览 —— */
   .right-panel {
@@ -11224,7 +11871,7 @@
     position: relative;
     display: flex;
     flex-direction: column;
-    background: var(--g0);
+    background: var(--glass-panel);
     border-left: 1px solid var(--g3);
     min-height: 0;
   }
@@ -11266,7 +11913,7 @@
     flex: none;
     display: flex;
     flex-direction: column;
-    background: var(--g0);
+    background: var(--glass-panel);
     border-left: 1px solid var(--g3);
     min-height: 0;
   }
@@ -11367,8 +12014,9 @@
     flex: none;
   }
   .web-tab.active {
-    background: var(--g3);
-    color: var(--g7);
+    /* 网页页签激活：统一选中口径（橙字无底色；底色模式铺 --sel-bg） */
+    background: var(--sel-bg);
+    color: var(--sel-fg);
   }
   .web-tab-title {
     overflow: hidden;
@@ -11415,7 +12063,7 @@
     top: calc(100% + 2px);
     right: 8px;
     z-index: 31;
-    background: var(--g1);
+    background: var(--glass-float);
     border: 1px solid var(--g3);
     border-radius: 9px;
     padding: 4px;
@@ -11585,11 +12233,12 @@
   }
   .rp-tabs button:hover {
     color: var(--g7);
-    background: var(--g1);
+    background: var(--veil);
   }
   .rp-tabs button.active {
-    background: var(--g2);
-    color: var(--g7);
+    /* 页签激活：橙色高亮无底色（2026-11-12 选中口径统一；底色模式铺 --sel-bg） */
+    background: var(--sel-bg);
+    color: var(--sel-fg);
     font-weight: 600;
   }
   /* —— 右侧边栏：统一标签页（2026-10-01）—— */
@@ -11674,7 +12323,7 @@
     display: flex;
     flex-direction: column;
     padding: 4px;
-    background: var(--g1);
+    background: var(--glass-float);
     border: 1px solid var(--g3);
     border-radius: 8px;
     box-shadow: 0 10px 26px rgb(0 0 0 / 45%);
@@ -11691,7 +12340,7 @@
     white-space: nowrap;
   }
   .rp-add-menu button:hover {
-    background: var(--g2);
+    background: var(--g3);
     color: var(--g7);
   }
   .rp-add-menu svg {
@@ -11794,7 +12443,7 @@
     flex: none;
     padding: 2px 10px;
     border-radius: 6px;
-    border: 1px solid var(--g3);
+    border: 1.5px solid var(--g3);
     background: transparent;
     color: var(--g6);
     font-size: 12px;
@@ -11911,7 +12560,7 @@
     outline: none;
   }
   .rp-edit:focus {
-    border-color: var(--brand, #e18c6c);
+    border-color: var(--g6);
   }
   .rp-refresh {
     background: transparent;
@@ -11968,8 +12617,10 @@
     color: var(--g7);
   }
   .rp-file.sel {
-    background: var(--g2);
-    color: var(--brand-text);
+    /* 产物行选中：橙色高亮无底色（2026-11-12 统一口径；底色模式铺 --sel-bg） */
+    background: var(--sel-bg);
+    color: var(--sel-fg);
+    font-weight: 600;
   }
   /* 路径标签吸顶：代码滚动时它不跟着滚，也不会被裁掉半个字 */
   .rp-preview-path {
@@ -12005,7 +12656,7 @@
   }
   /* —— 界面微调模式 —— */
   :global(body.micro-edit-mode *:hover) {
-    outline: 1px dashed color-mix(in srgb, var(--brand) 55%, transparent);
+    outline: 1px dashed color-mix(in srgb, var(--g5) 70%, transparent);
     outline-offset: -1px;
   }
   /* 微调回执 toast：底部居中、不挡点击、1.6s 自动消失 */
@@ -12019,7 +12670,7 @@
     border-radius: 8px;
     background: var(--g2);
     border: 1px solid var(--g3);
-    border-left: 2px solid var(--brand);
+    border-left: 2px solid var(--g6);
     color: var(--g7);
     font-size: 12.5px;
     box-shadow: 0 8px 24px var(--overlay);
@@ -12030,8 +12681,8 @@
     z-index: 200; /* 盖过设置弹窗（z-20）等一切浮层 */
     width: 270px;
     box-sizing: border-box; /* max-height 必须把 padding/border 一起算进去，否则底部会溢出视口 */
-    background: var(--g2);
-    border: 1px solid var(--brand);
+    background: color-mix(in srgb, var(--g2) 92%, transparent);
+    border: 1px solid var(--g5);
     border-radius: 10px;
     padding: 10px;
     box-shadow: 0 8px 24px var(--overlay);
@@ -12099,7 +12750,7 @@
   }
   .micro-row input[type='range'] {
     flex: 1;
-    accent-color: var(--brand);
+    accent-color: var(--g6);
   }
   .micro-row input[type='number'] {
     width: 64px;
@@ -12144,8 +12795,8 @@
     flex: 1;
     padding: 4px 6px;
     border-radius: 7px;
-    border: 1px solid var(--g3);
-    background: var(--g1);
+    border: 1.5px solid var(--g3);
+    background: transparent;
     color: var(--g6);
     font-size: 11.5px;
     cursor: pointer;
@@ -12154,10 +12805,17 @@
     border-color: var(--g4);
     color: var(--g7);
   }
+  .scope-opt:disabled {
+    /* 悬停态强制同类：仅此元素不可选 */
+    opacity: 0.45;
+    cursor: default;
+  }
   .scope-opt.active {
-    background: var(--brand);
-    border-color: var(--brand);
-    color: var(--brand-ink);
+    /* 选中口径统一（2026-11-12）：橙字高亮无底色；底色模式铺 --sel-bg */
+    background: var(--sel-bg);
+    border-color: transparent;
+    color: var(--sel-fg);
+    font-weight: 650;
   }
   .chat-body {
     flex: 1;
@@ -12184,6 +12842,12 @@
      口径与「#each messageChunks」一致：cv-chunk 是 chat-body 直接子级 */
   .cv-chunk {
     content-visibility: auto;
+  }
+  /* 编辑/回滚后的临时底部留白：只补足视口高度内的差额，保住 scrollTop 不被钳位；
+     内容长出来/用户滚动后自动消失（见 beginScrollFreeze / syncScrollFreeze） */
+  .scroll-spacer {
+    width: 100%;
+    pointer-events: none;
   }
   /* 原 flex gap: 14px 的块内等价物 */
   .cv-chunk > .msg + .msg {
@@ -12426,9 +13090,19 @@
     white-space: pre-wrap;
     line-height: 1.7;
   }
+  /* 带附件时气泡被撑到附件宽度，正文不能贴左缘（2026-11-11）：
+     收缩到内容宽并推到右侧，多行仍正常换行、文字自身保持左对齐 */
+  .msg.user .user-text {
+    width: fit-content;
+    margin-left: auto;
+  }
   /* {@html} 注入的 span 不带作用域类，必须 :global（同入下输入框浮层那个坑） */
   .user-text :global(.ref) {
+    /* 引用高亮回橙色（2026-11-12 用户：怎么变成白色了；11-11 统一描边那轮被改成白字） */
     color: var(--brand-text);
+    text-decoration: underline;
+    text-decoration-color: color-mix(in srgb, var(--brand-text) 45%, transparent);
+    text-underline-offset: 2px;
   }
   /* 2026-10-30 排版重做：正文是主角——15px/1.78 的阅读节奏，标题/列表/代码块
      各自有清晰层级，不再是一坨同灰度小字。 */
@@ -12469,8 +13143,9 @@
     margin: 4px 0;
   }
   .content :global(.md-code) {
-    background: var(--g2);
-    border: 1px solid color-mix(in srgb, var(--g3) 70%, transparent);
+    /* 代码块也走透明+描边（2026-11-11 用户拍板） */
+    background: transparent;
+    border: 1px solid var(--g3);
     border-radius: 5px;
     padding: 1px 5px;
     font: 12.5px/1.5 Consolas, 'Cascadia Code', monospace;
@@ -12479,17 +13154,17 @@
   /* 代码块：独立卡片 + 语言标签 + 复制按钮（md.js 生成结构，点击委托在 onContentClick） */
   .content :global(.md-codeblock) {
     margin: 10px 0 14px;
-    border: 1px solid var(--g2);
+    border: 1px solid var(--g3);
     border-radius: 10px;
     overflow: hidden;
-    background: var(--g0);
+    background: transparent;
   }
   .content :global(.md-codehead) {
     display: flex;
     align-items: center;
     justify-content: space-between;
     padding: 5px 8px 5px 12px;
-    background: var(--g1);
+    background: transparent;
     border-bottom: 1px solid var(--g2);
   }
   .content :global(.md-codelang) {
@@ -12509,7 +13184,7 @@
     cursor: pointer;
   }
   .content :global(.md-copy:hover) {
-    background: var(--g2);
+    background: var(--veil);
     color: var(--g7);
   }
   .content :global(.md-pre) {
@@ -12573,7 +13248,7 @@
     max-height: 320px;
     overflow: auto;
     border-top: 1px solid var(--g2);
-    background: var(--g0);
+    background: transparent;
     color: var(--g5);
     font: 12px/1.6 Consolas, 'Cascadia Code', monospace;
     white-space: pre-wrap;
@@ -12591,12 +13266,15 @@
     margin: 16px 0;
   }
   .content :global(.md-a) {
-    color: var(--brand-text);
-    text-decoration: none;
-    border-bottom: 1px solid color-mix(in srgb, var(--brand) 45%, transparent);
+    /* 链接走中性下划线（全局去橙） */
+    color: var(--g7);
+    text-decoration: underline;
+    text-decoration-color: var(--g5);
+    text-underline-offset: 2px;
+    border-bottom: none;
   }
   .content :global(.md-a:hover) {
-    border-bottom-color: var(--brand);
+    text-decoration-color: var(--g7);
   }
   /* markdown 图片（2026-10-31）：助手回复里的 ![alt](url) 直接显示，点开看大图。
      限制最大高度避免长图撑爆消息流；圆角与代码卡同一语言。 */
@@ -12737,9 +13415,9 @@
   }
   .edit-area {
     width: 100%;
-    background: var(--g1);
+    background: transparent;
     color: var(--g7);
-    border: 1px solid var(--g3);
+    border: 1.5px solid var(--g3);
     border-radius: 8px;
     padding: 8px 10px;
     font-size: 13.5px;
@@ -12758,13 +13436,18 @@
     font-size: 11px;
     color: var(--g4);
   }
+  .edit-att-hint {
+    margin: 2px 0 6px;
+    font-size: 11.5px;
+    color: var(--g5);
+  }
   .select-bar {
     display: flex;
     align-items: center;
     gap: 10px;
     padding: 8px 24px;
     border-top: 1px solid var(--g2);
-    background: var(--g1);
+    background: var(--glass-chrome);
     font-size: 12.5px;
     color: var(--g6);
   }
@@ -12824,8 +13507,8 @@
     text-align: right;
     font-variant-numeric: tabular-nums;
     color: var(--g7);
-    background: var(--g1);
-    border: 1px solid var(--g3);
+    background: transparent;
+    border: 1.5px solid var(--g3);
     border-radius: 6px;
     font-family: inherit;
   }
@@ -12840,7 +13523,7 @@
   }
   .compact-threshold-input:focus {
     outline: none;
-    border-color: var(--brand);
+    border-color: var(--g6);
   }
   /* 数字输入框右侧的步进按钮会顶住文字，隐藏后数字才真正贴右 */
   .compact-threshold-input {
@@ -12878,6 +13561,23 @@
   }
   .compact-divider.failed {
     color: var(--warn, #c98a4b);
+  }
+  /* 失败行的「重试」按钮：清服务端暂停标记，下轮收尾再试（2026-11-10） */
+  .compact-divider .compact-retry {
+    margin-left: 8px;
+    padding: 0 8px;
+    height: 18px;
+    line-height: 16px;
+    font-size: 11px;
+    color: var(--g5);
+    background: transparent;
+    border: 1px solid var(--g5);
+    border-radius: 999px;
+    cursor: pointer;
+  }
+  .compact-divider .compact-retry:hover {
+    color: var(--g7);
+    border-color: var(--g6);
   }
   @keyframes compact-pulse {
     0%, 100% { opacity: 0.45; }
@@ -13221,7 +13921,10 @@
     padding: 8px 10px;
     border: 1px solid var(--g2);
     border-radius: 8px;
-    background: var(--g1);
+    background: color-mix(in srgb, var(--g1) 70%, transparent);
+  }
+  .tool-sec {
+    position: relative;
   }
   .tool-sec + .tool-sec {
     margin-top: 8px;
@@ -13237,7 +13940,8 @@
     margin: 0;
     padding: 8px 10px;
     border-radius: 6px;
-    background: var(--g0);
+    background: transparent;
+    border: 1px solid var(--g2);
     color: var(--g6);
     font: 12px/1.6 Consolas, 'Cascadia Code', monospace;
     white-space: pre-wrap;
@@ -13245,15 +13949,39 @@
     max-height: 200px;
     overflow: auto;
   }
+  /* 参数区上滑后「回到底部」：与思考框同款，让出滚动条宽度 */
+  .tool-jump {
+    position: absolute;
+    right: 18px;
+    bottom: 10px;
+    display: grid;
+    place-items: center;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border-radius: 50%;
+    border: 1px solid var(--g4);
+    background: var(--g2);
+    color: var(--g7);
+    cursor: pointer;
+    box-shadow: 0 4px 12px rgb(0 0 0 / 28%);
+  }
+  .tool-jump svg {
+    width: 12px;
+    height: 12px;
+  }
+  .tool-jump:hover {
+    background: var(--g3);
+  }
   .tool-wait {
     font-size: 11.5px;
     color: var(--g5);
   }
   /* 审批卡（2026-11-03 重塑：跟随柔和主题，不再红框警示——严重度由档位徽章自己说话） */
   .approval-box {
-    background: var(--g1);
+    background: color-mix(in srgb, var(--g1) 70%, transparent);
     border: 1px solid var(--g3);
-    border-left: 2px solid var(--brand);
+    border-left: 2px solid var(--g5);
     border-radius: 10px;
     padding: 10px 12px;
     font-size: 13px;
@@ -13286,18 +14014,20 @@
     padding: 7px 9px;
     border: 1px solid var(--g3);
     border-radius: 8px;
-    background: var(--g2);
+    background: transparent;
     color: var(--g6);
     cursor: pointer;
     font-size: 12.5px;
   }
   .ask-opt:hover {
-    border-color: var(--brand);
+    border-color: var(--g5);
   }
   .ask-opt.sel {
-    border-color: var(--brand);
-    background: var(--tint-orange-bg, var(--g2));
-    color: var(--g7);
+    /* 提问卡选中项：统一选中口径（橙字无底色描边；底色模式铺 --sel-bg） */
+    border-color: transparent;
+    background: var(--sel-bg);
+    color: var(--sel-fg);
+    font-weight: 650;
   }
   .ask-opt-label {
     font-weight: 600;
@@ -13382,7 +14112,7 @@
   .todo-ico {
     width: 15px;
     height: 15px;
-    color: var(--brand);
+    color: var(--g6);
   }
   .todo-title {
     font-weight: 600;
@@ -13436,7 +14166,8 @@
     color: var(--tint-green-fg);
   }
   .todo-item.in_progress .todo-mark {
-    color: var(--brand);
+    color: var(--g6);
+    font-weight: 650;
   }
   .todo-text {
     min-width: 0;
@@ -13552,6 +14283,10 @@
     font-size: 12px;
     color: var(--tint-blue-fg);
     max-width: 240px;
+    cursor: pointer; /* 点击打开预览（2026-11-10） */
+  }
+  .att-chip:hover {
+    border-color: var(--g5);
   }
   .att-thumb {
     width: 22px;
@@ -13618,6 +14353,16 @@
     padding: 4px 8px;
     background: var(--veil);
     border-radius: 4px;
+  }
+  /* 解码兜底的文件条是按钮（点击系统播放器打开）：重置按钮外观，hover 提亮 */
+  .msg-att-file-act {
+    font-family: inherit;
+    border: none;
+    cursor: pointer;
+    align-self: flex-start;
+  }
+  .msg-att-file-act:hover {
+    background: color-mix(in srgb, var(--veil) 70%, var(--tint-blue-fg) 8%);
   }
 
   /* 缺 git 明说条（2026-10-06）：git 面板顶部直接讲清楚功能为什么没了 */
@@ -13748,20 +14493,26 @@
     padding: 8px 10px;
     border-bottom: 1px solid var(--g2);
   }
+  /* git 面板范围选择器：Select 组件按面板尺寸收窄（默认是设置弹窗里的整行宽）。
+     button.csel 提一档特异性：稳压 Select 组件自身的 .csel.svelte-hash 规则 */
   .rv-src {
     flex: none;
     max-width: 100%;
-    background: var(--g1);
-    color: var(--g7);
+  }
+  .rv-src :global(.csel-wrap) {
+    width: auto;
+  }
+  .rv-src :global(button.csel) {
+    padding: 4px 8px;
     border: 1px solid var(--g3);
     border-radius: 6px;
-    padding: 4px 6px;
     font-size: 12px;
-    font-family: inherit;
-    cursor: pointer;
   }
-  .rv-src:hover {
+  .rv-src :global(button.csel:hover) {
     border-color: var(--g4);
+  }
+  .rv-src :global(.csel-menu) {
+    min-width: 150px;
   }
   .rv-totals {
     flex: none;
@@ -14022,7 +14773,7 @@
     position: fixed;
     z-index: 91;
     min-width: 132px;
-    background: var(--g1);
+    background: var(--glass-float);
     border: 1px solid var(--g3);
     border-radius: 8px;
     box-shadow: 0 10px 30px var(--overlay);
@@ -14042,7 +14793,12 @@
     cursor: pointer;
   }
   .rv-menu button:hover {
-    background: var(--g2);
+    background: var(--g3);
+  }
+  .rv-menu-sep {
+    height: 1px;
+    margin: 4px 6px;
+    background: var(--g3);
   }
   /* 审批卡里仍要显示原始工具参数（工具调用行已改成人话说明） */
   .approval-box .tool-args {
@@ -14413,7 +15169,7 @@
     color: var(--g7);
   }
   .computer-log-row.last {
-    border: 1px solid var(--brand);
+    border: 1px solid var(--g5);
     color: var(--g7);
   }
   .clr-text {
@@ -14422,7 +15178,7 @@
   }
   .clr-more {
     flex: none;
-    color: var(--brand);
+    color: var(--g6);
     font-size: 10.5px;
     white-space: nowrap;
   }
@@ -14461,16 +15217,16 @@
     box-sizing: border-box;
   }
   .composer {
-    background: var(--g2);
-    border: 1px solid var(--g3);
+    background: color-mix(in srgb, var(--g2) 55%, transparent);
+    border: 1.5px solid var(--g3);
     border-radius: 16px;
     padding: 6px 12px 10px;
     transition: border-color 0.15s, box-shadow 0.15s;
-    box-shadow: 0 4px 16px var(--overlay);
+    box-shadow: none;
   }
   .composer:focus-within {
-    border-color: color-mix(in srgb, var(--brand) 45%, var(--g3));
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand) 12%, transparent), 0 6px 20px var(--overlay);
+    border-color: var(--g6);
+    box-shadow: none;
   }
   .composer-input {
     display: block;
@@ -14525,7 +15281,12 @@
   }
   /* {@html} 注入的 span 不带 Svelte 作用域类，必须 :global 才吃得到样式（同 markdown 那坑） */
   .composer-hl :global(.ref) {
+    /* 引用高亮（/能力、@文件）回到橙色（2026-11-12 用户：怎么变成白色了）——
+       11-11 全局透明+描边那轮改成白字+下划线，丢了强调色 */
     color: var(--brand-text);
+    text-decoration: underline;
+    text-decoration-color: color-mix(in srgb, var(--brand-text) 45%, transparent);
+    text-underline-offset: 2px;
   }
   .composer-input:disabled {
     opacity: 0.6;
@@ -14547,7 +15308,8 @@
     width: 28px;
     height: 28px;
     border-radius: 7px;
-    border: none;
+    /* 全局描边口径：常态无框，hover 才出 1px 描边 */
+    border: 1px solid transparent;
     background: transparent;
     color: var(--g6);
     font-size: 16px;
@@ -14555,8 +15317,8 @@
     cursor: pointer;
   }
   .icon-btn:hover {
-    /* 输入框自身是 g2 底：hover 再用 g2 完全看不见，改半透明提亮 */
-    background: color-mix(in srgb, var(--g4) 45%, transparent);
+    background: transparent;
+    border-color: var(--g5);
     color: var(--g7);
   }
   .icon-btn:disabled {
@@ -14574,6 +15336,7 @@
     max-width: 240px;
     padding: 4px 8px;
     border-radius: 8px;
+    /* 输入栏里的 chip 不加描边（用户 2026-11-11 圈选：模型/思考/审批锁） */
     border: none;
     background: transparent;
     color: var(--g6);
@@ -14583,10 +15346,16 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  .pill:hover,
-  .pill.active {
-    background: var(--g2);
+  .pill:hover {
+    /* 输入栏 chip 一律无底色（用户 2026-11-11：思考那里不要背景色） */
+    background: transparent;
     color: var(--g7);
+  }
+  .pill.active {
+    /* 输入栏 chip（思考开）不走全局「背景高亮」口径：永远橙字、无底色
+       （2026-11-12 用户：背景高亮下这里也不要有背景色） */
+    background: transparent;
+    color: var(--brand-text);
   }
   /* 完全访问档只留红字作静态警示：边框去掉（2026-10-07 真机实测「把红色框
      去掉」——整个输入栏就这一块挂红框太扎眼；档位含义有 title 与菜单说明讲）。 */
@@ -14628,7 +15397,7 @@
     min-width: 230px;
     max-height: 320px;
     overflow-y: auto;
-    background: var(--g2);
+    background: color-mix(in srgb, var(--g2) 92%, transparent);
     border: 1px solid var(--g3);
     border-radius: 10px;
     padding: 4px;
@@ -14662,8 +15431,10 @@
     color: var(--g7);
   }
   .think-state.active {
-    background: var(--g3);
-    color: var(--g7);
+    /* 三态分段选中：橙色高亮无底色（2026-11-12 用户：去背景色用选中高亮） */
+    background: var(--sel-bg);
+    color: var(--sel-fg);
+    font-weight: 600;
   }
   /* —— 档位滑杆：结构/动效自 ZCode ComposerModelMenu + composer-thought-slider.css 复刻 ——
      几何：滑块块 32px、轨道 24px（top 4）、圆钮 28px（行程 100%-28px）；
@@ -14874,9 +15645,11 @@
     cursor: pointer;
   }
   .ctx-tab.active {
-    background: var(--g3);
-    color: var(--g7);
-    border-color: var(--g4);
+    /* 选中口径统一（2026-11-12）：橙字高亮，无底色无描边；底色模式铺 --sel-bg */
+    background: var(--sel-bg);
+    color: var(--sel-fg);
+    border-color: transparent;
+    font-weight: 600;
   }
   /* 对话行：块级上下两行——标题一行（超长省略），
      时间一行小字。不再用行内 flex（挤压问题反复踩） */
@@ -14905,6 +15678,7 @@
   .msg-convs {
     display: flex;
     flex-wrap: wrap;
+    justify-content: flex-end; /* 与附件/正文同向：气泡被撑宽时标签也贴右缘 */
     gap: 6px;
     margin-top: 6px;
   }
@@ -14970,7 +15744,7 @@
     white-space: nowrap;
   }
   .bar-item:hover {
-    background: var(--g2);
+    background: var(--veil);
   }
   /* 模型快选：配置分组头 + 子项 */
   .bar-item.group-head {
@@ -14979,7 +15753,7 @@
     align-items: center;
   }
   .bar-item.group-head.active {
-    color: var(--g7);
+    color: var(--sel-fg);
   }
   .bar-item.group-head .caret-ico {
     width: 13px;
@@ -15026,7 +15800,9 @@
     gap: 10px;
   }
   .ctx-search {
-    background: var(--g1);
+    /* 与弹窗同色：透明底（2026-11-12 用户：搜索框颜色要和旁边一样），
+     * 之前 var(--g1) 在浅色下近纯白，跟奶油底弹窗割裂 */
+    background: transparent;
     color: var(--g7);
     border: 1px solid var(--g3);
     border-radius: 8px;
@@ -15035,7 +15811,7 @@
     outline: none;
   }
   .ctx-search:focus {
-    border-color: var(--brand);
+    border-color: var(--g6);
   }
   .ctx-file-list {
     flex: 1;
@@ -15071,8 +15847,9 @@
     color: var(--g7);
   }
   .bar-item.active {
-    background: var(--g3);
-    color: var(--g7);
+    /* 菜单内当前项（模型快选/@ 菜单等）：橙色高亮无底色（2026-11-12 统一口径） */
+    background: var(--sel-bg);
+    color: var(--sel-fg);
   }
   /* 上下文圆环：空色轨道 + 实色占用弧 */
   .ctx-ring .ctx-track {
@@ -15140,6 +15917,129 @@
     /* 固定高度：所有设置页统一窗口大小（以最高的「模型配置」页为准），短页留白，内容区自行滚动 */
     height: 85vh;
   }
+  /* 设置弹窗统一「描边无底色」v2（2026-11-11 用户复审定稿）：
+     全部按钮/输入框透明底+灰描边——主按钮也不加橙（只保留字重），品牌橙不进设置弹窗；
+     选中态=描边加深、不填色；描边整体 1.5px。红色只留给危险动作的文字与描边。 */
+  .settings-modal :global(.btn),
+  .settings-modal :global(.btn.ghost),
+  .settings-modal :global(.btn.primary),
+  .settings-modal :global(.btn.danger) {
+    background: transparent;
+    border: 1.5px solid var(--g3);
+    color: var(--g7);
+    filter: none;
+  }
+  .settings-modal :global(.btn.primary) {
+    font-weight: 620;
+  }
+  .settings-modal :global(.btn:hover) {
+    background: transparent;
+    border-color: var(--g5);
+  }
+  .settings-modal :global(.btn.danger),
+  .settings-modal :global(.btn.ghost.danger) {
+    color: var(--tint-red-fg);
+    border-color: color-mix(in srgb, var(--tint-red-fg) 45%, var(--g3));
+  }
+  .settings-modal :global(.btn.danger:hover) {
+    border-color: var(--tint-red-fg);
+  }
+  /* 选中态（主题三选/分段开关）：描边加深，不填色 */
+  .settings-modal :global(.theme-opt) {
+    border: 1.5px solid var(--g3);
+  }
+  .settings-modal :global(.btn.active),
+  .settings-modal :global(.theme-opt),
+  .settings-modal :global(.theme-opt:hover) {
+    background: transparent;
+  }
+  .settings-modal :global(.btn.active) {
+    /* 选中口径统一（2026-11-12）：文字高亮=橙字；底色模式铺 --sel-bg。
+       这条特异性高于组件内同规则，口径变量本身全局一致 */
+    border-color: transparent;
+    background: var(--sel-bg);
+    color: var(--sel-fg);
+    font-weight: 650;
+  }
+  .settings-modal :global(.theme-opt.active) {
+    /* 主题/选中样式这类选项钮：选中要描边（2026-11-12 用户拍板），浅橙同调 */
+    border-color: var(--sel-line);
+    background: var(--sel-bg);
+    color: var(--sel-fg);
+    font-weight: 650;
+  }
+  /* 输入类：透明底 + 1.5px 描边；焦点只加深描边，不发光 */
+  .settings-modal :global(.field input),
+  .settings-modal :global(.field select),
+  .settings-modal :global(.field textarea) {
+    background: transparent;
+    border: 1.5px solid var(--g3);
+  }
+  .settings-modal :global(.field input:focus),
+  .settings-modal :global(.field select:focus),
+  .settings-modal :global(.field textarea:focus) {
+    border-color: var(--g6);
+    box-shadow: none;
+  }
+  /* 胶囊 chip（模型区/记忆约定页签）：透明底 + 1.5px；选中=描边加深 */
+  .settings-modal :global(.chip) {
+    background: transparent;
+    border: 1.5px solid var(--g3);
+  }
+  .settings-modal :global(.chip.active) {
+    /* 记忆约定等 chip：选中要描边（2026-11-12 用户拍板），浅橙同调 */
+    border-color: var(--sel-line);
+    background: var(--sel-bg);
+    color: var(--sel-fg);
+    font-weight: 650;
+  }
+  /* 微调/CSS 编辑器文本域同规则 */
+  .settings-modal :global(textarea.agents-editor) {
+    background: transparent;
+    border: 1.5px solid var(--g3);
+    border-radius: 9px;
+  }
+  .settings-modal :global(textarea.agents-editor:focus) {
+    border-color: var(--g6);
+    box-shadow: none;
+    outline: none;
+  }
+  /* 数据页图标按钮与路径框：hover/focus 不再变橙 */
+  .settings-modal :global(.icon-btn) {
+    background: transparent;
+  }
+  .settings-modal :global(.icon-btn:hover) {
+    background: transparent;
+    color: var(--g7);
+    border-color: var(--g5);
+  }
+  .settings-modal :global(.path-input input:focus) {
+    border-color: var(--g6);
+  }
+  /* 模型列表卡片去底色；当前模型卡片=描边加深，不再用品牌色 */
+  .settings-modal :global(.model-card) {
+    background: transparent;
+  }
+  .settings-modal :global(.model-card.cur) {
+    border-color: var(--g5);
+  }
+  .settings-modal :global(.model-card.cur .model-name) {
+    color: var(--g7);
+    font-weight: 600;
+  }
+  .settings-modal :global(.act.on) {
+    background: transparent;
+    color: var(--g7);
+  }
+  .settings-modal :global(.use-current) {
+    border-color: var(--g3);
+    color: var(--g6);
+  }
+  .settings-modal :global(.use-current:hover) {
+    background: transparent;
+    border-color: var(--g5);
+    color: var(--g7);
+  }
   .settings-body {
     display: flex;
     gap: 14px;
@@ -15168,9 +16068,12 @@
     color: var(--g7);
   }
   .settings-nav button.active {
-    background: var(--g3);
-    color: var(--g7);
+    /* 选中=橙色高亮（2026-11-12）；底色模式铺 --sel-bg；
+       描边用内阴影画，避免加边框把行文字顶出去 */
+    background: var(--sel-bg);
+    color: var(--sel-fg);
     font-weight: 600;
+    box-shadow: inset 0 0 0 1px var(--sel-line-soft);
   }
   .settings-content {
     flex: 1;

@@ -70,9 +70,13 @@ pub struct UsageRecord {
     /// 首包延迟毫秒（请求发出 → 第一个分片到达）；None = 无计时（非流式/取消早于首包/旧记录）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttft_ms: Option<u64>,
-    /// 输出耗时毫秒（正文首 → 流结束，正文跨度缺失回落思考跨度）；None = 无计时
+    /// 正文输出耗时毫秒（正文首 → 流结束，正文跨度缺失回落思考跨度）；None = 无计时
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gen_ms: Option<u64>,
+    /// 生成窗口毫秒（首包 → 流结束）：输出速度的分母，含思考与工具参数。
+    /// 旧记录没有这个字段，统计时回落 latency_ms - ttft_ms 回算。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_ms: Option<u64>,
     /// 失败原因（截断；绝不含 key）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -99,6 +103,7 @@ impl UsageRecord {
             latency_ms: 0,
             ttft_ms: None,
             gen_ms: None,
+            decode_ms: None,
             error: None,
             cost_usd: None,
         }
@@ -396,6 +401,9 @@ pub struct Report {
     pub from: Option<String>,
     pub rows: Vec<Agg>,
     pub totals: Agg,
+    /// 只算 purpose=main 的子合计（会话口径时与圆环「平均缓存命中率」同源——
+    /// 媒体转接（media）等旁路请求没有缓存概念，混进分母会把命中率稀释出假差异）。
+    pub totals_main: Agg,
     pub spend_cap_usd: f64,
     pub spend_total_usd: f64,
     /// 是否全部记录都已计价（false = 有未计价请求，界面要显式说明）
@@ -417,8 +425,10 @@ struct Acc {
     /// 首包延迟合计与样本数（只算成功调用；算平均用）
     ttft_sum_ms: u64,
     ttft_n: u64,
-    /// 输出耗时合计毫秒与参与速度计算的 completion 合计（输出速度 = 后者/前者）
-    gen_sum_ms: u64,
+    /// 生成窗口合计毫秒与参与速度计算的 completion 合计（输出速度 = 后者/前者）。
+    /// 窗口 = 首包→流结束（含思考与工具参数）；旧记录没有 decode_ms 时用
+    /// latency_ms - ttft_ms 回算，口径一致。
+    speed_span_ms: u64,
     speed_comp_tokens: u64,
     sessions: HashSet<String>,
 }
@@ -445,10 +455,16 @@ impl Acc {
         {
             self.ttft_sum_ms += t;
             self.ttft_n += 1;
-            if let Some(g) = r.gen_ms
+            // 输出速度的分母必须是「首包→流结束」的完整生成窗口：completion_tokens
+            // 含思考与工具参数。旧记录没 decode_ms，用 latency - ttft 回算同一口径
+            // （两者都以请求发出为起点，差值就是首包→结束）。
+            let span = r
+                .decode_ms
+                .or_else(|| r.latency_ms.checked_sub(t).filter(|d| *d > 0));
+            if let Some(g) = span
                 && g > 0
             {
-                self.gen_sum_ms += g;
+                self.speed_span_ms += g;
                 self.speed_comp_tokens += r.completion_tokens;
             }
         }
@@ -473,8 +489,8 @@ impl Acc {
             p50_ms: percentile(&lat, 0.5),
             p95_ms: percentile(&lat, 0.95),
             avg_ttft_ms: (self.ttft_n > 0).then(|| self.ttft_sum_ms / self.ttft_n),
-            avg_out_tps: (self.gen_sum_ms > 0)
-                .then(|| self.speed_comp_tokens as f64 / (self.gen_sum_ms as f64 / 1000.0)),
+            avg_out_tps: (self.speed_span_ms > 0)
+                .then(|| self.speed_comp_tokens as f64 / (self.speed_span_ms as f64 / 1000.0)),
             sessions: self.sessions.len(),
         }
     }
@@ -508,6 +524,7 @@ pub fn report(group: &str, range: &str, session: &str) -> Report {
     let records = LEDGER.get().map(|l| l.read_all()).unwrap_or_default();
     let mut groups: HashMap<String, Acc> = HashMap::new();
     let mut totals = Acc::default();
+    let mut totals_main = Acc::default();
     let mut unpriced_total = 0u64;
     for r in &records {
         if !session.is_empty() && r.session_id != session {
@@ -537,6 +554,9 @@ pub fn report(group: &str, range: &str, session: &str) -> Report {
             r.provider.clone()
         };
         totals.add(r, cost);
+        if r.purpose == "main" {
+            totals_main.add(r, cost);
+        }
         groups.entry(key).or_default().add(r, cost);
     }
     let mut rows: Vec<Agg> = groups.iter().map(|(k, a)| a.finish(k)).collect();
@@ -554,6 +574,7 @@ pub fn report(group: &str, range: &str, session: &str) -> Report {
         from: from.map(|f| f.to_rfc3339_opts(SecondsFormat::Secs, true)),
         rows,
         totals: totals.finish(""),
+        totals_main: totals_main.finish("main"),
         spend_cap_usd: cap_value(),
         spend_total_usd: spend_total(),
         priced: unpriced_total == 0,
@@ -876,5 +897,30 @@ mod tests {
             .filter_map(|l| serde_json::from_str::<UsageRecord>(l).ok())
             .filter(|r| r.session_id == session)
             .count()
+    }
+
+    /// 输出速度分母 = 首包→流结束，不是正文跨度（2026-11-09 修）：
+    /// 思考 80s + 正文 2s 的调用，用 gen_ms 会算出 40 倍速度。
+    #[test]
+    fn out_speed_uses_decode_window_and_falls_back_for_old_records() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        ledger();
+        prices_star();
+        // 新记录：1000 completion，请求 85s、首包 3s、正文段只有 2s、生成窗口 82s
+        let mut fresh = rec("api.speed.com", "m-speed", 0, 1000, 0, "ok", 85_000);
+        fresh.ttft_ms = Some(3_000);
+        fresh.gen_ms = Some(2_000);
+        fresh.decode_ms = Some(82_000);
+        record(fresh);
+        // 旧记录（没 decode_ms）：500 completion，请求 42s、首包 2s → 回算窗口 40s
+        let mut old = rec("api.speed.com", "m-speed", 0, 500, 0, "ok", 42_000);
+        old.ttft_ms = Some(2_000);
+        record(old);
+        let rep = report(GROUP_PROVIDER, "all", "");
+        let row = rep.rows.iter().find(|r| r.key == "api.speed.com").expect("应有速度行");
+        // (1000+500) / (82+40)s ≈ 12.3 tok/s；若误用 gen_ms 只剩 (1000)/(2s)=500
+        let want = 1500.0 / 122.0;
+        let got = row.avg_out_tps.expect("有计时就该有速度");
+        assert!((got - want).abs() < 1e-6, "速度应按完整生成窗口算: {got} vs {want}");
     }
 }

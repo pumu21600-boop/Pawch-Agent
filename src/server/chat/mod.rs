@@ -19,6 +19,31 @@ pub(crate) use identity::clear_cache as clear_identity_cache;
 pub(crate) use media::*;
 pub(crate) use turn::*;
 
+/// 协议能否承载某种媒体输入块——能力勾选之外的协议硬约束（2026-11-11）：
+/// 图片三种协议都认；音频只有 Chat Completions / Responses 有块形状（Anthropic 没有）；
+/// 视频只有部分 Chat 端点支持（Responses / Anthropic 都没有视频块）。
+fn protocol_can_carry(proto: gateway::Protocol, kind: &str) -> bool {
+    match kind {
+        "audio" => proto != gateway::Protocol::AnthropicMessages,
+        "video" => proto == gateway::Protocol::OpenAiCompletions,
+        _ => true,
+    }
+}
+
+/// 媒体旁路提示词变体里是否含某个内容块类型（数组<消息<content<parts>>）。
+/// 用来按协议筛掉翻不过去的备选形状（如 Responses 不认 audio_url）。
+fn media_variant_has_block(variant: &Value, block_type: &str) -> bool {
+    variant.as_array().is_some_and(|msgs| {
+        msgs.iter().any(|m| {
+            m.get("content").and_then(Value::as_array).is_some_and(|parts| {
+                parts
+                    .iter()
+                    .any(|p| p.get("type").and_then(Value::as_str) == Some(block_type))
+            })
+        })
+    })
+}
+
 
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
@@ -102,6 +127,51 @@ fn merge_file_history(mut file_msgs: Vec<Value>, req_history: &[Value], message:
 /// 丢掉（「截图 + 合同.pdf」同发时模型只收到文档通知，截图从未进入上下文）。
 /// 数组形态：所有 text part 合成一条（投影在前、原正文在后），非 text part
 /// （image_url/input_audio/video_url）原样保留；字符串形态维持旧行为。
+/// 落盘边界：把本轮用户消息的 content 还原成用户原文。
+/// 投影文本、原生内联媒体的 base64、项目 brief 都只进本次请求——会话文件是
+/// 界面回显的数据源，混进投影后刷新会显示成「识别出来的文本」，体积与上下文
+/// 估价也跟着虚高（2026-11-10 真机：视频内联 13.9 万 token 的根因之一）。
+/// 按消息 id 定位；找不到 id 就不动（宁可不还原，也不能盖到别的 user 消息上）。
+fn restore_orig_user_content(messages: &mut [Value], orig: Option<&(Value, Value)>) {
+    let Some((id, content)) = orig else { return };
+    // id 可能是数字（前端 nextId 是 ++seq）也可能是字符串，按 Value 直接比；
+    // 没有 id（API 直调 / 无头会话）退回「最后一条 user」——这些路径不会有引导消息
+    let at = if id.is_null() {
+        messages.iter().rposition(|m| m["role"] == "user")
+    } else {
+        messages.iter().rposition(|m| m.get("id") == Some(id))
+    };
+    if let Some(i) = at {
+        messages[i]["content"] = content.clone();
+    }
+}
+
+/// input_audio.data 的形态分流：阿里百炼（dashscope）要求 URL 或 data URI，
+/// 纯 base64 会被判「The provided URI does not appear to be valid」；OpenAI 官方
+/// 与多数兼容端点要纯 base64。按端点分流，别一刀切（2026-11-10 真机实测）。
+fn audio_payload_is_uri(base_url: &str) -> bool {
+    let b = base_url.to_ascii_lowercase();
+    b.contains("dashscope") || b.contains("aliyuncs")
+}
+
+/// 错误体是否属于「模型/端点不接受这种媒体模态」——只用来给配置指引，
+/// 不参与判定（配额 403、鉴权这些不能算）。
+fn media_modality_rejected(err: &str) -> bool {
+    let l = err.to_ascii_lowercase();
+    [
+        "incorrect modal",
+        "does not support video",
+        "does not support audio",
+        "does not support image",
+        "unsupported media",
+        "invalid value: video_url",
+        "invalid value: audio_url",
+        "invalid value: input_audio",
+    ]
+    .iter()
+    .any(|k| l.contains(k))
+}
+
 fn apply_projections_to_last_user(history: &mut [Value], projections: &[String]) {
     if projections.is_empty() {
         return;
@@ -230,7 +300,8 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
     // 上下文预算：当前模型设了上下文长度就用它（覆盖全局 [context].budget_tokens）
     let ctx_cfg = {
         let mut c = (*state.context_cfg).clone();
-        if let Some(cl) = active_cfg.context_length {
+        // 上下文长度按本轮模型取（模型级 > 配置级）
+        if let Some(cl) = active_cfg.params_for(&req.model).context_length {
             c.budget_tokens = cl;
         }
         c
@@ -336,7 +407,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                 json!(text.clone())
             } else {
                 let fallback = if text.is_empty() { "请查看附带的媒体文件" } else { text.as_str() };
-                steer_content_with_attachments(fallback, &attachments, &active_cfg.capabilities).await
+                steer_content_with_attachments(fallback, &attachments, &active_cfg.caps_for(&req.model)).await
             };
             state.steer.push_content(&session_id, text, content, mode)
         };
@@ -661,26 +732,47 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
         // **不含**「项目现状」brief——它只在新会话第一轮出现，放进系统提示会让
         // 第 2 轮 system 变短、system+tools 稳定区缓存全失效（e2e 实测第 2 轮
         // 命中 21%）；改并进首条 user 消息，随 messages 区走（turn.rs 有完整纪律注释）。
-        let system_prompt = turn_system_prompt(&state, &ch.primary).await;
+        let system_prompt = turn_system_prompt(&state, &ch.primary, &crate::tools::workspace_root()).await;
 
         // 多模态媒体理解流水线：感知媒体附件与视觉/视频/音频解析能力
         let mut history = history;
+        // 落盘用的用户原文：投影/内联媒体 base64/brief 只进本次请求，不进会话文件
+        let orig_user = history
+            .iter()
+            .rev()
+            .find(|m| m["role"] == "user")
+            .map(|m| (m.get("id").cloned().unwrap_or(Value::Null), m["content"].clone()));
         // 新会话第一轮：项目现状 brief 并进首条 user 消息（不进系统提示，保缓存前缀）
-        let brief = first_turn_brief(&state, &session_id).await;
+        let brief = first_turn_brief(&state, &session_id, &crate::tools::workspace_root()).await;
         inject_brief_into_first_user(&mut history, &brief);
         if !attachments.is_empty() {
             // features.roles=false（「功能桥接」关）= 不走专家渠道，媒体附件统一占位文本
             let roles = if s.features.roles { s.roles.as_ref() } else { None };
-            let mut native_attachments: Vec<&MediaAttachment> = Vec::new();
-            let mut forward_attachments: Vec<&MediaAttachment> = Vec::new();
-            let mut doc_attachments: Vec<&MediaAttachment> = Vec::new();
+            let mut native_attachments: Vec<(&MediaAttachment, Option<String>)> = Vec::new();
+            let mut forward_attachments: Vec<(&MediaAttachment, Option<String>)> = Vec::new();
+            let mut doc_attachments: Vec<(&MediaAttachment, Option<String>)> = Vec::new();
             let mut projections: Vec<String> = Vec::new();
+            // 2026-11-10：所有附件统一先落盘一次（原来只有转接/文档两类落盘，原生内联
+            // 的图片视频只活在 base64 里）——落盘路径随消息元数据落盘，刷新/重开会话
+            // 时气泡上仍能还原附件预览（此前刷新即消失：消息里只有 content parts）。
+            let att_ws = crate::tools::workspace_root();
+            let _ = std::fs::create_dir_all(att_ws.join(".attachments"));
+            ensure_attachments_ignored(&att_ws);
+            let mut saved_paths: Vec<Option<String>> = Vec::with_capacity(attachments.len());
+            // 协议能承载哪些媒体块（2026-11-11）：能力勾选只管模型，协议决定形状——
+            // Anthropic 没有音频/视频输入块，Responses 没有视频输入块。落不进协议的
+            // 媒体一律转专家旁路/占位文本，绝不把 OpenAI 形状硬塞过去（真机实测：
+            // 勾了「音频」的 Anthropic 渠道会把 input_audio 直接发给 /messages → 400）。
+            let primary_proto =
+                gateway::channel_protocol(&ch.primary.params, &ch.primary.base_url, &ch.primary.model);
 
             for att in &attachments {
+                let saved = persist_attachment(att, &att_ws);
+                saved_paths.push(saved.clone());
                 // 文档流水线：Office/PDF 类附件不做多模态内联（视觉模型解析不了
                 // 二进制文档），一律落盘工作区 + 文本通知，交给文档处理技能
                 if att.is_document() {
-                    doc_attachments.push(att);
+                    doc_attachments.push((att, saved));
                     continue;
                 }
                 let is_vid = att.is_video();
@@ -690,15 +782,39 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                 // 塞进 image_url，渠道直接 400、整轮失败（2026-10-08 修）。
                 let is_img = att.is_image() && att.effective_mime().starts_with("image/");
 
-                let supports_natively = (is_img && active_cfg.capabilities.vision)
-                    || (is_vid && active_cfg.capabilities.video)
-                    || (is_aud && active_cfg.capabilities.audio);
+                // 能力按「本轮实际使用的模型」取：同渠道不同模型各自的能力标记
+                // （文本模型不勾音视频、omni 模型勾音频）——2026-11-10 ZCode 式改造
+                let caps = active_cfg.caps_for(&ch.primary.model);
+                let att_kind = if is_vid { "video" } else if is_aud { "audio" } else { "image" };
+                let proto_can_carry = protocol_can_carry(primary_proto, att_kind);
+                let supports_natively = proto_can_carry
+                    && ((is_img && caps.vision)
+                        || (is_vid && caps.video)
+                        || (is_aud && caps.audio));
 
                 if supports_natively {
-                    native_attachments.push(att);
+                    native_attachments.push((att, saved));
                 } else {
-                    forward_attachments.push(att);
+                    forward_attachments.push((att, saved));
                 }
+            }
+
+            // 附件元数据（name/mime/size/path）挂在本轮 user 消息上：会话落盘只存
+            // 元信息、不存 base64，前端刷新后靠它还原气泡预览（2026-11-10）
+            let att_meta: Vec<Value> = attachments
+                .iter()
+                .zip(saved_paths.iter())
+                .map(|(a, p)| {
+                    json!({
+                        "name": a.name,
+                        "mime": a.effective_mime(),
+                        "size": a.decoded_len(),
+                        "path": p.as_ref().map(|s| format!(".attachments/{s}")),
+                    })
+                })
+                .collect();
+            if let Some(last_msg) = history.iter_mut().rev().find(|m| m["role"] == "user") {
+                last_msg["attachments"] = json!(att_meta);
             }
 
             // 1. 对于主模型原生支持的媒体类型，挂载原生多模态结构
@@ -708,12 +824,18 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                     if let Some(txt) = last_msg["content"].as_str() {
                         parts.push(json!({ "type": "text", "text": txt }));
                     }
-                    for att in native_attachments {
+                    for (att, _) in native_attachments {
                         if att.is_audio() {
+                            // 百炼要 data URI、OpenAI 要纯 base64：按端点分流
+                            let audio_data = if audio_payload_is_uri(&ch.primary.base_url) {
+                                att.data_url()
+                            } else {
+                                att.raw_base64()
+                            };
                             parts.push(json!({
                                 "type": "input_audio",
                                 "input_audio": {
-                                    "data": att.raw_base64(),
+                                    "data": audio_data,
                                     "format": att.audio_format()
                                 }
                             }));
@@ -740,9 +862,9 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                 let ws = crate::tools::workspace_root();
                 let _ = std::fs::create_dir_all(ws.join(".attachments"));
                 ensure_attachments_ignored(&ws);
-                for att in &doc_attachments {
-                    match persist_attachment(att, &ws) {
-                        Some(rel) => projections.push(att.document_intake_notice(&ws, &rel).await),
+                for (att, saved) in &doc_attachments {
+                    match saved {
+                        Some(rel) => projections.push(att.document_intake_notice(&ws, rel).await),
                         None => projections.push(format!(
                             "[📄 文档附件「{}」保存失败：附件内容解码异常，请用户重新发送该文件]",
                             att.name
@@ -754,17 +876,16 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
             // 2. 对于主模型不支持的媒体类型，走专职转接与确定性文本投影（对齐 DSH media-understanding 规范）
             if !forward_attachments.is_empty() {
 
-                for att in forward_attachments {
+                for (att, saved) in forward_attachments {
                     let is_vid = att.is_video();
                     let is_aud = att.is_audio();
                     let kind = if is_vid { "video" } else if is_aud { "audio" } else { "image" };
                     let kind_cn = if is_vid { "视频" } else if is_aud { "音频" } else { "图片" };
                     let success_label = if is_vid { "Video understanding" } else if is_aud { "Audio understanding" } else { "Image understanding" };
 
-                    // 持久化附件到工作区 .attachments/ 便于主模型与工具查阅
-                    // A5：附件目录自动进工作区 git 排除（幂等，只追加）
-                    let safe_name = persist_attachment(att, &crate::tools::workspace_root())
-                        .unwrap_or_else(|| "attachment".to_string());
+                    // 附件已在上面统一落盘（.attachments/）便于主模型与工具查阅；
+                    // 这里只取路径
+                    let safe_name = saved.unwrap_or_else(|| "attachment".to_string());
 
                     // 1) 专属路由解析（对齐 DSH）：严格隔离，仅使用用户在 roles 中针对该模态显式配置的渠道，严禁自动跨渠道降级
                     let role_target = if is_vid {
@@ -801,15 +922,8 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                     let first_provider = first_ch.params.provider_id.as_deref().unwrap_or("openai_compat");
                     let first_model = &first_ch.model;
 
-                    let gate_ok = match role_target
-                        .and_then(|id| s.configs.iter().find(|c| c.id == id || c.name == id))
-                    {
-                        Some(expert) => match kind {
-                            "audio" => expert.capabilities.audio,
-                            "video" => expert.capabilities.video,
-                            "image" => expert.capabilities.vision,
-                            _ => false,
-                        },
+                    let gate_ok = match role_target {
+                        Some(v) => role_expert_has_cap(&s, v, kind),
                         None => false,
                     };
                     if !gate_ok {
@@ -842,6 +956,28 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                                     ]
                                 }
                             ]),
+                            // 格式 1b（input_audio + data URI）：阿里百炼文档要求 data 是
+                            // 「URL 或 data URI」，纯 base64 会被判成非法值——同一形状
+                            // 补一版 data URI（2026-11-10 真机：音频只报 audio_url 不支持，
+                            // 实为格式 1 的 data 形态被拒后没再试对的那版）
+                            json!([
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "input_audio",
+                                            "input_audio": {
+                                                "data": att.data_url(),
+                                                "format": att.audio_format()
+                                            }
+                                        },
+                                        {
+                                            "type": "text",
+                                            "text": "Transcribe and describe this audio in detail. Cover spoken content and notable non-speech sounds in order. 请仔细倾听并详细转录该音频内容：逐字转录全部语音对话内容（ASR），提取说话人语调与关键要点，并记录环境背景声音。"
+                                        }
+                                    ]
+                                }
+                            ]),
                             // 格式 2（备选 audio_url）
                             json!([
                                 {
@@ -860,6 +996,10 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                             ]),
                         ]
                     } else if is_vid {
+                        // 2026-11-10：只发 video_url。旧实现还有一条「把视频塞 image_url」
+                        // 的回退——渠道会尝试当图片解码，返回「loading IMAGE」这种误导性
+                        // 400（真机：视频专家的端点不支持视频时，用户只看到图片解码失败，
+                        // 误以为视频被当成图片/音频发出去）。不支持就如实失败，不瞎猜。
                         vec![
                             json!([
                                 {
@@ -872,21 +1012,6 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                                         {
                                             "type": "text",
                                             "text": "Describe this video in detail: what happens across it, including visual content and any speech or captions, in chronological order. 请按时间顺序详细描述该视频：视频中发生了什么，包括画面视觉内容、任何语音旁白或字幕。"
-                                        }
-                                    ]
-                                }
-                            ]),
-                            json!([
-                                {
-                                    "role": "user",
-                                    "content": [
-                                        {
-                                            "type": "image_url",
-                                            "image_url": { "url": att.data_url() }
-                                        },
-                                        {
-                                            "type": "text",
-                                            "text": "Describe this video in detail: what happens across it, including visual content and any speech or captions, in chronological order."
                                         }
                                     ]
                                 }
@@ -927,8 +1052,39 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                         params.max_tokens = Some(params.max_tokens.unwrap_or(1500).min(1500));
                         params.thinking = None;
 
+                        // 协议能力预检（2026-11-11）：媒体块形状按协议分叉，Anthropic 没有
+                        // 音频/视频输入，Responses 没有视频输入——这类组合注定失败，
+                        // 直接给明确原因，不拿 OpenAI 形状去撞一个文不对题的 400。
+                        let proto = gateway::channel_protocol(&params, &vch.base_url, &vch.model);
+                        if !protocol_can_carry(proto, kind) {
+                            let msg = match kind {
+                                "audio" => {
+                                    "Anthropic Messages 协议不支持音频输入（请把音频专家换成 Chat Completions 或 Responses 渠道）"
+                                }
+                                "video" => {
+                                    "该协议不支持视频输入（Anthropic Messages / Responses 都没有视频输入块，请把视频专家换成支持视频的 Chat Completions 渠道）"
+                                }
+                                _ => "该协议不支持这种媒体输入",
+                            };
+                            observability::event(
+                                EventType::Error,
+                                json!({ "kind": "media.protocol_unsupported", "modality": kind, "model": vch.model, "protocol": format!("{proto:?}") }),
+                            );
+                            last_error_msg = msg.to_string();
+                            continue;
+                        }
+                        // Responses 只认 input_audio（base64/data URI 两版），audio_url
+                        // 那条备选形状翻不过去，直接跳过，别发一条把音频丢掉的空请求。
+                        let variants: Vec<&serde_json::Value> = candidate_prompts
+                            .iter()
+                            .filter(|v| {
+                                !(proto == gateway::Protocol::OpenAiResponses
+                                    && media_variant_has_block(v, "audio_url"))
+                            })
+                            .collect();
+
                         let mut call_err = None;
-                        for prompt_variant in &candidate_prompts {
+                        for prompt_variant in variants {
                             // 媒体旁路调用记台账（purpose=media，归属本会话）
                             let media_ctx = gateway::UsageCtx::aux(&session_id, "media");
                             // 旁路走非流式 complete，本身不看取消标志：用户点了停止
@@ -991,7 +1147,34 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                     let substituted_text = if let Some(text) = desc_result {
                         format!("[{} ({}/{}):\n{}]", success_label, last_route.0, last_route.1, text)
                     } else {
-                        format!("[{} failed ({}/{}): {}]", success_label, last_route.0, last_route.1, last_error_msg)
+                        // 只有**端点确实不认这种媒体块**才给「换视频模型」的建议。
+                        // 403 配额/鉴权这类错误要原样报——2026-11-10 真机：百炼
+                        // 「Free quota exhausted」被无条件诊断成「不支持视频」，
+                        // 主模型据此劝用户换模型，真正原因反而被埋掉。
+                        let lower = last_error_msg.to_ascii_lowercase();
+                        let media_unsupported = [
+                            "does not support video",
+                            "does not support audio",
+                            "does not support image",
+                            "invalid value: video_url",
+                            "invalid value: audio_url",
+                            "invalid value: input_audio",
+                            "video input",
+                            "audio input",
+                        ]
+                        .iter()
+                        .any(|k| lower.contains(k));
+                        let hint = if is_vid && media_unsupported {
+                            "（该渠道声明了视频能力但端点未接受视频输入，很可能并不支持视频——请如实告诉用户，建议在「功能桥接」里换真正支持视频的模型，如 Gemini / Qwen-VL 系列）"
+                        } else if is_aud && media_unsupported {
+                            "（该渠道声明了音频能力但端点未接受音频输入，很可能并不支持音频——请如实告诉用户，建议在「功能桥接」里换真正支持音频输入的模型）"
+                        } else {
+                            ""
+                        };
+                        format!(
+                            "[{} failed ({}/{}): {}{}]",
+                            success_label, last_route.0, last_route.1, last_error_msg, hint
+                        )
                     };
                     projections.push(substituted_text);
                 }
@@ -1154,6 +1337,8 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                     AgentEvent::Snapshot { messages } => {
                         let mut messages = messages;
                         strip_brief_from_first_user(&mut messages);
+                        // 本轮用户消息落盘用原文（投影/内联媒体只活在请求里）
+                        restore_orig_user_content(&mut messages, orig_user.as_ref());
                         // 信息卡的「来源配置」要随消息落盘：stats 由核心层生成（只有模型/供应商），
                         // 配置名只有服务端知道——不补的话刷新/切回会话后那一行永远是「—」
                         // （2026-11-01 真机实测：好多条消息的来源配置都是一条横杆）
@@ -1217,12 +1402,25 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                 // 出错也继续走下面的收尾：已排队的追加消息是用户发出去的话，不能因上一轮
                 // 失败被悄悄吞掉（若下一轮同样失败，会再报一次错，语义仍然清楚）
                 observability::event(EventType::Error, json!({ "message": e.to_string() }));
-                send(json!({ "error": e.to_string() }));
+                // 媒体模态被当前主模型拒收时，把「怎么配」直接写进错误：
+                // 能力勾选是「当前这个模型支持」的声明，勾了却选文本模型就会 400，
+                // 用户看到裸错误码只会以为功能坏了（2026-11-10 真机）
+                let media_err = !attachments.is_empty() && media_modality_rejected(&e.to_string());
+                let err_text = if media_err {
+                    format!(
+                        "{e}\n\n当前主模型「{}」不接受这类媒体。两种解法：①把主模型换成没勾该能力的配置，附件会自动转给「功能桥接」里的专家；②把主模型换成真正支持该模态的模型。",
+                        ch.primary.model
+                    )
+                } else {
+                    e.to_string()
+                };
+                send(json!({ "error": err_text }));
                 // 错误随会话落盘（重启/切回会话后报错气泡还在）。display_only 消息，
                 // 发送侧 replay 剥离，不进模型上下文。
                 {
                     let mut snap = last_snapshot.lock().unwrap_or_else(|e| e.into_inner());
-                    snap.push(json!({ "role": "system", "content": format!("[错误] {e}"), "display_only": true }));
+                    snap.push(json!({ "role": "system", "content": format!("[错误] {err_text}"), "display_only": true }));
+                    restore_orig_user_content(snap.as_mut_slice(), orig_user.as_ref());
                     if let Err(se) = session.save(&session_id, &snap, None) {
                         observability::event(
                             EventType::Error,
@@ -1500,8 +1698,11 @@ mod tests {
             top_p: None,
             thinking: None,
             thinking_style: None,
+            protocol: None,
+            auto_suffix: true,
             capabilities: Default::default(),
             capabilities_user_set: false,
+            model_params: Default::default(),
         };
         // 无 DPAPI key、无环境变量 → 空
         unsafe { std::env::remove_var("DEEPSEEK_API_KEY") };
@@ -1563,6 +1764,22 @@ fn persist_attachment(att: &MediaAttachment, ws: &std::path::Path) -> Option<Str
     Some(final_name)
 }
 
+/// 角色专家能力预检：角色值可能是「配置id::模型」形式（功能桥接下拉按渠道多模型
+/// 清单展开），整串查配置会把 UI 保存的值误判成「配置不存在」→ 配好的图片/视频/
+/// 音频专家被静默跳过（2026-11-10 审查 P0）。先拆配置段再查，与 turn.rs 视觉门同款。
+fn role_expert_has_cap(s: &Settings, role_value: &str, kind: &str) -> bool {
+    // 用户在「功能桥接」里显式选了这个专家 = 声明它能处理该模态，配置能解析就放行。
+    // 能力勾选只作主模型内联的判据——同一份标记同时卡主请求和专家，会把两条路
+    // 一起堵死（2026-11-10 真机：主模型取消音频勾选走转接，专家又被同一配置的
+    // audio:false 拦住，提示「专家未勾选音频解析能力」）。真不支持就让端点报真错误。
+    let cfg_ref = split_role_value(role_value).0;
+    s.configs
+        .iter()
+        .find(|c| c.id == cfg_ref || c.name == cfg_ref)
+        .map(|_expert| matches!(kind, "audio" | "video" | "image"))
+        .unwrap_or(false)
+}
+
 /// 引导/立即发送带附件（2026-11-03）：把附件转成模型可用的 user content。
 /// - 图片/音频/视频：主渠道原生支持（capabilities）就内联成内容块；
 /// - 文档、主渠道不支持的媒体：落盘工作区 `.attachments/`，以文本带出路径/清单。
@@ -1608,7 +1825,7 @@ async fn steer_content_with_attachments(
         let kind_cn = if is_vid { "视频" } else if is_aud { "音频" } else { "图片" };
         let safe_name = persist_attachment(att, &ws).unwrap_or_else(|| "attachment".to_string());
         notes.push(format!(
-            "[{kind_cn}附件「{}」已保存到工作区 .attachments/{}；当前主渠道未开启{kind_cn}理解，无法直接查看。需要时用工具读取，或让用户改用支持{kind_cn}的模型。]",
+            "[{kind_cn}附件「{}」已保存到工作区 .attachments/{}；引导消息不转接{kind_cn}专家，当前主渠道也未开启{kind_cn}理解，无法直接查看。需要时用工具读取，或让用户改用支持{kind_cn}的模型。]",
             att.name, safe_name
         ));
     }
@@ -1629,6 +1846,34 @@ mod projection_tests {
 
     /// 2026-10-08 修：投影块曾无条件把 content 换成字符串，原生多模态 parts
     /// （图片/音频）被静默丢掉——「截图 + 合同.pdf」同发时模型只收到文档通知。
+    #[test]
+    fn restore_orig_user_content_handles_numeric_and_string_ids() {
+        // 前端 nextId 是数字：曾经只认字符串 id，落盘还原整个失效
+        let mut msgs = vec![
+            json!({ "role": "user", "id": 7, "content": "[投影]\n\n原文" }),
+            json!({ "role": "assistant", "content": "ok" }),
+        ];
+        restore_orig_user_content(&mut msgs, Some(&(json!(7), json!("原文"))));
+        assert_eq!(msgs[0]["content"], json!("原文"));
+        assert_eq!(msgs[1]["content"], json!("ok"));
+        // 字符串 id 同样支持
+        let mut msgs = vec![json!({ "role": "user", "id": "u1", "content": "x" })];
+        restore_orig_user_content(&mut msgs, Some(&(json!("u1"), json!("y"))));
+        assert_eq!(msgs[0]["content"], json!("y"));
+        // id 找不到：一条都不许动（宁可保留投影，也不能盖错消息）
+        let mut msgs = vec![json!({ "role": "user", "id": 1, "content": "x" })];
+        restore_orig_user_content(&mut msgs, Some(&(json!(2), json!("y"))));
+        assert_eq!(msgs[0]["content"], json!("x"));
+        // 没有 id（API 直调 / 无头会话）：退回最后一条 user
+        let mut msgs = vec![
+            json!({ "role": "user", "content": "a" }),
+            json!({ "role": "user", "content": "[投影]\n\nb" }),
+        ];
+        restore_orig_user_content(&mut msgs, Some(&(Value::Null, json!("b"))));
+        assert_eq!(msgs[1]["content"], json!("b"));
+        assert_eq!(msgs[0]["content"], json!("a"));
+    }
+
     #[test]
     fn projections_preserve_native_multimodal_parts() {
         let mut history = vec![json!({
@@ -1703,5 +1948,63 @@ mod projection_tests {
         apply_projections_to_last_user(&mut h3, &["投影".into()]);
         assert_eq!(h3.len(), 1);
         assert_eq!(h3[0]["content"], json!("s"));
+    }
+
+    /// 2026-11-10 审查 P0：功能桥接下拉保存的是「配置id::模型」，能力预检必须
+    /// 先拆配置段再查——整串查配置永远查不到，配好的专家被误报「未勾选能力」。
+    #[test]
+    fn role_expert_gate_accepts_cfg_model_value() {
+        let s: crate::config::settings::Settings = serde_json::from_value(json!({
+            "configs": [{
+                "id": "cfg-x",
+                "name": "渠道X",
+                "provider_id": "openai_compat",
+                "capabilities": {"vision": true, "video": false, "audio": false}
+            }]
+        }))
+        .expect("settings");
+        assert!(
+            role_expert_has_cap(&s, "cfg-x::some-model", "image"),
+            "「配置id::模型」形态必须能查到专家"
+        );
+        assert!(
+            role_expert_has_cap(&s, "渠道X::some-model", "image"),
+            "按配置名 + ::模型 也要认"
+        );
+        // 老值（纯配置名/纯 id）行为不变
+        assert!(role_expert_has_cap(&s, "cfg-x", "image"));
+        assert!(role_expert_has_cap(&s, "渠道X", "image"));
+        // 用户显式选了专家 = 声明它能处理该模态：不再拿能力勾选二次拦截
+        // （同一份标记卡主请求又卡专家，两条路一起堵死）
+        assert!(role_expert_has_cap(&s, "cfg-x::some-model", "video"));
+        // 配置不存在拒、畸形值拒
+        assert!(!role_expert_has_cap(&s, "missing::m", "image"));
+        assert!(!role_expert_has_cap(&s, "::m", "image"));
+    }
+
+    #[test]
+    fn protocol_media_capability_matrix() {
+        use crate::gateway::Protocol;
+        assert!(protocol_can_carry(Protocol::OpenAiCompletions, "audio"));
+        assert!(protocol_can_carry(Protocol::OpenAiResponses, "audio"));
+        assert!(!protocol_can_carry(Protocol::AnthropicMessages, "audio"));
+        assert!(protocol_can_carry(Protocol::OpenAiCompletions, "video"));
+        assert!(!protocol_can_carry(Protocol::OpenAiResponses, "video"));
+        assert!(!protocol_can_carry(Protocol::AnthropicMessages, "video"));
+        assert!(protocol_can_carry(Protocol::AnthropicMessages, "image"));
+    }
+
+    #[test]
+    fn media_variant_block_detection_filters_audio_url() {
+        // Responses 只认 input_audio：audio_url 备选变体要能被筛出来，别发空请求
+        let audio_url = json!([{ "role": "user", "content": [
+            { "type": "audio_url", "audio_url": { "url": "data:audio/wav;base64,AAA" } }
+        ]}]);
+        assert!(media_variant_has_block(&audio_url, "audio_url"));
+        let input_audio = json!([{ "role": "user", "content": [
+            { "type": "input_audio", "input_audio": { "data": "AAA", "format": "wav" } }
+        ]}]);
+        assert!(!media_variant_has_block(&input_audio, "audio_url"));
+        assert!(media_variant_has_block(&input_audio, "input_audio"));
     }
 }

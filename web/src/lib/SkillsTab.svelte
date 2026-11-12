@@ -89,8 +89,13 @@
 
       {#if tab === 'skills'}
         <div class="sub-row">
-          <button class="btn primary" on:click={newSkill}>新建技能</button>
-          <button class="btn" on:click={() => dispatch('reload')}>刷新</button>
+          <button class="btn primary btn-plus" on:click={newSkill}>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+            新建技能
+          </button>
+          <button class="icon-act" title="刷新" aria-label="刷新" on:click={() => dispatch('reload')}>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg>
+          </button>
           {#if skillMsg}<span class="hint">{skillMsg}</span>{/if}
         </div>
         <!-- 编辑器开着时不出现下方技能列表（编辑态只留编辑器） -->
@@ -128,12 +133,19 @@
                 <div class="plug-desc">{s.description || '（无描述）'}</div>
               </div>
               <!-- 来源徽标只标例外：全局技能是这页的常态（每行都挂「全局」= 纯噪音，
-                  2026-10-07 真机实测「这些全局按钮可以去掉」）；只有项目级这种
-                  少数情况值得亮出来。插件来源的技能本就被上面过滤掉，无需分支 -->
-              {#if s.source === 'project'}<span class="plug-chip">项目级</span>{/if}
+                  2026-10-07 真机实测「这些全局按钮可以去掉」）；只有项目级/内置这种
+                  少数情况值得亮出来。插件来源的技能本就被上面过滤掉，无需分支。
+                  徽标统一放在 flex-sp 之后（靠按钮右对齐）——之前跟在描述后面，
+                  位置随描述长度参差（2026-11-10 真机反馈）。 -->
               <span class="flex-sp"></span>
-              <button class="btn ghost" on:click={() => editSkill(s)}>编辑</button>
-              <button class="btn ghost danger" on:click={() => deleteSkill(s.name)}>删除</button>
+              {#if s.source === 'project'}<span class="plug-chip">项目级</span>{/if}
+              {#if s.source === 'builtin'}<span class="plug-chip">内置</span>{/if}
+              <button class="icon-act" title="编辑" aria-label="编辑" on:click={() => editSkill(s)}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>
+              </button>
+              <!-- 内置技能是随包分发的文件，删除入口收起（2026-11-10）；编辑会在
+                   数据目录生成覆盖副本，想覆盖就新建同名 -->
+              {#if s.source !== 'builtin'}<button class="btn ghost danger" on:click={() => deleteSkill(s.name)}>删除</button>{/if}
               <button class="switch" class:on={s.enabled !== false} role="switch" aria-checked={s.enabled !== false} aria-label="{s.name} 启用/停用" on:click={() => toggleSkill(s)}><span class="knob"></span></button>
             </div>
           {/each}
@@ -148,7 +160,7 @@
     font-family: Consolas, 'Courier New', monospace;
     font-size: 12.5px;
     line-height: 1.7;
-    background: var(--g1);
+    background: transparent; /* 描边无底色（2026-11-11 设置统一样式） */
     color: var(--g7);
     border: 1px solid var(--g3);
     border-radius: 8px;

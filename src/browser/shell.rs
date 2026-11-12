@@ -15,13 +15,16 @@
 //! | `menu_close` | 关菜单 webview |
 //!
 //! 设计约束：
-//! - **单向**：壳只收指令不回 ack——create 的确认靠 /json/list 里出现新 target
-//!   （CDP 端口 9223，见 `SHELL_CDP_PORT`），其余指令幂等。
+//! - **壳 → 服务的唯一上行消息是 `focus`**（窗口「看得见/看不见」变化；2026-11-09 加）：
+//!   看不见（被完全遮挡/最小化）时冻结页面动画省渲染，露出来立即恢复——窗口内容
+//!   保持最后一帧，切回来无缝，观感对齐 ZCode（它靠 Chromium 自身的遮挡节流）。
+//!   其余指令单向，create 的确认靠 /json/list 里出现新 target。
 //! - **单连接**：只认第一个连进来的壳（单实例守卫下只有一个）；第二个连接直接关掉，
 //!   防止两个壳互相顶替。
 //! - 通道断连只意味着"指挥不动壳了"：`available()` 转假，浏览器会话回落到无头模式，
 //!   不影响其他任何功能。
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -46,6 +49,19 @@ fn slot() -> &'static Mutex<Option<Conn>> {
 /// 壳是否连着（能指挥 webview 的前提）。
 pub fn available() -> bool {
     slot().lock().map(|g| g.is_some()).unwrap_or(false)
+}
+
+/// 壳主窗口是否「看得见」（缺省 true）：未最小化、未被前台窗口完全盖住。
+/// 部分可见（侧并排）时页面照常渲染，跟 ZCode 一致；「看不见」时冻结页面动画
+/// （rAF 停住，最后一帧留在屏上，切回来无缝，2026-11-09）。
+static WINDOW_VISIBLE: AtomicBool = AtomicBool::new(true);
+
+pub fn window_visible() -> bool {
+    WINDOW_VISIBLE.load(Ordering::Relaxed)
+}
+
+fn set_window_visible(v: bool) {
+    WINDOW_VISIBLE.store(v, Ordering::Relaxed);
 }
 
 /// 手动禁用 shell 模式（CDP 探测失败等自愈路径；下次壳重连自动恢复）。
@@ -109,10 +125,27 @@ pub fn start_listener() {
                     match r.read_line(&mut line).await {
                         Ok(0) => break,
                         Ok(_) => {
-                            if let Ok(v) = serde_json::from_str::<Value>(line.trim())
-                                && v.get("op").and_then(Value::as_str) == Some("hello")
-                            {
-                                crate::observability::debug(&format!("[shell] 壳 hello: {}", line.trim()));
+                            if let Ok(v) = serde_json::from_str::<Value>(line.trim()) {
+                                match v.get("op").and_then(Value::as_str) {
+                                    Some("hello") => {
+                                        crate::observability::debug(&format!("[shell] 壳 hello: {}", line.trim()));
+                                    }
+                                    // 壳窗口可见性变化（被完全遮挡/最小化 ↔ 露出来了）：
+                                    // 立即冻结/恢复页面动画（不等 5s 巡检），语义见 WINDOW_VISIBLE。
+                                    Some("focus") => {
+                                        let visible = v.get("focused").and_then(Value::as_bool).unwrap_or(true);
+                                        set_window_visible(visible);
+                                        crate::observability::debug(&format!("[shell] 窗口可见 visible={visible}"));
+                                        let session = {
+                                            let g = super::SESSION.lock().await;
+                                            g.clone()
+                                        };
+                                        if let Some(s) = session {
+                                            super::sweep_session(&s).await;
+                                        }
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
                         Err(_) => break,

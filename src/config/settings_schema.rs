@@ -167,6 +167,24 @@ pub const SCHEMA: &[SchemaEntry] = &[
         desc: "各协议 thinking 字段形态覆盖；旧词表别名自动映射",
     },
     SchemaEntry {
+        path: "protocol",
+        label: "API 格式",
+        ty: "string",
+        enum_values: &["openai", "anthropic", "responses"],
+        default: Some("未设置时按端点特征推初值"),
+        risk: "normal",
+        desc: "API 格式：openai=Chat Completions、anthropic=Anthropic Messages、responses=OpenAI Responses",
+    },
+    SchemaEntry {
+        path: "auto_suffix",
+        label: "自动补后缀",
+        ty: "bool",
+        enum_values: &[],
+        default: Some("true"),
+        risk: "normal",
+        desc: "勾=按惯例补 /v1/messages、/chat/completions、/v1/responses；不勾=Base URL 即最终地址原样直发",
+    },
+    SchemaEntry {
         path: "capabilities",
         label: "模型能力标记",
         ty: "object",
@@ -182,7 +200,7 @@ pub const SCHEMA: &[SchemaEntry] = &[
         enum_values: &[],
         default: None,
         risk: "normal",
-        desc: "摘要/标题/多模态/降级链的专用配置名映射。逐字段改优先用点号路径 roles.<字段>",
+        desc: "摘要/多模态/嵌入/降级链/子代理的专用配置名映射。逐字段改优先用点号路径 roles.<字段>；整表写按键合并（不带的字段保留现状），清空 fallbacks 用点号路径",
     },
     SchemaEntry {
         path: "features",
@@ -237,7 +255,7 @@ pub const SCHEMA: &[SchemaEntry] = &[
         enum_values: &[],
         default: Some("true"),
         risk: "normal",
-        desc: "关=摘要/标题/嵌入/多模态/子代理/预算降级全部回主渠道或默认退化",
+        desc: "关=摘要/嵌入/多模态/子代理/预算降级全部回主渠道或默认退化",
     },
     SchemaEntry {
         path: "features.css_tool",

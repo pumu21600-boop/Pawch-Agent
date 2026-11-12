@@ -15,7 +15,6 @@
     msg = '';
     err = '';
   }
-  let withCache = false;
   let installInput = '';
   let dataInput = '';
   // 迁移/导入完成后的旧目录清理弹窗：{ install, data, kind: 'migrate'|'import' }
@@ -115,7 +114,9 @@
       const r = await api('/api/data/migrate', {
         install_dir: installInput.trim(),
         data_dir: dataInput.trim(),
-        include_cache: withCache,
+        // 迁移固定带缓存（2026-11-12 用户拍板，勾选框已去掉）：缓存不迁过去
+        // 到新目录还得重建（模型缓存/会话索引等），迁移完直接可用
+        include_cache: true,
       });
       if (!r.restarting) {
         msg = '已复制完成，但自动重启失败，请手动重启 Pawch 后生效。';
@@ -197,7 +198,8 @@
     err = '';
     try {
       busy = 'export';
-      const r = await api('/api/data/export', { include_cache: withCache });
+      // 导出维持不带缓存（原勾选框默认态）：备份 zip 装 85MB 可再生的缓存只会虚胖
+      const r = await api('/api/data/export', { include_cache: false });
       if (r.cancelled) return;
       msg = `已导出 ${r.files} 个文件到 ${r.path}（${fmtBytes(r.zip_bytes)}）。`;
     } catch (e) {
@@ -252,7 +254,9 @@
         <button class="icon-btn" title="选择目录" aria-label="选择目录" on:click={() => pick('install')}>
           <svg class="ic" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M3 7.5A1.5 1.5 0 0 1 4.5 6h4.6l2 2h8.4A1.5 1.5 0 0 1 21 9.5v8A1.5 1.5 0 0 1 19.5 19h-15A1.5 1.5 0 0 1 3 17.5v-10z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" /></svg>
         </button>
-        <button class="open-btn" title="打开目录" on:click={() => openDir('install')}>打开</button>
+        <button class="icon-btn" title="打开目录" aria-label="打开目录" on:click={() => openDir('install')}>
+          <svg class="ic" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6"/><path d="M20 4 10 14"/><path d="M20 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h5"/></svg>
+        </button>
       </div>
     </div>
 
@@ -263,7 +267,9 @@
         <button class="icon-btn" title="选择目录" aria-label="选择目录" on:click={() => pick('data')}>
           <svg class="ic" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M3 7.5A1.5 1.5 0 0 1 4.5 6h4.6l2 2h8.4A1.5 1.5 0 0 1 21 9.5v8A1.5 1.5 0 0 1 19.5 19h-15A1.5 1.5 0 0 1 3 17.5v-10z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" /></svg>
         </button>
-        <button class="open-btn" title="打开目录" on:click={() => openDir('data')}>打开</button>
+        <button class="icon-btn" title="打开目录" aria-label="打开目录" on:click={() => openDir('data')}>
+          <svg class="ic" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6"/><path d="M20 4 10 14"/><path d="M20 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h5"/></svg>
+        </button>
       </div>
     </div>
 
@@ -271,7 +277,6 @@
       <button class="btn primary" disabled={!canMigrate} on:click={doMigrate}>
         {busy === 'migrate' ? '迁移中…' : '迁移'}
       </button>
-      <label class="cache-opt"><input type="checkbox" bind:checked={withCache} /> 连缓存一起</label>
       {#if info}
         <span class="size-note">数据 {fmtBytes(info.data_bytes)} · 缓存 {fmtBytes(info.cache_bytes)}</span>
       {/if}
@@ -325,11 +330,9 @@
 
 <style>
   .data-card {
-    border: 1px solid var(--line);
-    border-radius: 12px;
     padding: 14px 16px;
     margin-bottom: 14px;
-    background: var(--bg1);
+    /* 不描边（2026-11-12 用户：页面只加目录行两个框，别的不框） */
   }
   .path-field {
     margin-bottom: 12px;
@@ -341,36 +344,38 @@
     margin-bottom: 6px;
   }
   .path-input {
+    /* 行级框（2026-11-12 用户标注）：一行一个框，输入框+两个图标一起框住，
+       图标不单独带框；数值=技能页 plug-row 同款（1.5px --g3、圆角 10px） */
     display: flex;
     align-items: center;
     gap: 6px;
+    padding: 9px 12px;
+    border: 1.5px solid var(--g3);
+    border-radius: 10px;
+    background: transparent;
   }
   .path-input input {
     flex: 1;
     min-width: 0;
-    height: 34px;
-    padding: 0 10px;
+    height: 24px;
+    padding: 0 4px;
     font-size: 13px;
     color: var(--g6);
-    background: var(--bg2);
-    border: 1px solid var(--line);
-    border-radius: 8px;
+    background: transparent;
+    border: none;
     outline: none;
   }
-  .path-input input:focus {
-    border-color: var(--brand);
-  }
   .icon-btn {
-    width: 34px;
-    height: 34px;
+    width: 30px;
+    height: 30px;
     flex: none;
     display: inline-flex;
     align-items: center;
     justify-content: center;
     font-size: 15px;
     color: var(--g5);
-    background: var(--bg2);
-    border: 1px solid var(--line);
+    background: transparent;
+    border: none;
     border-radius: 8px;
     cursor: pointer;
   }
@@ -378,23 +383,8 @@
     display: block;
   }
   .icon-btn:hover {
-    color: var(--brand-text);
-    border-color: var(--brand);
-  }
-  .open-btn {
-    height: 34px;
-    padding: 0 12px;
-    flex: none;
-    font-size: 12.5px;
-    color: var(--g5);
-    background: var(--bg2);
-    border: 1px solid var(--line);
-    border-radius: 8px;
-    cursor: pointer;
-  }
-  .open-btn:hover {
-    color: var(--brand-text);
-    border-color: var(--brand);
+    /* 无框：hover 只提亮（品牌橙不进设置弹窗，v2 口径） */
+    color: var(--g7);
   }
   .field-title {
     font-size: 13px;
@@ -416,20 +406,12 @@
     height: 6px;
     border-radius: 4px;
     background: var(--g2);
-    border: 1px solid var(--line);
     overflow: hidden;
   }
   .prog-fill {
     height: 100%;
     background: linear-gradient(90deg, var(--brand), var(--brand-deep));
     transition: width 0.3s ease;
-  }
-  .cache-opt {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 13px;
-    color: var(--g5);
   }
   .data-msg {
     margin-top: 6px;
@@ -458,8 +440,7 @@
     margin-top: 6px;
     padding: 6px 8px;
     border-radius: 6px;
-    background: var(--bg2);
-    border: 1px solid var(--line);
+    background: var(--g2);
     overflow-wrap: anywhere;
   }
   .cleanup-note {

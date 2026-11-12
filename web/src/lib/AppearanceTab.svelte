@@ -6,6 +6,10 @@
   // 微调引擎的全局右键都挂在根上），这里只做设置分区的界面半边
   export let themeMode = 'dark';
   export let applyThemeMode = () => {};
+  // 选中态口径（2026-11-12 用户拍板）：hl=文字高亮（默认）/ bg=背景高亮。
+  // 全部选中态样式只引用 --sel-fg/--sel-bg，这里切换根元素 data-sel
+  export let selStyle = 'hl';
+  export let applySelStyle = () => {};
   export let wallpaper = '';
   export let wallpaperOpacity = 30;
   export let wallpaperMsg = '';
@@ -30,6 +34,13 @@
       <button class="theme-opt" class:active={themeMode === 'dark'} on:click={() => applyThemeMode('dark')}>深色</button>
       <button class="theme-opt" class:active={themeMode === 'light'} on:click={() => applyThemeMode('light')}>浅色</button>
       <button class="theme-opt" class:active={themeMode === 'system'} on:click={() => applyThemeMode('system')}>跟随系统</button>
+    </div>
+  </div>
+  <div class="field">
+    <label>选中样式</label>
+    <div class="theme-opts">
+      <button class="theme-opt" class:active={selStyle === 'hl'} on:click={() => applySelStyle('hl')}>文字高亮</button>
+      <button class="theme-opt" class:active={selStyle === 'bg'} on:click={() => applySelStyle('bg')}>背景高亮</button>
     </div>
   </div>
   <div class="field">
@@ -115,9 +126,10 @@
     border-color: var(--g4);
   }
   .theme-opt.active {
-    background: var(--g3);
-    border-color: var(--g5);
-    color: var(--g7);
+    /* 本页选项钮选中：橙字 + 浅橙描边（2026-11-12 用户拍板：这里的选中态要有描边） */
+    background: var(--sel-bg);
+    border-color: var(--sel-line);
+    color: var(--sel-fg);
     font-weight: 650;
   }
   .exp-badge {
@@ -168,7 +180,7 @@
     font-family: Consolas, 'Courier New', monospace;
     font-size: 12.5px;
     line-height: 1.7;
-    background: var(--g1);
+    background: transparent; /* 描边无底色（2026-11-11 设置统一样式） */
     color: var(--g7);
     border: 1px solid var(--g3);
     border-radius: 8px;

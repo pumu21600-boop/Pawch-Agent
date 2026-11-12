@@ -68,15 +68,17 @@ mod tests {
     #[test]
     fn presets_parse_with_thinking_format() {
         let ps = load_test();
-        // 预设收敛：OpenAI 兼容 / Anthropic / DeepSeek / StepFun / GLM 五个。
-        // 被移除的旧预设 id 的契约知识保留在 compat 端点探测里，老渠道照常工作。
-        assert_eq!(ps.len(), 5, "预设收敛后应是五个，实际 {}", ps.len());
-        for id in ["openai_compat", "anthropic", "deepseek", "stepfun", "zhipu"] {
+        // 预设收敛：自定义（openai_compat）/ DeepSeek / StepFun / GLM 四个（2026-11-11：
+        // 「OpenAI 兼容」与「Anthropic 兼容」合并为「自定义供应商」，协议交给「API 格式」三选）。
+        // 被移除的旧预设 id（anthropic 等）的契约知识保留在 compat 端点探测里，老渠道照常工作。
+        // 协议不再由预设决定：配置里另有显式 protocol 字段（openai/anthropic/responses）。
+        assert_eq!(ps.len(), 4, "预设收敛后应是四个，实际 {}", ps.len());
+        for id in ["openai_compat", "deepseek", "stepfun", "zhipu"] {
             assert!(ps.iter().any(|p| p.id == id), "缺预设 {id}");
         }
-        // OpenAI 兼容（自定义端点）key 可空（覆盖本地推理服务等无 key 场景），其余四家必填
+        // 自定义（原 OpenAI 兼容）key 可空（覆盖本地推理服务等无 key 场景），其余必填
         assert!(ps.iter().find(|p| p.id == "openai_compat").unwrap().key_optional);
-        for required in ["anthropic", "deepseek", "stepfun", "zhipu"] {
+        for required in ["deepseek", "stepfun", "zhipu"] {
             assert!(
                 !ps.iter().find(|p| p.id == required).unwrap().key_optional,
                 "{required} 应 key 必填"

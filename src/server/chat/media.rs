@@ -269,6 +269,14 @@ impl MediaAttachment {
         }
     }
 
+    /// 解码后字节数（base64 长度换算，只给界面显示「多大」用，不做校验）
+    pub fn decoded_len(&self) -> usize {
+        let b = self.raw_base64();
+        let n = b.as_bytes();
+        let pad = n.iter().rev().take_while(|&&c| c == b'=').count();
+        (n.len() / 4) * 3 - pad.min(2)
+    }
+
     pub fn effective_mime(&self) -> String {
         if !self.mime.is_empty() && self.mime != "application/octet-stream" {
             return self.mime.clone();

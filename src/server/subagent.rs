@@ -290,13 +290,19 @@ impl SubagentDispatcher {
         }
         // 派发模型模式：显式 model 参数永远优先；parent=跟随父对话，custom=专用配置
         // （旧设置里可能残留的 ask 档已下线，按 parent 走）。
+        // 2026-11-10：功能桥接总开关关闭 = 默认退化回 parent；残留的 custom 值
+        // 不再生效（否则子代理会无视父轮请求级模型覆盖，与「关=回主渠道」不符）。
         let dispatch_mode = {
             let s = self.state.settings.read().unwrap_or_else(|e| e.into_inner());
-            s.roles
-                .as_ref()
-                .and_then(|r| r.subagent_mode.as_deref())
-                .unwrap_or("parent")
-                .to_string()
+            if !s.features.roles {
+                "parent".to_string()
+            } else {
+                s.roles
+                    .as_ref()
+                    .and_then(|r| r.subagent_mode.as_deref())
+                    .unwrap_or("parent")
+                    .to_string()
+            }
         };
         // 派发 id 提前发号：排队/spawned/done/取消全生命周期共用（前端实时条按它聚合）
         let dispatch_id = uuid::Uuid::new_v4().simple().to_string();
@@ -390,6 +396,9 @@ impl SubagentDispatcher {
         // subagent_mode 两档（parent=父任务当前轮的三元组，空则激活配置兜底；
         // custom=roles.subagent 席位 B3 链）
         let (mut model, mut base_url, mut api_key) = (String::new(), String::new(), String::new());
+        // 席位解析失败的人话提示：随结果带回父轮（原实现静默落回主渠道，用户以为
+        // 专用渠道在跑；2026-11-10 审查）。
+        let mut seat_notice: Option<String> = None;
         if !args.model.trim().is_empty() {
             // 请求级覆盖：只换模型，渠道仍走激活配置（与 /api/chat 请求级覆盖同义）
             model = args.model.trim().to_string();
@@ -404,12 +413,19 @@ impl SubagentDispatcher {
             } else {
                 None
             };
-            if let Some(name) = role_name
-                && let Some(ch) = find_channel(&s, name)
-            {
-                model = ch.model.clone();
-                base_url = ch.base_url.clone();
-                api_key = ch.api_key.clone();
+            if let Some(name) = role_name {
+                match find_channel(&s, name) {
+                    Some(ch) => {
+                        model = ch.model.clone();
+                        base_url = ch.base_url.clone();
+                        api_key = ch.api_key.clone();
+                    }
+                    None => {
+                        seat_notice = Some(format!(
+                            "子代理席位配置「{name}」解析失败（配置名不存在或地址为空），本轮回落主渠道"
+                        ));
+                    }
+                }
             }
             // 未配置席位：三项留空 → 无头会话用激活配置（主渠道）
         } else {
@@ -526,7 +542,11 @@ impl SubagentDispatcher {
         );
         match result {
             Ok(r) => format!(
-                "[子代理结果·{}] 状态 {} · 用时 {:.1}s · 输入 token {}\n{}",
+                "{}[子代理结果·{}] 状态 {} · 用时 {:.1}s · 输入 token {}\n{}",
+                seat_notice
+                    .as_deref()
+                    .map(|n| format!("（{n}）\n"))
+                    .unwrap_or_default(),
                 label,
                 r.status,
                 r.duration_ms as f64 / 1000.0,

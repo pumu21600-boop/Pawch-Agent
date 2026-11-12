@@ -458,6 +458,41 @@ fn persist_notice(msgs: &mut Vec<Value>, on_event: &(impl Fn(AgentEvent) + Send 
     on_event(AgentEvent::Snapshot { messages: snapshot_msgs(msgs) });
 }
 
+/// 思考回放元数据挂到 assistant 消息上：思考块序列（Anthropic thinking/redacted、
+/// Responses reasoning 条目）/ 签名 / 加密条目，并记下产出它的模型与端点来源——
+/// 回放侧只对同模型、同端点生效（签名/加密内容换端点也对不上；旧消息无来源时
+/// 退回模型名守卫）。
+fn attach_reasoning_replay(
+    m: &mut Value,
+    turn: &crate::gateway::AssistantTurn,
+    model: &str,
+    source: Option<&str>,
+) {
+    let has_blocks = !turn.reasoning_blocks.is_empty();
+    if turn.reasoning.is_empty() && !has_blocks {
+        return;
+    }
+    let mut stored = false;
+    if has_blocks {
+        m["reasoning_blocks"] = json!(turn.reasoning_blocks);
+        stored = true;
+    }
+    if let Some(sig) = &turn.reasoning_signature {
+        m["reasoning_signature"] = json!(sig);
+        stored = true;
+    }
+    if let Some(enc) = &turn.reasoning_encrypted {
+        m["reasoning_encrypted"] = json!(enc);
+        stored = true;
+    }
+    if stored {
+        m["reasoning_model"] = json!(model);
+        if let Some(s) = source {
+            m["reasoning_source"] = json!(s);
+        }
+    }
+}
+
 /// 实时转发 + 持久化（绝大多数通知走这个）。
 fn emit_notice(msgs: &mut Vec<Value>, on_event: &(impl Fn(AgentEvent) + Send + Sync), text: String) {
     on_event(AgentEvent::Notice(text.clone()));
@@ -477,7 +512,7 @@ fn emit_context_usage(
     msgs: &[Value],
     anchor: Option<(u64, u64)>,
     tools_schema_tokens: u64,
-    count_reasoning: bool,
+    count_reasoning: context::ReasoningCount,
     window: u64,
     on_event: &(impl Fn(AgentEvent) + Send + Sync),
 ) -> context::Breakdown {
@@ -505,7 +540,7 @@ fn report_api_usage(
     turn: &crate::gateway::AssistantTurn,
     est_at_request: u64,
     tools_schema_tokens: u64,
-    count_reasoning: bool,
+    count_reasoning: context::ReasoningCount,
     anchor: &mut Option<(u64, u64)>,
     on_event: &(impl Fn(AgentEvent) + Send + Sync),
 ) {
@@ -628,18 +663,18 @@ pub async fn run_task(
     // 否则比真实用量少一大截（实测：估算 1866 vs 实际 4750，差额≈工具 Schema）
     let tools_schema_tokens =
         tools_def.as_ref().map(|d| context::estimate_tokens(&d.to_string())).unwrap_or(0);
-    // 估算/裁剪是否计入思考，跟随回放判定：DeepSeek/zai 契约与白名单模型每轮把思考
-    // 重发进 prompt，本地预算必须看见；剥离渠道思考不进上下文、不计入（
-    // 2026-10-01：切勿对所有模型一律计入，否则剥离渠道会被过度裁剪）。
+    // 估算/裁剪是否计入思考，跟随「真会回放进请求」的口径：Anthropic/Responses 只计
+    // 带签名/加密条目的思考（2026-11-11 起真回放）；Chat Completions 按渠道契约。
     // 注：降级/备用渠道若契约不同会有偏差，以主渠道为准（裁剪本就是启发式）
     let count_reasoning = {
-        let compat = crate::gateway::compat::resolve(
+        let compat = crate::gateway::compat::resolve_with_protocol(
             primary.params.provider_id.as_deref(),
             Some(primary.base_url.trim()),
             &primary.model,
             primary.params.thinking_format,
+            primary.params.protocol,
         );
-        crate::gateway::replay::should_preserve_replay(&primary.model, &compat)
+        crate::gateway::replay::reasoning_count(&compat, &primary.model)
     };
     // 占用锚点（对齐 DSH token-meter）：`(渠道实报 prompt_tokens, 那次请求发出时的本地估价)`。
     // 圆环 = 实报 + 自锚点以来的带符号增量，所以「回复落地即进上下文」「工具结果回填」
@@ -751,6 +786,20 @@ pub async fn run_task(
         .await;
         // 本步模型调用耗时（中间步骤消息的 step_ms）
         let call_ms = call_started.elapsed().as_millis() as u64;
+        // 本步实际成功的渠道（降级链取成功那个）：消息信息卡与思考回放来源都用它
+        let used_model = used_channel
+            .as_ref()
+            .map(|c| c.model.clone())
+            .unwrap_or_else(|| primary.model.clone());
+        // 本条回答的思考回放来源（协议+最终端点+模型）：随消息落盘，回放侧比对。
+        // 用最终 URL 而不是配置里的 base_url——同一端点的不同写法（根 vs /v1、
+        // 结尾斜杠）不该让历史回放失效。
+        let reasoning_source = used_channel.as_ref().map(|c| {
+            let proto = crate::gateway::channel_protocol(&c.params, &c.base_url, &c.model);
+            let endpoint =
+                crate::gateway::Gateway::endpoint_url_with(&c.base_url, proto, c.params.suffix_auto);
+            crate::gateway::replay::source_tag(proto, &endpoint, &c.model)
+        });
         if matches!(&outcome, Ok(ChatOutcome::Cancelled(_))) {
             // 取消收尾：半截回答**落地**（有内容才落；tool_calls 已在网关侧清空）。
             // 立即发送=停轮重启，被打断那轮的执行过程是真实发生过的工作——不落地的
@@ -760,8 +809,11 @@ pub async fn run_task(
                 && (!t.content.trim().is_empty() || !t.reasoning.trim().is_empty())
             {
                 let mut m = json!({ "role": "assistant", "content": t.content, "ts": now_ms() });
-                if !t.reasoning.trim().is_empty() {
-                    m["reasoning_content"] = json!(t.reasoning);
+                if !t.reasoning.trim().is_empty() || !t.reasoning_blocks.is_empty() {
+                    if !t.reasoning.trim().is_empty() {
+                        m["reasoning_content"] = json!(t.reasoning);
+                    }
+                    attach_reasoning_replay(&mut m, t, &used_model, reasoning_source.as_deref());
                 }
                 msgs.push(m);
             }
@@ -797,16 +849,15 @@ pub async fn run_task(
         // 消息信息卡数据（2026-10-26）：本步实际用的渠道（降级链取成功那个）+ 流式计时。
         // 随 assistant 消息落 stats 进会话文件（刷新/切回还能看），TurnStats 事件转前端
         // 给正在流式的那条气泡实时挂上（server 层再补配置名）。
-        let used_model = used_channel
-            .as_ref()
-            .map(|c| c.model.clone())
-            .unwrap_or_else(|| primary.model.clone());
         let used_provider = used_channel
             .as_ref()
             .and_then(|c| c.params.provider_id.clone())
             .or_else(|| primary.params.provider_id.clone());
         let turn_stats = json!({
             "ttft_ms": turn.ttft_ms(call_started),
+            // 生成窗口（首包→流结束，含思考与工具参数）：信息卡的输出耗时与速度都用它，
+            // 与台账 completion_tokens 同口径（gen_ms 只算正文，不能当速度分母）
+            "decode_ms": turn.decode_ms(),
             "gen_ms": turn.gen_ms(),
             "completion_tokens": turn.completion_tokens,
             "prompt_tokens": turn.prompt_tokens,
@@ -890,8 +941,11 @@ pub async fn run_task(
             // 顺带落时长：「工作用时」（整轮）与「思考 · 持续了」
             // （本步 reasoning 分片首尾差）——刷新/切回会话后这两个数字还在
             let mut final_msg = json!({ "role": "assistant", "content": final_text, "ts": now_ms() });
-            if !turn.reasoning.is_empty() {
-                final_msg["reasoning_content"] = json!(turn.reasoning);
+            if !turn.reasoning.is_empty() || !turn.reasoning_blocks.is_empty() {
+                if !turn.reasoning.is_empty() {
+                    final_msg["reasoning_content"] = json!(turn.reasoning);
+                }
+                attach_reasoning_replay(&mut final_msg, &turn, &used_model, reasoning_source.as_deref());
             }
             final_msg["work_ms"] = json!(task_started.elapsed().as_millis() as u64);
             final_msg["stats"] = turn_stats.clone();
@@ -984,11 +1038,14 @@ pub async fn run_task(
             "ts": now_ms(),
             "stats": turn_stats.clone(),
         });
-        if !turn.reasoning.is_empty()
+        if (!turn.reasoning.is_empty() || !turn.reasoning_blocks.is_empty())
             && primary.params.thinking.as_deref() != Some("off")
         {
             // 思考=关时不落 reasoning_content——否则刷新/切回会话又从历史里显示出来
-            asst_msg["reasoning_content"] = json!(turn.reasoning);
+            if !turn.reasoning.is_empty() {
+                asst_msg["reasoning_content"] = json!(turn.reasoning);
+            }
+            attach_reasoning_replay(&mut asst_msg, &turn, &used_model, reasoning_source.as_deref());
         }
         // 中间步骤也带上时长（思考持续 + 本步耗时）：刷新后每一步的气泡也能显示
         asst_msg["step_ms"] = json!(call_ms);

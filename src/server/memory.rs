@@ -152,9 +152,31 @@ pub(crate) async fn build_library(state: &AppState, force: bool) -> Value {
         .collect();
     let indexed = lib.entries.iter().filter(|e| !e.vec.is_empty()).count();
     let mem = state.memory.read().unwrap_or_else(|e| e.into_inner()).clone();
+    // 自动记忆（profile.md 条目）：星图里单独一组「自动记忆」，一条一个星点。
+    // 会话索引只覆盖会话，自动记忆是另一份数据源（按条读，不走向量索引）；
+    // 条目 id 带序号，条目按文件顺序稳定（行级增删，顺序即用户看到的样子）。
+    let auto_entries: Vec<Value> = mem
+        .profile()
+        .entries()
+        .into_iter()
+        .enumerate()
+        .map(|(i, (section, e))| {
+            json!({
+                "id": format!("auto:{i}"),
+                "text": e.text,
+                "section": section.label(),
+                "src": e.src,
+                "date": e.date,
+                "hits": e.hits,
+                "status": e.status,
+            })
+        })
+        .collect();
+    let auto_count = auto_entries.len();
     json!({
         "items": items,
         "projects": projects,
+        "auto_memory": { "entries": auto_entries, "count": auto_count },
         "stats": {
             "sessions": lib.entries.len(),
             "projects": projects.len(),

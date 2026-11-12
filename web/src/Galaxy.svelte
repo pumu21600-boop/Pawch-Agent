@@ -30,13 +30,21 @@
   let errMsg = '';
   let notice = '';
   let items = [];
+  let autoEntries = [];
   let stats = null;
+  // 自动记忆在星图里的星座名（与项目并列展示，但单独一组、排在项目列表下面）
+  const AUTO_CLUSTER = '自动记忆';
 
   // 场景
   let clusters = [];
   let stars = [];
   let starById = new Map();
   let clusterByName = new Map();
+  // 项目列表（不含自动记忆）+ 自动记忆单独一组（排在项目列表下面）
+  let projClusters = [];
+  let autoCluster = null;
+  $: projClusters = clusters.filter((c) => c.name !== AUTO_CLUSTER);
+  $: autoCluster = clusters.find((c) => c.name === AUTO_CLUSTER) || null;
   let bounds = { minX: 0, maxX: 0, minY: 0, maxY: 0 };
   let dust = [];
   let sprites = new Map();
@@ -288,6 +296,28 @@
   const MODE_LABEL = (m, model) =>
     m === 'external' ? `向量检索 · ${model}` : m === 'local' ? '本地检索（未配置嵌入渠道）' : '关键词检索';
 
+  // 自动记忆条目 → 星点：一条一个星，title 就是条目正文。
+  // updated_at 用首次记录日期（星点亮度按「多新」走）；count 放 hits（卡片展示用）。
+  function toAutoItem(e) {
+    return {
+      id: e.id,
+      title: e.text,
+      project: AUTO_CLUSTER,
+      workspace: '',
+      created_at: e.date,
+      updated_at: e.date,
+      count: e.hits || 1,
+      chars: (e.text || '').length,
+      snippet: e.text,
+      pinned: false,
+      auto: true,
+      section: e.section || '',
+      src: e.src || '',
+      hits: e.hits || 1,
+      status: e.status || '',
+    };
+  }
+
   async function load(force = false) {
     loading = true;
     errMsg = '';
@@ -297,7 +327,8 @@
       });
       const d = await r.json();
       if (destroyed) return;
-      items = d.items || [];
+      autoEntries = (d.auto_memory && d.auto_memory.entries) || [];
+      items = [...(d.items || []), ...autoEntries.map(toAutoItem)];
       stats = d.stats || null;
       notice = d.notice || '';
       rebuild();
@@ -395,7 +426,7 @@
     searched = false;
     results = [];
     selected = null;
-    searchInfo = `${c.name} · ${c.count} 个会话`;
+    searchInfo = c.name === AUTO_CLUSTER ? `${c.name} · ${c.count} 条` : `${c.name} · ${c.count} 个会话`;
     fitToStars(c.stars, 1.5);
   }
 
@@ -820,7 +851,7 @@
     <div class="gx-title">
       <span class="gx-mark" aria-hidden="true"></span>
       <b>记忆库</b>
-      <span class="gx-sub">{stats ? `${stats.sessions} 个会话 · ${stats.projects} 个项目` : ''}</span>
+      <span class="gx-sub">{stats ? `${stats.sessions} 个会话 · ${stats.projects} 个项目` : ''}{autoEntries.length ? ` · ${autoEntries.length} 条自动记忆` : ''}</span>
     </div>
     <div class="gx-search">
       <input
@@ -849,22 +880,35 @@
     </div>
   </header>
 
-  {#if clusters.length}
+  {#if projClusters.length || autoCluster}
     <aside class="gx-rail" aria-label="项目列表">
       <div class="gx-rail-head">
-        <span>项目</span>
+        <span>{projClusters.length ? '项目' : '记忆'}</span>
         {#if matchIds}
           <button class="gx-mini" on:click={clearSearch}>显示全部</button>
         {/if}
       </div>
       <div class="gx-rail-list">
-        {#each clusters as c (c.name)}
+        {#each projClusters as c (c.name)}
           <button class="gx-proj" class:on={focusProj === c.name} on:click={() => pickProject(c)} title={`只看「${c.name}」的会话`}>
             <span class="gx-dot" style="background:{c.color};box-shadow:0 0 8px {c.color}"></span>
             <span class="gx-proj-name">{c.name}</span>
             <span class="gx-count">{c.count}</span>
           </button>
         {/each}
+        {#if autoCluster}
+          {#if projClusters.length}<div class="gx-rail-sep"></div>{/if}
+          <button
+            class="gx-proj gx-auto"
+            class:on={focusProj === autoCluster.name}
+            on:click={() => pickProject(autoCluster)}
+            title={`只看自动记忆（${autoCluster.count} 条，一条一个星点）`}
+          >
+            <span class="gx-dot" style="background:{autoCluster.color};box-shadow:0 0 8px {autoCluster.color}"></span>
+            <span class="gx-proj-name">自动记忆</span>
+            <span class="gx-count">{autoCluster.count}</span>
+          </button>
+        {/if}
       </div>
     </aside>
   {/if}
@@ -905,15 +949,24 @@
     {#if selected}
       <aside class="gx-card">
         <div class="gx-card-title">{selected.title}</div>
-        <div class="gx-card-meta">
-          {selected.project} · {relTime(selected.updated_at)} · {selected.count} 条消息{#if selected.archived} · 已归档{/if}
-        </div>
-        <div class="gx-card-snip">{selected.snippet || '（这条会话还没有摘要）'}</div>
-        <div class="gx-card-actions">
-          <button class="gx-btn primary" on:click={() => openNode(selected)}>打开会话</button>
-          <button class="gx-btn" on:click={doSimilar} disabled={searching} title="用向量找和这条会话相近的记忆">相似会话</button>
-          <button class="gx-btn ghost" on:click={() => (selected = null)}>关闭</button>
-        </div>
+        {#if selected.auto}
+          <div class="gx-card-meta">
+            {selected.section}{#if selected.src} · {selected.src}{/if}{#if selected.date} · {selected.date}{/if} · 命中 {selected.hits} 次{#if selected.status} · {selected.status}{/if}
+          </div>
+          <div class="gx-card-actions">
+            <button class="gx-btn ghost" on:click={() => (selected = null)}>关闭</button>
+          </div>
+        {:else}
+          <div class="gx-card-meta">
+            {selected.project} · {relTime(selected.updated_at)} · {selected.count} 条消息{#if selected.archived} · 已归档{/if}
+          </div>
+          <div class="gx-card-snip">{selected.snippet || '（这条会话还没有摘要）'}</div>
+          <div class="gx-card-actions">
+            <button class="gx-btn primary" on:click={() => openNode(selected)}>打开会话</button>
+            <button class="gx-btn" on:click={doSimilar} disabled={searching} title="用向量找和这条会话相近的记忆">相似会话</button>
+            <button class="gx-btn ghost" on:click={() => (selected = null)}>关闭</button>
+          </div>
+        {/if}
       </aside>
     {/if}
   </div>
@@ -1125,6 +1178,12 @@
     flex-direction: column;
     gap: 2px;
     overflow: auto;
+  }
+  /* 项目列表与「自动记忆」之间的分隔：一条极淡的线，不抢视觉 */
+  .gx-rail-sep {
+    height: 1px;
+    margin: 6px 8px;
+    background: var(--gx-line);
   }
   .gx-proj {
     display: flex;

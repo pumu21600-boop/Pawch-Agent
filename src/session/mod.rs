@@ -358,6 +358,19 @@ impl SessionManager {
     /// 落盘（原子写）：已存在则保留 created_at/标题/置顶/归档/工作区，否则标题取首条
     /// 用户消息、工作区记为当前工作区。summary 传 Some 才更新（None 保留旧值）。
     pub fn save(&self, id: &str, messages: &[Value], summary: Option<&str>) -> anyhow::Result<()> {
+        self.save_with_workspace(id, messages, summary, None)
+    }
+
+    /// save 的显式工作区版：`workspace` 只用于**新会话**的归属目录——无头任务传
+    /// 任务工作区，不再靠改进程全局根来给会话记账（那会污染同时在跑的前台会话，
+    /// 2026-11-10 审查 P1）。已存在会话始终保留盘上的原 workspace。
+    pub fn save_with_workspace(
+        &self,
+        id: &str,
+        messages: &[Value],
+        summary: Option<&str>,
+        workspace: Option<&std::path::Path>,
+    ) -> anyhow::Result<()> {
         if !safe_id(id) {
             anyhow::bail!("非法 session id");
         }
@@ -393,7 +406,9 @@ impl SessionManager {
                 first_user_title(messages),
                 now.clone(),
                 None,
-                crate::tools::workspace_root().display().to_string(),
+                workspace
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| crate::tools::workspace_root().display().to_string()),
                 false,
                 None,
                 None,
@@ -619,6 +634,7 @@ impl SessionManager {
             e
         };
         f.messages.drain(start..end);
+        Self::invalidate_compact_if_anchor_gone(&mut f);
         let n = f.messages.len();
         self.write(&f)?;
         Ok(n)
@@ -690,8 +706,29 @@ impl SessionManager {
         for &i in doomed.iter().rev() {
             f.messages.remove(i);
         }
+        Self::invalidate_compact_if_anchor_gone(&mut f);
         self.write(&f)?;
         Ok(n)
+    }
+
+    /// 压缩锚点（尾段起点/被压段末条/末尾锚）被删或回滚掉时：作废压缩记录，并摘掉
+    /// 最后一条完成标记行——否则请求侧静默回退全量，屏幕却还写着「压缩后上下文 Nk」
+    /// （2026-11-10 审查）。
+    fn invalidate_compact_if_anchor_gone(f: &mut SessionFile) {
+        let Some(r) = &f.compact else { return };
+        let gone = |id: &str| {
+            !f.messages
+                .iter()
+                .any(|m| m.get("id").and_then(serde_json::Value::as_str) == Some(id))
+        };
+        if gone(&r.tail_start_id) || gone(&r.summarized_last_id) || gone(&r.after_id) {
+            f.compact = None;
+            if let Some(i) = f.messages.iter().rposition(|m| {
+                m.get("kind").and_then(serde_json::Value::as_str) == Some("compact_marker")
+            }) {
+                f.messages.remove(i);
+            }
+        }
     }
 
     /// 同项目（workspace 相同）里最近更新的一条已落盘会话，排除 current_id。
@@ -716,8 +753,12 @@ impl SessionManager {
     /// 新会话开场的「项目现状」摘要：上一条同项目会话的标题/滚动摘要 + 工作区未提交改动量。
     /// 没有任何可写事实时返回 None（不注入，避免占上下文）。
     /// `changes` = (文件数, 新增行, 删除行)，相对影子仓库最近检查点。
-    pub fn project_brief(&self, current_id: &str, changes: Option<(usize, u64, u64)>) -> Option<String> {
-        let ws = crate::tools::workspace_root();
+    pub fn project_brief(
+        &self,
+        current_id: &str,
+        changes: Option<(usize, u64, u64)>,
+        ws: &std::path::Path,
+    ) -> Option<String> {
         let ws_path = ws.display().to_string();
         let ws_name = ws.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         let mut lines: Vec<String> = Vec::new();
@@ -740,12 +781,48 @@ impl SessionManager {
         ))
     }
 
-    /// DSH 式侧边栏「分叉会话」：复制消息/摘要/工作区为新会话，标题加「（分叉）」。
+    /// 分叉会话：复制消息/摘要/工作区为新会话，标题加「（分叉）」。
+    /// `user_index = Some(n)` 时只复制到第 n 条用户消息（含）为止——消息操作条上的
+    /// 「从这条消息分叉」；None = 复制整条会话（侧栏旧行为/agent 工具仍可用）。
+    /// 附件跟着消息 JSON 原样复制（path 是工作区相对路径，同一工作区可直接读回）。
     /// 返回新会话 id；分叉不带走置顶/归档状态。
-    pub fn fork(&self, id: &str) -> anyhow::Result<String> {
+    pub fn fork(&self, id: &str, user_index: Option<usize>) -> anyhow::Result<String> {
         let Some(f) = self.get(id) else {
             anyhow::bail!("会话不存在: {id}");
         };
+        let mut messages = f.messages.clone();
+        let mut summary = f.summary.clone();
+        let mut compact = f.compact.clone();
+        if let Some(ui) = user_index {
+            let mut seen = 0usize;
+            let mut end = None;
+            for (i, m) in messages.iter().enumerate() {
+                if m.get("role").and_then(Value::as_str) == Some("user") {
+                    if seen == ui {
+                        end = Some(i + 1);
+                        break;
+                    }
+                    seen += 1;
+                }
+            }
+            let Some(end) = end else {
+                anyhow::bail!("找不到第 {ui} 条用户消息");
+            };
+            messages.truncate(end);
+            // 摘要/压缩记录只在这段前缀完整覆盖压缩边界时保留；否则摘要会把
+            // 分叉点之后的历史也带进来（跨任务延续的 summary 必须清掉）。
+            let keep_compact = compact.as_ref().is_some_and(|c| {
+                let has = |mid: &str| {
+                    messages.iter().any(|m| m.get("id").and_then(Value::as_str) == Some(mid))
+                };
+                has(&c.summarized_last_id) && has(&c.tail_start_id) && has(&c.after_id)
+            });
+            if !keep_compact {
+                summary = None;
+                compact = None;
+                messages.retain(|m| m.get("kind").and_then(Value::as_str) != Some("compact_marker"));
+            }
+        }
         let new_id = self.new_id();
         let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
         let title = format!("{}（分叉）", f.title).chars().take(60).collect();
@@ -754,15 +831,14 @@ impl SessionManager {
             title,
             created_at: now.clone(),
             updated_at: now,
-            messages: f.messages,
-            summary: f.summary,
+            messages,
+            summary,
             workspace: f.workspace,
             pinned: false,
             archived: false,
             // 分叉不带用量快照：台账记录归属原会话 id，分叉从零攒自己的账
             usage: None,
-            // 压缩记录跟着走：消息连同 id 一起复制，边界锚点在分叉里仍然有效
-            compact: f.compact,
+            compact,
         };
         self.write(&file)?;
         Ok(new_id)
@@ -1026,6 +1102,61 @@ mod tests {
     }
 
     /// 静默压缩（2026-11-07）：apply_compaction 写记录+标记行+summary；锚点没了作废；
+    /// 2026-11-10：删/回滚掉压缩锚点时必须清记录并摘标记行——否则请求侧静默回退
+    /// 全量，界面还写着「压缩后上下文 Nk」。
+    #[test]
+    fn truncating_compaction_anchor_clears_record_and_marker() {
+        let _ = crate::observability::init(
+            &std::env::temp_dir().join("agent-test-logs"),
+            "sessions.jsonl",
+            format!("session-test-{}", uuid::Uuid::new_v4()),
+        );
+        let (_d, m) = mgr("compact-anchor");
+        let f = m.create_empty("C:\\ws\\anchor", PLACEHOLDER_TITLE).unwrap();
+        m.save(
+            &f.id,
+            &[
+                json!({"role":"user","content":"q1"}),
+                json!({"role":"assistant","content":"a1"}),
+                json!({"role":"user","content":"q2"}),
+                json!({"role":"assistant","content":"a2"}),
+            ],
+            None,
+        )
+        .unwrap();
+        let saved = m.get(&f.id).unwrap();
+        let ids: Vec<String> = saved
+            .messages
+            .iter()
+            .map(|x| x.get("id").and_then(Value::as_str).unwrap_or("").to_string())
+            .collect();
+        let record = crate::compact::CompactRecord {
+            summary: "锚点测试".into(),
+            summarized_last_id: ids[1].clone(),
+            tail_start_id: ids[2].clone(),
+            after_id: ids[3].clone(),
+            pre_tokens: 90_000,
+            post_tokens: 40_000,
+            transcript_path: "C:\\logs\\transcripts\\x-001.md".into(),
+            created_at: "2026-11-10T00:00:00Z".into(),
+        };
+        let marker = crate::compact::marker_message(&crate::compact::done_marker_text(40_000));
+        assert!(m.apply_compaction(&f.id, record, marker).unwrap());
+        // 对照：删一条不在锚点上的消息（第 0 条 user）→ 记录保留
+        m.truncate(&f.id, 0, "delete_user").unwrap();
+        assert!(m.get(&f.id).unwrap().compact.is_some(), "未命中锚点不应作废");
+        // 回滚到第 2 条 user → 删掉 tail_start 及之后（含标记行）→ 记录作废
+        m.truncate(&f.id, 0, "rollback").unwrap();
+        let got = m.get(&f.id).unwrap();
+        assert!(got.compact.is_none(), "锚点没了压缩记录应作废");
+        assert!(
+            !got.messages
+                .iter()
+                .any(|x| x.get("kind").and_then(Value::as_str) == Some("compact_marker")),
+            "标记行应摘掉"
+        );
+    }
+
     /// 快照覆写不丢记录，标记行被冲掉时按记录补回。
     #[test]
     fn compaction_apply_and_persistence() {
@@ -1213,7 +1344,7 @@ mod tests {
         // 分叉：消息/摘要/工作区复制，标题加（分叉），新 id，无置顶
         m.set_flags(&a, Some(true)).unwrap();
         m.rename(&a, "原始标题").unwrap();
-        let forked = m.fork(&a).unwrap();
+        let forked = m.fork(&a, None).unwrap();
         let ff = m.get(&forked).unwrap();
         assert_eq!(ff.title, "原始标题（分叉）");
         assert_eq!(ff.messages.len(), m.get(&a).unwrap().messages.len());
@@ -1223,7 +1354,32 @@ mod tests {
 
         // 不存在的会话
         assert!(m.set_flags("ghost", Some(true)).is_err());
-        assert!(m.fork("ghost").is_err());
+        assert!(m.fork("ghost", None).is_err());
+    }
+
+    #[test]
+    fn fork_at_user_message_keeps_prefix_and_attachments() {
+        // 消息操作条的「从这条消息分叉」：复制到该条用户消息（含），附件元数据
+        // 原样跟着走，原会话不动；越界索引报错。
+        let (_d, m) = mgr("fork_at");
+        let a = m.new_id();
+        let msgs = vec![
+            json!({"id":"u1","role":"user","content":"第一问"}),
+            json!({"id":"a1","role":"assistant","content":"第一答"}),
+            json!({
+                "id":"u2","role":"user","content":"第二问",
+                "attachments":[{"name":"x.png","mime":"image/png","size":3,"path":".attachments/x.png"}]
+            }),
+            json!({"id":"a2","role":"assistant","content":"第二答"}),
+        ];
+        m.save(&a, &msgs, None).unwrap();
+        let forked = m.fork(&a, Some(1)).unwrap();
+        let ff = m.get(&forked).unwrap();
+        assert_eq!(ff.messages.len(), 3, "只复制到第二条用户消息（含），不带它的回答");
+        assert_eq!(ff.messages[2]["content"], "第二问");
+        assert_eq!(ff.messages[2]["attachments"][0]["path"], ".attachments/x.png");
+        assert_eq!(m.get(&a).unwrap().messages.len(), 4, "原会话不动");
+        assert!(m.fork(&a, Some(9)).is_err(), "越界 user_index 要报错");
     }
 
     #[test]
@@ -1280,11 +1436,12 @@ mod tests {
             format!("session-test-{}", uuid::Uuid::new_v4()),
         );
         let (_d, m) = mgr("brief");
-        let ws = crate::tools::workspace_root().display().to_string();
+        let ws_path = crate::tools::workspace_root();
+        let ws = ws_path.display().to_string();
 
         // 项目里还没有别的会话：没有可写事实 → 不注入
         let fresh = m.new_id();
-        assert!(m.project_brief(&fresh, None).is_none(), "空项目不该注入现状");
+        assert!(m.project_brief(&fresh, None, &ws_path).is_none(), "空项目不该注入现状");
 
         // 上一条会话有摘要 + 工作区有未提交改动 → 摘要里两者都要出现
         let prev = m.new_id();
@@ -1299,7 +1456,7 @@ mod tests {
         )
         .unwrap();
 
-        let brief = m.project_brief(&fresh, Some((2, 15, 4))).expect("应生成项目现状");
+        let brief = m.project_brief(&fresh, Some((2, 15, 4)), &ws_path).expect("应生成项目现状");
         assert!(brief.contains("把登录接口改成"), "带上一条会话标题（首句前 10 字）: {brief}");
         assert!(brief.contains("待补刷新逻辑"), "带上一条会话摘要: {brief}");
         assert!(brief.contains("2 个文件改动"), "带未提交改动量: {brief}");
@@ -1310,7 +1467,44 @@ mod tests {
 
         // 别的项目不算同项目
         assert!(m.previous_in_workspace("C:\\somewhere\\else", &fresh).is_none());
-        assert!(m.project_brief(&fresh, None).is_some(), "换基线仍有上一条会话可写");
+        assert!(m.project_brief(&fresh, None, &ws_path).is_some(), "换基线仍有上一条会话可写");
+    }
+
+    /// 2026-11-10 审查 P1：无头任务的新会话归属用显式传入的工作区，
+    /// 不再读（会被任务自己改写的）进程全局根；已存在会话保持不变。
+    #[test]
+    fn save_with_workspace_stamps_explicit_workspace() {
+        let _ = crate::observability::init(
+            &std::env::temp_dir().join("agent-test-logs"),
+            "sessions.jsonl",
+            format!("session-test-{}", uuid::Uuid::new_v4()),
+        );
+        let (_d, m) = mgr("ws-save");
+        let id = m.new_id();
+        let ws = std::path::PathBuf::from("C:\\tmp\\task-project");
+        m.save_with_workspace(
+            &id,
+            &[json!({"role":"user","content":"任务消息"})],
+            None,
+            Some(&ws),
+        )
+        .unwrap();
+        assert_eq!(m.get(&id).unwrap().workspace, ws.display().to_string());
+        // 后续普通 save（无显式工作区）不得改掉归属
+        m.save(
+            &id,
+            &[
+                json!({"role":"user","content":"任务消息"}),
+                json!({"role":"assistant","content":"答"}),
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            m.get(&id).unwrap().workspace,
+            ws.display().to_string(),
+            "已存在会话保留原归属"
+        );
     }
 
     #[test]

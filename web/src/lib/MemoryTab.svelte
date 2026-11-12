@@ -148,7 +148,7 @@
     font-family: Consolas, 'Courier New', monospace;
     font-size: 12.5px;
     line-height: 1.7;
-    background: var(--g1);
+    background: transparent; /* 描边无底色（2026-11-11 设置统一样式） */
     color: var(--g7);
     border: 1px solid var(--g3);
     border-radius: 8px;
@@ -174,8 +174,9 @@
     cursor: pointer;
   }
   .chip.active {
-    background: var(--g3);
-    border-color: var(--g5);
-    color: var(--g7);
+    /* 选中：橙字 + 浅橙描边（2026-11-12 用户拍板：记忆约定的选中态要有描边） */
+    background: var(--sel-bg);
+    border-color: var(--sel-line);
+    color: var(--sel-fg);
   }
 </style>

@@ -24,6 +24,7 @@ toml_edit = "0.22"
 windows-sys = { version = "0.52", features = [
   "Win32_Foundation",
   "Win32_UI_WindowsAndMessaging",
+  "Win32_Graphics_Dwm",
 ] }
 
 [profile.release]

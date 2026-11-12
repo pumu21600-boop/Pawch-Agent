@@ -6,7 +6,9 @@
     <style>
       /* 壳里置顶透明 webview 的「⋯」菜单页（P20.4 补丁四）：
          整页透明 backdrop 负责接住点击（点哪都关），只有菜单卡片是不透明的。
-         配色与 App 深色主题一致（--g1 底 / --g3 边 / --g7 字 / --g2 悬停）。 */
+         配色对齐 App 当前色板（2026-11-12）：暖黑 + 浮层玻璃（同 .bar-dropdown 的
+         --glass-float：g2 92% 半透明）、g3 描边、g7 字、g3 悬停；
+         浅色同一套暖奶油底。别再用旧的冷黑 #17171a。 */
       html,
       body {
         margin: 0;
@@ -24,8 +26,8 @@
       /* 浅色主题：主界面同一套微橙暖色（html.light 由下面脚本按 localStorage 的 theme 切，
          与宿主 App 的 resolveTheme 口径一致，system 也在这解） */
       html.light .card {
-        background: #fffefc;
-        border-color: #e7e2da;
+        background: rgba(243, 240, 235, 0.92); /* --glass-float：g2 92% 玻璃（浅），与主界面下拉菜单同档 */
+        border-color: #e7e2da; /* --g3 */
         box-shadow: 0 8px 28px rgba(15, 23, 42, 0.18);
       }
       .card {
@@ -33,10 +35,10 @@
         display: none;
         min-width: 180px;
         padding: 4px;
-        background: #17171a;
-        border: 1px solid #2c2c31;
-        border-radius: 9px;
-        box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+        background: rgba(38, 35, 32, 0.92); /* --glass-float：g2 92% 玻璃（暖黑），与主界面下拉菜单同档 */
+        border: 1px solid #332f2a; /* --g3 */
+        border-radius: 10px;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
       }
       .card.show {
         display: block;
@@ -49,37 +51,187 @@
         padding: 7px 10px;
         border: none;
         background: transparent;
-        color: #f4f5f7;
+        color: #f3f1ec; /* --g7 */
         font-size: 12.5px;
         line-height: 1;
-        border-radius: 6px;
+        border-radius: 7px;
         cursor: pointer;
         text-align: left;
       }
       .card button:hover {
-        background: #202024;
+        background: #332f2a; /* --g3 */
       }
       .card button:disabled {
-        color: #777b85;
+        color: #6e695f;
         cursor: default;
       }
       .card svg {
         width: 14px;
         height: 14px;
         flex: none;
-        color: #a7abb5;
+        color: #8a8478; /* --g5 */
       }
       html.light .card button {
-        color: #1f1d1a;
+        color: #1f1d1a; /* --g7 浅 */
       }
       html.light .card button:hover {
-        background: #f3f0eb;
+        background: #e7e2da; /* --g3 浅 */
       }
       html.light .card button:disabled {
-        color: #87827a;
+        color: #a9a49b;
       }
       html.light .card svg {
-        color: #87827a;
+        color: #87827a; /* --g5 浅 */
+      }
+      /* —— 本窗口自带的精简微调面板（2026-11-12）——
+         本页是壳里的独立浮层 webview，宿主页面的微调（改宿主 CSS）够不到它，
+         所以在这里内置一个同口径的小面板：右击元素 → 调 → 应用，规则存在
+         localStorage.menuMicro（菜单窗口专属；宿主不读也不覆盖）。 */
+      .mp {
+        position: absolute;
+        display: none;
+        width: 236px;
+        padding: 10px 10px 8px;
+        background: rgba(38, 35, 32, 0.92);
+        border: 1px solid #332f2a;
+        border-radius: 10px;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
+        color: #f3f1ec;
+        font-size: 12px;
+        z-index: 10;
+      }
+      .mp.show {
+        display: block;
+      }
+      html.light .mp {
+        background: rgba(243, 240, 235, 0.92);
+        border-color: #e7e2da;
+        color: #1f1d1a;
+        box-shadow: 0 8px 28px rgba(15, 23, 42, 0.18);
+      }
+      .mp .mp-title {
+        font-weight: 650;
+        margin-bottom: 8px;
+      }
+      .mp .mp-sel {
+        color: #8a8478;
+        font-weight: 400;
+        font-size: 11px;
+        margin-left: 6px;
+      }
+      .mp .row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin: 6px 0;
+      }
+      .mp .row label {
+        width: 58px;
+        flex: none;
+        color: #b8b3a9;
+      }
+      html.light .mp .row label {
+        color: #56524b;
+      }
+      .mp input[type='color'] {
+        width: 36px;
+        height: 22px;
+        padding: 0;
+        border: 1px solid #454039;
+        border-radius: 5px;
+        background: transparent;
+      }
+      html.light .mp input[type='color'] {
+        border-color: #d9d3c9;
+      }
+      .mp input[type='range'] {
+        flex: 1;
+        min-width: 0;
+        accent-color: #ba8a78;
+      }
+      .mp input[type='number'] {
+        width: 56px;
+        padding: 3px 6px;
+        border: 1px solid #454039;
+        border-radius: 5px;
+        background: transparent;
+        color: inherit;
+        font-size: 12px;
+        font-family: inherit;
+      }
+      html.light .mp input[type='number'] {
+        border-color: #d9d3c9;
+      }
+      .mp .val {
+        width: 42px;
+        flex: none;
+        text-align: right;
+        color: #b8b3a9;
+        font-variant-numeric: tabular-nums;
+      }
+      html.light .mp .val {
+        color: #56524b;
+      }
+      .mp .mp-acts {
+        display: flex;
+        gap: 6px;
+        margin-top: 10px;
+      }
+      /* 常态/悬停两态切换（同主界面微调） */
+      .mp .seg {
+        display: flex;
+        gap: 6px;
+        flex: 1;
+      }
+      .mp .seg button {
+        flex: 1;
+        height: 22px;
+        border-radius: 6px;
+        border: 1px solid #454039;
+        background: transparent;
+        color: #b8b3a9;
+        font-size: 11.5px;
+        font-family: inherit;
+        cursor: pointer;
+      }
+      .mp .seg button.on {
+        border-color: #ba8a78;
+        color: #c49c8d;
+        font-weight: 650;
+      }
+      html.light .mp .seg button {
+        border-color: #d9d3c9;
+        color: #56524b;
+      }
+      html.light .mp .seg button.on {
+        border-color: #ba8a78;
+        color: #a46851;
+      }
+      .mp .mp-acts button {
+        flex: 1;
+        height: 26px;
+        border-radius: 7px;
+        border: 1px solid #454039;
+        background: transparent;
+        color: #f3f1ec;
+        font-size: 12px;
+        font-family: inherit;
+        cursor: pointer;
+      }
+      .mp .mp-acts button:hover {
+        border-color: #ba8a78;
+      }
+      .mp .mp-acts button.primary {
+        border-color: #ba8a78;
+        color: #c49c8d;
+      }
+      html.light .mp .mp-acts button {
+        border-color: #d9d3c9;
+        color: #1f1d1a;
+      }
+      html.light .mp .mp-acts button.primary {
+        border-color: #ba8a78;
+        color: #a46851;
       }
     </style>
   </head>
@@ -94,6 +246,23 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a4.5 4.5 0 0 0-6 6L3 18l3 3 5.7-5.7a4.5 4.5 0 0 0 6-6L14 14l-4-4 4.7-3.7z"/></svg>
         开发者工具
       </button>
+    </div>
+    <div class="mp" id="mp">
+      <div class="mp-title">微调<span class="mp-sel" id="mp-sel"></span></div>
+      <div class="row"><label>状态</label><div class="seg"><button id="mp-normal" class="on">常态</button><button id="mp-hover">悬停</button></div></div>
+      <div class="row"><label>文字色</label><input type="color" id="mp-color" /><span class="val" id="mp-color-v"></span></div>
+      <div class="row"><label>背景色</label><input type="color" id="mp-bg" /><span class="val" id="mp-bg-v"></span></div>
+      <div class="row"><label>背景透明</label><input type="range" id="mp-op" min="0" max="100" /><span class="val" id="mp-op-v"></span></div>
+      <div class="row"><label>模糊</label><input type="range" id="mp-blur" min="0" max="30" /><span class="val" id="mp-blur-v"></span></div>
+      <div class="row"><label>圆角</label><input type="range" id="mp-radius" min="0" max="24" /><span class="val" id="mp-radius-v"></span></div>
+      <div class="row"><label>描边</label><input type="range" id="mp-border" min="0" max="4" /><span class="val" id="mp-border-v"></span></div>
+      <div class="row"><label>描边色</label><input type="color" id="mp-bcolor" /><span class="val" id="mp-bcolor-v"></span></div>
+      <div class="row"><label>字号</label><input type="number" id="mp-font" min="9" max="20" /><span class="val">px</span></div>
+      <div class="mp-acts">
+        <button class="primary" id="mp-apply">应用</button>
+        <button id="mp-reset">重置</button>
+        <button id="mp-cancel">取消</button>
+      </div>
     </div>
     <script>
       const params = new URLSearchParams(location.search);
@@ -144,9 +313,22 @@
         post('/api/browser/overlay', { open: false });
       }
 
-      backdrop.addEventListener('click', dismiss);
+      backdrop.addEventListener('click', () => {
+        // 微调面板开着时，点空白先收面板（别把整个菜单关掉，否则调一半就没得调了）
+        if (mp.classList.contains('show')) {
+          $('mp-cancel').click();
+          return;
+        }
+        dismiss();
+      });
       document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape') dismiss();
+        if (e.key === 'Escape') {
+          if (mp.classList.contains('show')) {
+            $('mp-cancel').click();
+            return;
+          }
+          dismiss();
+        }
       });
 
       btnExternal.addEventListener('click', async () => {
@@ -159,6 +341,226 @@
         await post('/api/browser/devtools', { id: anchor.tab });
         dismiss();
       });
+
+      // —— 本窗口的微调（2026-11-12）——
+      // 主界面的微调改的是宿主页面的 CSS，够不到这个独立浮层窗口；这里内置精简版：
+      // 主界面开着微调模式（localStorage.microEditMode = '1'，同源共享）时，右击菜单里的
+      // 元素弹出小面板，操作与主界面一致（实时预览 / 应用 / 重置 / 取消），规则存在
+      // localStorage.menuMicro（本窗口专属，宿主不读也不覆盖）。
+      const $ = (id) => document.getElementById(id);
+      const MICRO_KEY = 'menuMicro';
+      const mp = $('mp');
+      const editMode = (() => {
+        try { return localStorage.getItem('microEditMode') === '1'; } catch (e) { return false; }
+      })();
+      let cur = null; // { el, sel, name }
+
+      const loadRules = () => {
+        try { return JSON.parse(localStorage.getItem(MICRO_KEY) || '{}') || {}; } catch (e) { return {}; }
+      };
+      const saveRules = (r) => {
+        try { localStorage.setItem(MICRO_KEY, JSON.stringify(r)); } catch (e) {}
+      };
+      const parseColor = (c) => {
+        const m = String(c || '').match(/rgba?\(([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:[,\s/]+([\d.]+))?\)/);
+        if (!m) return null;
+        return { r: +m[1], g: +m[2], b: +m[3], a: m[4] === undefined ? 1 : +m[4] };
+      };
+      const toHex = (c) =>
+        '#' + [c.r, c.g, c.b].map((x) => Math.max(0, Math.min(255, Math.round(x))).toString(16).padStart(2, '0')).join('');
+      const withAlpha = (hex, pct) => {
+        const m = /^#([0-9a-f]{6})$/i.exec(hex || '');
+        if (!m) return hex;
+        const a = Math.max(0, Math.min(1, (pct ?? 100) / 100));
+        return `rgba(${parseInt(m[1].slice(0, 2), 16)}, ${parseInt(m[1].slice(2, 4), 16)}, ${parseInt(m[1].slice(4, 6), 16)}, ${a})`;
+      };
+      const ruleCss = (t) => {
+        if (!t || !t.sel) return '';
+        const d = [];
+        if (t.color) d.push(`color: ${t.color} !important`);
+        if (t.bg) d.push(`background-color: ${withAlpha(t.bg, t.bgOpacity ?? 100)} !important`);
+        if (t.blur) d.push(`backdrop-filter: blur(${t.blur}px) !important`);
+        if (t.radius) d.push(`border-radius: ${t.radius} !important`);
+        if (t.border) d.push(`border-style: solid !important`, `border-width: ${t.border} !important`);
+        if (t.borderColor) d.push(`border-color: ${t.borderColor} !important`);
+        if (t.fontSize) d.push(`font-size: ${t.fontSize} !important`);
+        const sel = t.sel + (t.state === 'hover' ? ':hover' : '');
+        return d.length ? `${sel} { ${d.join('; ')} }` : '';
+      };
+      function applyRules() {
+        let el = document.getElementById('pawch-menu-micro');
+        if (!el) {
+          el = document.createElement('style');
+          el.id = 'pawch-menu-micro';
+          document.head.appendChild(el);
+        }
+        const rules = loadRules();
+        // 一次性修正（2026-11-12）：早前试面板存下的「菜单卡片 背景透明 0%」会让菜单全透明；
+        // 中间又一度被实底默认顶掉。定稿=和主界面下拉菜单同一档玻璃（g2 92%，样式默认），
+        // 存量里卡片那条只删背景字段（圆角/字号/描边保留），让默认玻璃生效。只跑一次。
+        try {
+          if (!localStorage.getItem('menuMicroGlassFix')) {
+            const card = rules['.card'];
+            if (card && (card.bg || card.bgOpacity != null)) {
+              delete card.bg;
+              delete card.bgOpacity;
+              saveRules(rules);
+            }
+            localStorage.setItem('menuMicroGlassFix', '1');
+          }
+        } catch (e) {}
+        el.textContent = Object.values(rules).map(ruleCss).filter(Boolean).join('\n');
+      }
+      applyRules(); // 先回放已存规则，再显示卡片（避免闪一下默认色）
+
+      function hidePanel() {
+        mp.classList.remove('show');
+        cur = null;
+      }
+      function clearInline(el) {
+        if (!el) return;
+        for (const k of [
+          'color',
+          'backgroundColor',
+          'backdropFilter',
+          'borderRadius',
+          'borderStyle',
+          'borderWidth',
+          'borderColor',
+          'fontSize',
+        ])
+          el.style[k] = '';
+      }
+      const keyOf = (sel, state) => sel + (state === 'hover' ? '|:hover' : '');
+      function setState(st) {
+        if (!cur) return;
+        cur.state = st;
+        $('mp-normal').classList.toggle('on', st === 'normal');
+        $('mp-hover').classList.toggle('on', st === 'hover');
+        clearInline(cur.el);
+        const entry = loadRules()[keyOf(cur.sel, st)];
+        if (entry) fillFromEntry(entry);
+      }
+      function fillFromEntry(t) {
+        if (!t) return;
+        if (t.color) $('mp-color').value = t.color;
+        if (t.bg) {
+          $('mp-bg').value = t.bg;
+          $('mp-op').value = t.bgOpacity ?? 100;
+        }
+        if (t.blur != null) $('mp-blur').value = Math.min(30, +t.blur || 0);
+        if (t.radius) $('mp-radius').value = Math.min(24, parseFloat(t.radius) || 0);
+        if (t.border) $('mp-border').value = Math.min(4, parseFloat(t.border) || 0);
+        if (t.borderColor) $('mp-bcolor').value = t.borderColor;
+        if (t.fontSize) $('mp-font').value = parseFloat(t.fontSize) || 13;
+        syncLabels();
+      }
+      function syncLabels() {
+        $('mp-color-v').textContent = $('mp-color').value;
+        $('mp-bg-v').textContent = $('mp-bg').value;
+        $('mp-op-v').textContent = $('mp-op').value + '%';
+        $('mp-blur-v').textContent = $('mp-blur').value + 'px';
+        $('mp-radius-v').textContent = $('mp-radius').value + 'px';
+        $('mp-border-v').textContent = $('mp-border').value + 'px';
+        $('mp-bcolor-v').textContent = $('mp-bcolor').value;
+      }
+      function openPanel(e, el, sel, name) {
+        cur = { el, sel, name, state: 'normal' };
+        const cs = getComputedStyle(el);
+        const col = parseColor(cs.color) || { r: 243, g: 241, b: 236, a: 1 };
+        const bg = parseColor(cs.backgroundColor);
+        const bgHex = bg ? toHex(bg) : '#262320';
+        const bc = parseColor(cs.borderTopColor) || { r: 51, g: 47, b: 42, a: 1 };
+        const rad = Math.round(parseFloat(cs.borderTopLeftRadius) || 0);
+        const bw = Math.round(parseFloat(cs.borderTopWidth) || 0);
+        const bm = String(cs.backdropFilter || cs.webkitBackdropFilter || '').match(/blur\(([\d.]+)px\)/);
+        const blurNow = bm ? Math.round(parseFloat(bm[1])) : 0;
+        $('mp-sel').textContent = name + ' · ' + sel;
+        $('mp-color').value = toHex(col);
+        $('mp-bg').value = bgHex;
+        $('mp-op').value = bg ? Math.round(bg.a * 100) : 0;
+        $('mp-blur').value = Math.min(30, blurNow);
+        $('mp-radius').value = Math.min(24, rad);
+        $('mp-border').value = Math.min(4, bw);
+        $('mp-bcolor').value = toHex(bc);
+        $('mp-font').value = Math.round(parseFloat(cs.fontSize) || 13);
+        syncLabels();
+        $('mp-normal').classList.add('on');
+        $('mp-hover').classList.remove('on');
+        mp.classList.add('show');
+        // 贴着点击点，右下不出窗口
+        const w = mp.offsetWidth;
+        const h = mp.offsetHeight;
+        mp.style.left = Math.max(4, Math.min(e.clientX, window.innerWidth - w - 4)) + 'px';
+        mp.style.top = Math.max(4, Math.min(e.clientY, window.innerHeight - h - 4)) + 'px';
+      }
+      function preview() {
+        if (!cur) return;
+        const el = cur.el;
+        const bv = +$('mp-blur').value;
+        el.style.color = $('mp-color').value;
+        el.style.backgroundColor = withAlpha($('mp-bg').value, +$('mp-op').value);
+        el.style.backdropFilter = bv > 0 ? `blur(${bv}px)` : '';
+        el.style.borderRadius = $('mp-radius').value + 'px';
+        el.style.borderStyle = 'solid';
+        el.style.borderWidth = $('mp-border').value + 'px';
+        el.style.borderColor = $('mp-bcolor').value;
+        el.style.fontSize = ($('mp-font').value || 12) + 'px';
+        syncLabels();
+      }
+      for (const id of ['mp-color', 'mp-bg', 'mp-op', 'mp-blur', 'mp-radius', 'mp-border', 'mp-bcolor', 'mp-font']) {
+        $(id).addEventListener('input', preview);
+      }
+      $('mp-normal').addEventListener('click', () => setState('normal'));
+      $('mp-hover').addEventListener('click', () => setState('hover'));
+      $('mp-apply').addEventListener('click', () => {
+        if (!cur) return;
+        const rules = loadRules();
+        const key = keyOf(cur.sel, cur.state);
+        rules[key] = {
+          sel: cur.sel,
+          name: cur.name,
+          state: cur.state,
+          color: $('mp-color').value,
+          bg: $('mp-bg').value,
+          bgOpacity: +$('mp-op').value,
+          blur: +$('mp-blur').value,
+          radius: $('mp-radius').value + 'px',
+          border: $('mp-border').value + 'px',
+          borderColor: $('mp-bcolor').value,
+          fontSize: ($('mp-font').value || 12) + 'px',
+        };
+        saveRules(rules);
+        applyRules();
+        clearInline(cur.el);
+        hidePanel();
+      });
+      $('mp-reset').addEventListener('click', () => {
+        if (!cur) return;
+        const rules = loadRules();
+        delete rules[keyOf(cur.sel, cur.state)];
+        saveRules(rules);
+        applyRules();
+        clearInline(cur.el);
+        hidePanel();
+      });
+      $('mp-cancel').addEventListener('click', () => {
+        if (!cur) return;
+        clearInline(cur.el);
+        hidePanel();
+      });
+      if (editMode) {
+        document.addEventListener('contextmenu', (e) => {
+          const t = e.target && e.target.nodeType === 1 ? e.target : e.target && e.target.parentElement;
+          if (!t || !t.closest || t.closest('.mp')) return;
+          e.preventDefault();
+          const btn = t.closest('#card button');
+          const icon = t.closest('#card svg');
+          if (btn) return openPanel(e, btn, '.card button', '菜单项');
+          if (icon) return openPanel(e, icon, '.card svg', '菜单图标');
+          if (t.closest('#card')) return openPanel(e, card, '.card', '菜单卡片');
+        });
+      }
 
       // 没有可见标签时禁用菜单项（此时也不该有菜单，防御）
       btnExternal.disabled = !anchor.tab;

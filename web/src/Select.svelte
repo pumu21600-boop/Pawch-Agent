@@ -232,8 +232,9 @@
     box-sizing: border-box;
     padding: 8px 10px;
     border-radius: 8px;
-    border: 1px solid var(--g3);
-    background: var(--g1);
+    border: 1.5px solid var(--g3);
+    /* 描边无底色（2026-11-11 设置弹窗统一样式）：Select 只在设置各页签用 */
+    background: transparent;
     color: var(--g7);
     font-size: 13px;
     font-family: inherit;
@@ -241,12 +242,12 @@
     cursor: pointer;
   }
   .csel:hover {
-    border-color: var(--g4);
+    border-color: var(--g5);
   }
   .csel.open,
   .csel:focus-visible {
     outline: none;
-    border-color: var(--brand);
+    border-color: var(--g6);
   }
   .csel:disabled {
     opacity: 0.5;
@@ -277,7 +278,8 @@
     z-index: 120;
     overflow-y: auto;
     padding: 4px;
-    background: var(--g1);
+    /* 浮层要盖住正文：比面板更实的玻璃 */
+    background: var(--glass-float);
     border: 1px solid var(--g3);
     border-radius: 10px;
     box-shadow: 0 10px 30px var(--overlay);
@@ -302,11 +304,14 @@
     cursor: pointer;
   }
   .csel-item.hl {
-    background: var(--g2);
+    /* 菜单底子已是 g2 系玻璃：高亮行要比底子深/浅一档（g3），否则 hover 糊进底色 */
+    background: var(--g3);
     color: var(--g7);
   }
   .csel-item.active {
-    color: var(--brand);
+    /* 当前项：统一选中口径（文字高亮=橙字；底色模式铺 --sel-bg） */
+    background: var(--sel-bg);
+    color: var(--sel-fg);
     font-weight: 600;
   }
   .csel-item-label {
@@ -348,7 +353,7 @@
   }
   .csel-group.hl,
   .csel-group:hover {
-    background: var(--g2);
+    background: var(--g3);
     color: var(--g7);
   }
   .csel-group.cur {

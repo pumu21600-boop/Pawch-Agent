@@ -10,6 +10,7 @@ import {
   specificityOf,
   classifyBgValue,
   microCss,
+  parseInsetRing,
 } from '../src/lib/dom.js';
 
 // —— 取色 ——
@@ -119,4 +120,36 @@ test('microCss：bgImage 走 background-image 且不再叠 background-color', ()
   assert.ok(solid.includes('background-color: rgba(255, 0, 0, 0.5)'));
   const frame = microCss({ k: { sel: '.btn', name: '按钮', bgImage: 'linear-gradient(180deg, rgba(255, 0, 0, 0.5))' } }, true);
   assert.ok(frame.includes('background-image: linear-gradient(180deg, rgba(255, 0, 0, 0.5)) !important'));
+});
+
+// —— 描边环（2026-11-12：选中态描边是 box-shadow inset 环画的，微调面板的描边要认它）——
+test('parseInsetRing：从 computed box-shadow 认出 inset 环（Chromium 色在前 inset 在后）', () => {
+  const ring = parseInsetRing('rgb(184, 179, 169) 0px 0px 0px 1px inset');
+  assert.ok(ring, '单环层应命中');
+  assert.equal(ring.width, 1);
+  assert.equal(ring.color, 'rgb(184, 179, 169)');
+  assert.deepEqual(ring.others, []);
+});
+test('parseInsetRing：多层 shadow 里认环并保留其余层', () => {
+  const ring = parseInsetRing('rgba(0, 0, 0, 0.55) 0px 10px 30px, rgb(86, 82, 75) 0px 0px 0px 2px inset');
+  assert.ok(ring);
+  assert.equal(ring.width, 2);
+  assert.equal(ring.others.length, 1);
+  assert.ok(ring.others[0].includes('0px 10px 30px'));
+});
+test('parseInsetRing：普通投影（三段长度）与 0 宽环不是环', () => {
+  assert.equal(parseInsetRing('rgba(0, 0, 0, 0.3) 0px 10px 20px'), null);
+  assert.equal(parseInsetRing('rgb(0, 0, 0) 0px 0px 0px 0px inset'), null);
+  assert.equal(parseInsetRing('none'), null);
+  assert.equal(parseInsetRing(''), null);
+});
+test('microCss：ring 走 box-shadow 环；0px 环=去线；ring 优先于 border', () => {
+  const on = microCss({ k: { sel: '.settings-nav button.active', name: '设置导航按钮', ring: '1px', ringColor: '#ba8a78' } });
+  assert.ok(on.includes('box-shadow: inset 0 0 0 1px #ba8a78'));
+  assert.ok(!on.includes('border-width'));
+  const off = microCss({ k: { sel: '.b', name: 'x', ring: '0px', ringColor: '#ba8a78' } });
+  assert.ok(off.includes('box-shadow: none'));
+  const mixed = microCss({ k: { sel: '.b', name: 'x', ring: '2px', ringColor: '#ba8a78', border: '3px', borderColor: '#ff0000' } });
+  assert.ok(mixed.includes('box-shadow: inset 0 0 0 2px #ba8a78'));
+  assert.ok(!mixed.includes('border-width'), '并存时 ring 赢，不输出 border 免布局位移');
 });

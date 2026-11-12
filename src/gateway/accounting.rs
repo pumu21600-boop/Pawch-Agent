@@ -37,8 +37,9 @@ pub(crate) struct UsageOutcome {
     pub(crate) status: &'static str,
     pub(crate) tokens: (u64, u64, u64),
     pub(crate) error: Option<String>,
-    /// 流式计时 (首包延迟 ms, 输出耗时 ms)；非流式/无计时为 None（使用统计面板用）
-    pub(crate) timing: Option<(u64, u64)>,
+    /// 流式计时 (首包延迟 ms, 正文耗时 ms, 生成窗口 ms)；非流式/无计时为 None
+    /// （使用统计面板用）。生成窗口 = 首包→流结束，是输出速度的分母。
+    pub(crate) timing: Option<(u64, u64, u64)>,
 }
 
 impl UsageOutcome {
@@ -53,11 +54,12 @@ impl UsageOutcome {
     pub(crate) fn err_with(status: &'static str, error: String, tokens: (u64, u64, u64)) -> Self {
         Self { status, tokens, error: Some(error), timing: None }
     }
-    /// 带流式计时（turn 的 ttft/gen 毫秒）：只有拿得到 AssistantTurn 的调用点能填。
+    /// 带流式计时（turn 的 ttft/gen/decode 毫秒）：只有拿得到 AssistantTurn 的调用点能填。
     pub(crate) fn timed(mut self, turn: &crate::gateway::AssistantTurn, started: std::time::Instant) -> Self {
         self.timing = Some((
             turn.ttft_ms(started).unwrap_or(0),
             turn.gen_ms().unwrap_or(0),
+            turn.decode_ms().unwrap_or(0),
         ));
         self
     }
@@ -78,9 +80,10 @@ pub(crate) fn record_usage(ctx: &UsageCtx, base_url: &str, provider_id: Option<&
     rec.cached_tokens = outcome.tokens.2;
     rec.status = outcome.status.to_string();
     rec.latency_ms = latency_ms;
-    if let Some((ttft, gen_ms)) = outcome.timing {
+    if let Some((ttft, gen_ms, decode_ms)) = outcome.timing {
         rec.ttft_ms = (ttft > 0).then_some(ttft);
         rec.gen_ms = (gen_ms > 0).then_some(gen_ms);
+        rec.decode_ms = (decode_ms > 0).then_some(decode_ms);
     }
     rec.error = outcome.error.map(|e| e.chars().take(200).collect());
     crate::usage::record(rec);

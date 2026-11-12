@@ -174,6 +174,9 @@ pub struct WebTab {
     dialog: Mutex<Option<DialogInfo>>,
     /// 视口覆盖（挂起恢复时重放；None = 未设置过）
     viewport: Mutex<Option<(i64, i64)>>,
+    /// 页面动画是否已被冻结（窗口被完全遮挡/最小化时冻结 rAF 省渲染，
+    /// 2026-11-09；只在翻转时发一次 CDP，状态记在 tab 上防重复）
+    raf_paused_applied: AtomicBool,
 }
 
 impl WebTab {
@@ -219,6 +222,7 @@ impl WebTab {
             frame: Mutex::new(None),
             dialog: Mutex::new(None),
             viewport: Mutex::new(None),
+            raf_paused_applied: AtomicBool::new(false),
         })
     }
 }
@@ -319,6 +323,12 @@ impl BrowserSession {
     }
     fn agent_tab_now(&self) -> Option<String> {
         self.agent_tab_id.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+    /// 最近 agent 是否碰过浏览器。截图/点击依赖页面真的在渲染：窗口失焦时不能把
+    /// agent 正在操作的那一页藏起来（隐藏的 WebView2 不产帧，captureScreenshot 会挂住）。
+    fn agent_active_recently(&self, window_ms: u64) -> bool {
+        let t = self.agent_touched_ms.load(Ordering::Relaxed);
+        t > 0 && now_ms().saturating_sub(t) < window_ms
     }
     /// 面板是否正在展示网页（壳里 webview 显隐的唯一依据）。
     fn showing(&self) -> bool {

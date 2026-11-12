@@ -28,8 +28,11 @@
             top_p: Some(0.9),
             thinking: Some("on".to_string()),
             thinking_style: Some("deepseek".to_string()),
+            protocol: None,
+            auto_suffix: true,
             capabilities: ModelCapabilities::default(),
             capabilities_user_set: false,
+            model_params: Default::default(),
         });
         s.configs.push(Config {
             id: "cfg-2".to_string(),
@@ -45,8 +48,11 @@
             top_p: None,
             thinking: Some("off".to_string()),
             thinking_style: Some("qwen".to_string()),
+            protocol: None,
+            auto_suffix: true,
             capabilities: ModelCapabilities::default(),
             capabilities_user_set: false,
+            model_params: Default::default(),
         });
         s.active_config_id = Some("cfg-1".to_string());
 
@@ -306,4 +312,91 @@
         assert_eq!(s.configs[0].name, "主力");
         assert_eq!(s.configs[0].context_length, Some(128_000), "字符串数字要纠回数字");
         assert_eq!(s.configs[0].max_output_tokens, None, "null 去键走默认");
+    }
+
+    /// 2026-11-10：纠型救援不得碰 roles 子树——roles.vision/video/audio 是配置名
+    /// 字符串（不是能力布尔），曾与 capabilities.vision 同名被当布尔键删掉，
+    /// 多模态路由静默回落主渠道。
+    #[test]
+    fn coercion_keeps_roles_multimodal_values() {
+        let text = r#"{
+            "compact_percent": "80",
+            "roles": {
+                "vision": "cfg-abc::vision-model",
+                "video": "配置B",
+                "audio": "配置C",
+                "summary": "配置D"
+            }
+        }"#;
+        let s = settings_from_text(text).expect("应纠型成功");
+        let roles = s.roles.expect("roles 应保留");
+        assert_eq!(roles.vision.as_deref(), Some("cfg-abc::vision-model"));
+        assert_eq!(roles.video.as_deref(), Some("配置B"));
+        assert_eq!(roles.audio.as_deref(), Some("配置C"));
+        assert_eq!(roles.summary.as_deref(), Some("配置D"));
+        assert_eq!(s.compact_percent, Some(80), "roles 外的数值漂移照常纠正");
+    }
+
+    /// 模型级参数覆盖：覆盖的字段用模型级，未覆盖的回落配置级；能力整块覆盖。
+    #[test]
+    fn model_params_override_config_defaults() {
+        let mut c = Config {
+            id: "cfg-1".into(),
+            name: "渠道".into(),
+            provider_id: "custom".into(),
+            base_url: "https://x/v1".into(),
+            model: "text-model".into(),
+            models: vec!["text-model".into(), "omni-model".into()],
+            capabilities: ModelCapabilities {
+                tools: true,
+                vision: true,
+                video: true,
+                audio: true,
+            },
+            context_length: Some(1000),
+            ..Default::default()
+        };
+        // 未覆盖：全回落配置级
+        let p = c.params_for("text-model");
+        assert_eq!(p.context_length, Some(1000));
+        assert!(p.capabilities.as_ref().map(|x| x.audio).unwrap_or(false));
+
+        // 整块能力覆盖 + 单个字段覆盖
+        c.model_params.insert(
+            "omni-model".into(),
+            ModelParams {
+                context_length: Some(2000),
+                capabilities: Some(ModelCapabilities {
+                    tools: true,
+                    vision: false,
+                    video: false,
+                    audio: true,
+                }),
+                ..Default::default()
+            },
+        );
+        let p = c.params_for("omni-model");
+        assert_eq!(p.context_length, Some(2000), "模型级覆盖生效");
+        assert!(c.caps_for("omni-model").audio, "omni 勾了音频");
+        assert!(c.caps_for("text-model").audio, "未覆盖时按配置级（配置级 audio=true）");
+        // 再把文本模型也单独覆盖：这才是不勾音视频的形态
+        c.model_params.insert(
+            "text-model".into(),
+            ModelParams {
+                capabilities: Some(ModelCapabilities {
+                    tools: true,
+                    vision: true,
+                    video: false,
+                    audio: false,
+                }),
+                ..Default::default()
+            },
+        );
+        assert!(!c.caps_for("text-model").audio, "文本模型取消音频");
+        assert!(!c.caps_for("text-model").video, "文本模型取消视频");
+        assert_eq!(
+            c.params_for("text-model").context_length,
+            Some(1000),
+            "未覆盖的字段回落配置级"
+        );
     }

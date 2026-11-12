@@ -26,6 +26,10 @@
         --arrow-h: #b8b3a9;
         --fico: #6e695f;
         --sep: #454039;
+        /* 选中口径随宿主（2026-11-12）：默认高亮无背景（橙字），宿主切「底色」口径时
+           html.sel-bg 把 --sel-fg/--sel-bg 换回普通文字+浅底 */
+        --sel-fg: #c49c8d;
+        --sel-bg: transparent;
         --ok: #7fd6a4;
         --err: #ff9b9b;
         --t-blue-bg: #1e2a3d;
@@ -64,6 +68,8 @@
         --arrow-h: #56524b;
         --fico: #9c968c;
         --sep: #9c968c;
+        --sel-fg: #a46851;
+        --sel-bg: transparent;
         --ok: #1e7a3f;
         --err: #b3261e;
         --t-blue-bg: #e7edfb;
@@ -76,6 +82,16 @@
         --t-yellow-fg: #8a6d1a;
         --t-gray-bg: #f0ede8;
         --t-gray-fg: #56524b;
+      }
+      /* 底色口径（宿主「无高亮有背景」模式）：选中铺浅底、文字回普通色。
+         html.sel-bg 由宿主在 pawch:init（payload.selStyle）里加减 */
+      html.sel-bg {
+        --sel-fg: var(--strong);
+        --sel-bg: #262320;
+      }
+      html.light.sel-bg {
+        --sel-fg: var(--strong);
+        --sel-bg: #f2e9df;
       }
 
       * {
@@ -198,7 +214,13 @@
         background: var(--hover);
       }
       .row.sel {
-        background: var(--sel);
+        /* 选中行：默认橙字高亮无底色；宿主底色口径下铺 --sel-bg（2026-11-12 统一口径） */
+        background: var(--sel-bg);
+      }
+      .row.sel .nm,
+      .row.file.sel .nm {
+        color: var(--sel-fg);
+        font-weight: 600;
       }
       .row .arw {
         flex: none;
@@ -343,6 +365,8 @@
           // 主题跟随宿主（init 里带已解析的 theme；宿主切主题会重发 init）
           document.documentElement.classList.toggle('light', ((d.payload || {}).theme) === 'light'); // 画布跟主题（只认根元素）
           document.body.classList.toggle('light', ((d.payload || {}).theme) === 'light');
+          // 选中口径跟随宿主（hl=高亮无背景默认 / bg=底色无高亮），换口径宿主会重发 init
+          document.documentElement.classList.toggle('sel-bg', ((d.payload || {}).selStyle) === 'bg');
           if (!booted) { booted = true; loadAll(); }
           return;
         }

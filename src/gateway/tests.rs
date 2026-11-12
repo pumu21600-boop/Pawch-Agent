@@ -11,6 +11,26 @@
     }
 
     #[test]
+    fn channel_protocol_follows_config_lock() {
+        // 媒体旁路等调用方靠它预判协议：配置锁定优先，未锁定时才看端点特征
+        let mut p = ChatParams::default();
+        p.protocol = Some(Protocol::AnthropicMessages);
+        assert_eq!(
+            channel_protocol(&p, "https://api.stepfun.com/v1", "m"),
+            Protocol::AnthropicMessages,
+            "（StepFun 这类不带 /anthropic 段的地址）配置锁了就必须走 Messages"
+        );
+        p.protocol = Some(Protocol::OpenAiResponses);
+        assert_eq!(channel_protocol(&p, "https://api.deepseek.com/v1", "m"), Protocol::OpenAiResponses);
+        let p = ChatParams::default();
+        assert_eq!(
+            channel_protocol(&p, "https://api.deepseek.com/anthropic", "m"),
+            Protocol::AnthropicMessages,
+            "未锁定时按 /anthropic 路径段探测"
+        );
+    }
+
+    #[test]
     fn thinking_inflates_max_tokens_budget() {
         // 思考开启时上游把 reasoning+正文算进同一个 max_tokens，用户配的
         // 「最大输出长度」会被思考吃掉——发送值 = 配置值 + max(配置值, 8192)。
@@ -339,7 +359,7 @@ Content-Length: 2
             std::env::set_var("HTTP_PROXY", "http://127.0.0.1:1");
         }
         g.rebuild_client_for_test();
-        let r1 = g.list_models(&base, "sk-dummy").await;
+        let r1 = g.list_models_with(&base, "sk-dummy", Protocol::OpenAiCompletions, true).await;
         let msg1 = r1.err().map(|e| format!("{e:#}")).unwrap_or_default();
         assert!(
             msg1.contains("401"),
@@ -351,7 +371,7 @@ Content-Length: 2
             std::env::remove_var("HTTP_PROXY");
         }
         g.rebuild_client_for_test();
-        let r2 = g.list_models(&base, "sk-dummy").await;
+        let r2 = g.list_models_with(&base, "sk-dummy", Protocol::OpenAiCompletions, true).await;
         let msg2 = r2.err().map(|e| format!("{e:#}")).unwrap_or_default();
         assert!(msg2.contains("401"), "清掉代理后仍应拿到 401，实际: {msg2}");
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -882,3 +902,202 @@ Content-Length: 2
         assert!(matches!(out, Ok(ChatOutcome::Done(_))), "第 6 次成功后应正常完成");
         assert!(started.elapsed() >= std::time::Duration::from_secs(15), "5 次退避应累计 15s");
     }
+
+    /// 输出速度分母必须是「首包→流结束」：思考 80 秒 + 正文 2 秒时，
+    /// gen_ms 只有 2 秒（正文跨度），decode_ms 是 82 秒。速度用前者会快 40 倍。
+    #[test]
+    fn decode_ms_covers_thinking_and_content_but_gen_ms_does_not() {
+        let t0 = Instant::now();
+        let turn = AssistantTurn {
+            first_chunk_at: Some(t0),
+            content_first_at: Some(t0 + std::time::Duration::from_secs(80)),
+            content_last_at: Some(t0 + std::time::Duration::from_secs(82)),
+            finished_at: Some(t0 + std::time::Duration::from_secs(82)),
+            ..Default::default()
+        };
+        assert_eq!(turn.decode_ms(), Some(82_000), "生成窗口含思考时间");
+        assert_eq!(turn.gen_ms(), Some(2_000), "正文耗时只覆盖正文段");
+        // 一个分片都没有（请求失败）：两者都无计时
+        assert_eq!(AssistantTurn::default().decode_ms(), None);
+    }
+
+    /// 2026-11-10：embeddings 端点只填主机时补 /v1（与 chat_url 同款判定），
+    /// 给了路径原样拼——旧实现直接拼 /embeddings，只填主机的渠道必 404。
+    #[test]
+    fn embed_url_adds_v1_only_for_root_base() {
+        assert_eq!(
+            embed_url("https://api.openai.com"),
+            "https://api.openai.com/v1/embeddings"
+        );
+        assert_eq!(
+            embed_url("https://api.openai.com/"),
+            "https://api.openai.com/v1/embeddings"
+        );
+        assert_eq!(
+            embed_url("https://api.openai.com/v1"),
+            "https://api.openai.com/v1/embeddings"
+        );
+        assert_eq!(
+            embed_url("https://gw.example.com/api/paas/v4"),
+            "https://gw.example.com/api/paas/v4/embeddings"
+        );
+    }
+
+#[test]
+fn endpoint_url_suffix_toggle() {
+    use crate::gateway::{Gateway, Protocol};
+    // 勾（默认）：按协议惯例补后缀
+    assert_eq!(
+        Gateway::endpoint_url_with("https://api.anthropic.com", Protocol::AnthropicMessages, true),
+        "https://api.anthropic.com/v1/messages"
+    );
+    // 不勾：Base URL 即最终地址，原样直发（deepseek 的 /anthropic 挂载走这条）
+    assert_eq!(
+        Gateway::endpoint_url_with("https://api.deepseek.com/anthropic", Protocol::AnthropicMessages, false),
+        "https://api.deepseek.com/anthropic"
+    );
+    assert_eq!(
+        Gateway::endpoint_url_with("https://api.deepseek.com/v1", Protocol::OpenAiCompletions, true),
+        "https://api.deepseek.com/v1/chat/completions"
+    );
+    assert_eq!(
+        Gateway::endpoint_url_with("https://api.openai.com", Protocol::OpenAiResponses, true),
+        "https://api.openai.com/v1/responses"
+    );
+    assert_eq!(
+        Gateway::endpoint_url_with("https://api.openai.com/v1", Protocol::OpenAiResponses, false),
+        "https://api.openai.com/v1"
+    );
+}
+
+#[test]
+fn model_list_candidates_cover_compat_mounts() {
+    use crate::gateway::{Gateway, Protocol};
+    // DeepSeek 形态：/anthropic 兼容层没有清单接口，候选链要回退到厂商根的
+    // OpenAI /models（Bearer）——2026-11-11 用户实测勾不勾自动补后缀都 404。
+    let c = Gateway::model_list_candidates("https://api.deepseek.com/anthropic", Protocol::AnthropicMessages, true);
+    let urls: Vec<&str> = c.iter().map(|(u, _)| u.as_str()).collect();
+    assert_eq!(urls[0], "https://api.deepseek.com/anthropic/v1/models");
+    assert!(c.iter().any(|(u, a)| u == "https://api.deepseek.com/models" && *a == Protocol::OpenAiCompletions), "{urls:?}");
+    assert!(c.iter().any(|(u, a)| u == "https://api.deepseek.com/v1/models" && *a == Protocol::OpenAiCompletions), "{urls:?}");
+    // 「自动补后缀」不勾 = Base URL 填的是最终聊天地址：先剥掉 /messages 再补清单，
+    // 不能拿聊天地址原样 GET（旧行为必然 404）。
+    let c = Gateway::model_list_candidates("https://host.example.com/anthropic/v1/messages", Protocol::AnthropicMessages, false);
+    let urls: Vec<&str> = c.iter().map(|(u, _)| u.as_str()).collect();
+    assert_eq!(urls[0], "https://host.example.com/anthropic/v1/models", "{urls:?}");
+    assert!(urls.contains(&"https://host.example.com/models"), "{urls:?}");
+    // OpenAI 协议：根补 /v1/models，带路径补 /models；不勾时剥 /chat/completions
+    let c = Gateway::model_list_candidates("https://api.openai.com", Protocol::OpenAiCompletions, true);
+    assert_eq!(c[0].0, "https://api.openai.com/v1/models");
+    let c = Gateway::model_list_candidates("https://api.openai.com/v1/chat/completions", Protocol::OpenAiCompletions, false);
+    assert_eq!(c[0].0, "https://api.openai.com/v1/models");
+}
+
+#[test]
+fn responses_success_with_null_error_is_not_an_error() {
+    // OpenAI Responses 成功对象固定带 "error": null（DeepSeek /v1/responses 实测）。
+    // 旧实现按「存在 error 键」判错，测试连通直接报「渠道业务错误 (raw: null)」。
+    assert!(body_error(&json!({ "error": null, "output": [] })).is_none());
+    assert!(body_error(&json!({ "error": { "message": "bad" } })).is_some());
+    assert!(body_error(&json!({ "output": [] })).is_none());
+}
+
+/// 404 降级真发：模拟 DeepSeek 的 /anthropic/* 全 404，清单必须回退到厂商根
+/// 的 OpenAI /models 并成功解析（2026-11-11 用户报「勾不勾都 404」的回归）。
+#[tokio::test]
+async fn list_models_falls_back_to_openai_root_on_404() {
+    init_logger();
+    let g = Gateway::new();
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop2 = stop.clone();
+    let mock = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut s, _)) => {
+                    let _ = s.set_nonblocking(false);
+                    let mut buf = [0u8; 4096];
+                    let n = s.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req.split_whitespace().nth(1).unwrap_or("").to_string();
+                    let (status, body) = if path.starts_with("/anthropic") {
+                        ("404 Not Found", "")
+                    } else {
+                        ("200 OK", r#"{"data":[{"id":"deepseek-reasoner"},{"id":"deepseek-chat"}]}"#)
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = s.write_all(resp.as_bytes());
+                    let _ = s.flush();
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+    });
+
+    let base = format!("http://127.0.0.1:{port}/anthropic");
+    let models = g
+        .list_models_with(&base, "sk-dummy", Protocol::AnthropicMessages, true)
+        .await
+        .unwrap();
+    assert_eq!(models, vec!["deepseek-chat".to_string(), "deepseek-reasoner".to_string()]);
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    mock.join().unwrap();
+}
+
+/// 鉴权头降级真发：模拟 StepFun 的 `/v1/models` 只认 Bearer、对 x-api-key 与
+/// 裸请求都回 401「Incorrect API key provided」。Anthropic 协议的第一个候选带
+/// x-api-key，必须继续试同一地址的 Bearer 候选，而不是在 401 上判死
+/// （2026-11-11 用户报「获取模型失败：渠道返回 401」的回归）。
+#[tokio::test]
+async fn list_models_retries_same_url_with_other_auth_on_401() {
+    init_logger();
+    let g = Gateway::new();
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop2 = stop.clone();
+    let mock = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut s, _)) => {
+                    let _ = s.set_nonblocking(false);
+                    let mut buf = [0u8; 4096];
+                    let n = s.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_lowercase();
+                    // StepFun 契约：只有 Authorization: Bearer 能过，x-api-key 不识
+                    let (status, body) = if req.contains("authorization: bearer") {
+                        ("200 OK", r#"{"data":[{"id":"step-3.5-flash"}]}"#)
+                    } else {
+                        ("401 Unauthorized", r#"{"error":{"message":"Incorrect API key provided","type":"invalid_api_key"}}"#)
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = s.write_all(resp.as_bytes());
+                    let _ = s.flush();
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+    });
+
+    let base = format!("http://127.0.0.1:{port}/v1");
+    let models = g
+        .list_models_with(&base, "sk-dummy", Protocol::AnthropicMessages, true)
+        .await
+        .unwrap();
+    assert_eq!(models, vec!["step-3.5-flash".to_string()]);
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    mock.join().unwrap();
+}

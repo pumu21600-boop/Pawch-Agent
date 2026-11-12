@@ -1,28 +1,36 @@
 use super::*;
 
 /// //从配置项 + 供应商预设组装请求参数（采样/思考/端点探测线索/工具开关）。
+/// 参数按 `model` 取：模型级覆盖 > 配置级（同一渠道不同模型各自调参）。
 pub(crate) fn build_chat_params(
     c: &crate::config::settings::Config,
     preset: Option<&gateway::providers::ProviderPreset>,
+    model: &str,
 ) -> gateway::ChatParams {
     let mut p = match preset {
         Some(p) => gateway::ChatParams::from_preset(p),
         None => gateway::ChatParams::default(),
     };
-    p.max_tokens = c.max_output_tokens;
-    p.temperature = c.temperature;
-    p.top_p = c.top_p;
-    p.thinking = c.thinking.clone();
+    let prm = c.params_for(model);
+    let caps = prm.capabilities.clone().unwrap_or_else(|| c.capabilities.clone());
+    p.max_tokens = prm.max_output_tokens;
+    p.temperature = prm.temperature;
+    p.top_p = prm.top_p;
+    p.thinking = prm.thinking.clone();
     p.base_url = Some(c.effective_base_url());
     // A3：能力标记「工具调用」闭环
-    p.tools_enabled = c.capabilities.tools;
+    p.tools_enabled = caps.tools;
     // 图片解析能力（2026-11-02 截图投递统一）：tool 结果里的截图按它决定「直接给
     // 模型看」还是「先走视觉角色转文字」——判模型能力，不判渠道/协议
-    p.vision = c.capabilities.vision;
+    p.vision = caps.vision;
     // 提示缓存保留档（[cost] cache_retention，进程级单值）：决定 cache_control 断点 /
     // prompt_cache_key / 长保留 TTL 发不发。角色/降级/摘要渠道与主渠道同一档
     p.cache_retention = gateway::cache_retention();
-    apply_thinking_style(&mut p, c.thinking_style.as_deref());
+    // 传输协议锁定（配置 protocol 字段）：锁定后端点探测让位——Anthropic 兼容端点
+    // 不必依赖「/anthropic 路径段」这类命名习惯（2026-11-11）
+    p.protocol = Some(c.effective_protocol());
+    p.suffix_auto = c.auto_suffix;
+    apply_thinking_style(&mut p, prm.thinking_style.as_deref());
     p
 }
 
@@ -78,7 +86,7 @@ pub(crate) fn find_channel(s: &Settings, name: &str) -> Option<gateway::Channel>
     }
     let model = model_override.unwrap_or_else(|| c.effective_model());
     let preset = gateway::providers::find(&c.provider_id);
-    let params = build_chat_params(c, preset);
+    let params = build_chat_params(c, preset, &model);
     // B2 key 回落链：DPAPI key > DEEPSEEK_API_KEY 环境变量。
     // 角色/降级渠道与主渠道同一把尺子——没单独存 key 的配置靠环境变量兜底
     // （补：此前只有主渠道走这条链，budget/summary/title 渠道会「未设置 key」）
@@ -135,7 +143,11 @@ pub(crate) fn normalize_mode(cfg: &crate::config::AgentConfig, requested: &str) 
 /// system+tools 全段重写（e2e 实测第 2 轮命中 21%，第 3 轮起才回 99%）——
 /// 2026-10-20 起 brief 改并进首条 user 消息（见 `inject_brief_into_first_user`），
 /// 它只属于 messages 区（区小、且本就带尾部断点）。
-pub(crate) async fn turn_system_prompt(state: &AppState, primary: &gateway::Channel) -> String {
+pub(crate) async fn turn_system_prompt(
+    state: &AppState,
+    primary: &gateway::Channel,
+    ws: &std::path::Path,
+) -> String {
     let prompt = read_system_prompt(state);
     let memory_md = state
         .memory
@@ -149,7 +161,13 @@ pub(crate) async fn turn_system_prompt(state: &AppState, primary: &gateway::Chan
     // 2026-10-05 再补一句「改名 = 改建显示名」：用户说「把工作区/项目的名字改成 X」时，模型
     // 因为没有现成入口，去 dir 桌面、翻 .agent、读应用源码找接口，白花十几步（真机
     // 实测）。入口本来就在 settings 工具里，这里点名，别让模型再当侦探。
-    let extras = crate::tools::workspace_extra_roots();
+    // 额外文件夹只属于「当前全局工作区」；无头任务指定了别的项目目录时不带过去
+    // （2026-11-10：工作区由调用方显式传入，任务提示不再跟着全局根走）。
+    let extras = if ws == crate::tools::workspace_root().as_path() {
+        crate::tools::workspace_extra_roots()
+    } else {
+        Vec::new()
+    };
     let extras_hint = if extras.is_empty() {
         String::new()
     } else {
@@ -169,7 +187,7 @@ pub(crate) async fn turn_system_prompt(state: &AppState, primary: &gateway::Chan
          用户说「把工作区/项目的名字改成 X」= 改它的**显示名**（侧栏那一行字），不是改磁盘目录名：\
          直接调 settings 工具 action=alias 配 name（path 省略=当前工作区；name 留空=恢复文件夹名）。\
          别去动目录名，也别翻应用源码找接口。{extras_hint}\n",
-        crate::tools::workspace_root().display()
+        ws.display()
     );
     let skills_index = crate::skills::index_prompt();
     let ui_index = crate::plugin::ui::index_prompt();
@@ -205,7 +223,11 @@ pub(crate) async fn turn_system_prompt(state: &AppState, primary: &gateway::Chan
 /// 新会话第一轮的「项目现状」brief（上一条同项目会话 + 工作区未提交改动）。
 /// 非新会话返回空串。**不并进系统提示**（会打破 system 缓存前缀，见
 /// `turn_system_prompt` 的纪律注释），由调用方并进首条 user 消息。
-pub(crate) async fn first_turn_brief(state: &AppState, session_id: &str) -> String {
+pub(crate) async fn first_turn_brief(
+    state: &AppState,
+    session_id: &str,
+    ws: &std::path::Path,
+) -> String {
     let is_new = state
         .session
         .get(session_id)
@@ -214,15 +236,15 @@ pub(crate) async fn first_turn_brief(state: &AppState, session_id: &str) -> Stri
     if !is_new {
         return String::new();
     }
-    let ws = crate::tools::workspace_root().to_path_buf();
+    let ws_path = ws.to_path_buf();
     let stats = tokio::task::spawn_blocking(move || {
-        let head = crate::recovery::head_id(&ws).ok().flatten()?;
-        crate::recovery::diff_stat(&ws, &head).ok()
+        let head = crate::recovery::head_id(&ws_path).ok().flatten()?;
+        crate::recovery::diff_stat(&ws_path, &head).ok()
     })
     .await
     .ok()
     .flatten();
-    state.session.project_brief(session_id, stats).unwrap_or_default()
+    state.session.project_brief(session_id, stats, ws).unwrap_or_default()
 }
 
 /// 把 brief 并进**首条 user 消息**（纯函数，单测覆盖）。
@@ -360,7 +382,7 @@ pub(crate) fn assemble_turn_channels(
             .or_else(|| std::env::var("DEEPSEEK_API_KEY").ok())
             .unwrap_or_default()
     };
-    let mut params = build_chat_params(active_cfg, gateway::providers::find(&active_cfg.provider_id));
+    let mut params = build_chat_params(active_cfg, gateway::providers::find(&active_cfg.provider_id), &model);
     params.base_url = Some(base_url.clone());
     let primary = gateway::Channel::new(&base_url, &model, &api_key, params);
     // / 角色映射：优先 settings.roles，未设回落 config.toml [roles]；
@@ -384,10 +406,26 @@ pub(crate) fn assemble_turn_channels(
         .map(|r| r.fallbacks.clone())
         .filter(|f| !f.is_empty())
         .unwrap_or_else(|| state.gateway_cfg.fallback_configs.clone());
+    let mut failed_fallbacks: Vec<String> = Vec::new();
     let fallbacks: Vec<gateway::Channel> = fallback_names
         .iter()
-        .filter_map(|n| find_channel(s, n))
+        .filter_map(|n| match find_channel(s, n) {
+            Some(c) => Some(c),
+            None => {
+                failed_fallbacks.push(n.clone());
+                None
+            }
+        })
         .collect();
+    // 写错的降级候选不再静默消失：降级链实际比配置的短，出故障时才发现就晚了
+    // （2026-11-10 审查）。
+    if !failed_fallbacks.is_empty() {
+        notices.push(format!(
+            "降级链里的渠道「{}」解析失败（配置名不存在或地址为空），已跳过（剩余 {} 个）",
+            failed_fallbacks.join("、"),
+            fallbacks.len()
+        ));
+    }
     // 预算降级渠道
     let budget_name = roles
         .and_then(|r| r.budget.as_deref())
@@ -404,21 +442,29 @@ pub(crate) fn assemble_turn_channels(
     // 没勾「图片解析」就当没配（不按模型名猜能力），免得把图发给看不了图的端点。
     // 只认 settings.roles.vision（config.toml 的 [roles] 没有多模态角色，附件转接同）。
     // 主模型自己就能看图时不解析——省得白推一条「专家没勾能力」的提示。
-    let vision_name = if active_cfg.capabilities.vision {
+    let vision_name = if active_cfg.caps_for(&model).vision {
         None
     } else {
         roles.and_then(|r| r.vision.as_deref())
     };
     let vision = vision_name.and_then(|n| {
         let cfg_ref = split_role_value(n).0;
-        let expert = s.configs.iter().find(|c| c.id == cfg_ref || c.name == cfg_ref)?;
-        if !expert.capabilities.vision {
-            notices.push(format!(
-                "角色「视觉理解」配置「{n}」没勾「图片解析」，截图不会转成文字（改按落盘指路）"
-            ));
-            return None;
+        match s.configs.iter().find(|c| c.id == cfg_ref || c.name == cfg_ref) {
+            // 配置被删/改坏：不再静默压平成文字（2026-11-10 审查）
+            None => {
+                notices.push(format!(
+                    "角色「视觉理解」配置「{n}」解析失败（配置名不存在或地址为空），截图改按落盘指路"
+                ));
+                None
+            }
+            Some(expert) if !expert.capabilities.vision => {
+                notices.push(format!(
+                    "角色「视觉理解」配置「{n}」没勾「图片解析」，截图不会转成文字（改按落盘指路）"
+                ));
+                None
+            }
+            Some(_) => find_channel(s, n),
         }
-        find_channel(s, n)
     });
     // 思考参数自适应降级登记：该端点此前 400 拒收过思考字段（剥参重试成功）。
     // 同进程内只在首次提醒一次（2026-11-05：原来每轮都发，多个对话里反复出现同一条通知）
@@ -611,8 +657,11 @@ mod role_value_tests {
             top_p: None,
             thinking: None,
             thinking_style: None,
+            protocol: None,
+            auto_suffix: true,
             capabilities: ModelCapabilities::default(),
             capabilities_user_set: false,
+            model_params: Default::default(),
         }
     }
 

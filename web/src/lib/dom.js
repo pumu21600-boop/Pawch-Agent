@@ -145,16 +145,25 @@ export const ELEMENT_ALIASES = [
   { sel: '.asst-bubble', name: 'AI 消息气泡', pick: 'self' },
   { sel: '.bubble', name: '消息气泡', pick: 'self' },
   { sel: '.error-bubble', name: '错误消息气泡' },
-  { sel: '.tool-card', name: '工具卡' },
-  { sel: '.tool-preview', name: '工具输出（代码块）' },
+  /* 工具卡（2026-11-12 修）：旧类名 tool-card/tool-head/tool-preview/tool-badge 早已
+     改名（现在是 tool-item/tool-row/tool-sec/tool-status），登记表没跟上——右击工具卡
+     落进结构选择器，「同类全部」既命中不到兄弟、DOM 一变还漂走，用户看到的就是
+     「同类没生效 + 调完反弹」。类名一律以 markup 实际为准 */
+  { sel: '.tool-item', name: '工具卡' },
+  { sel: '.tool-sec', name: '工具卡分区' },
   { sel: '.tool-detail', name: '工具卡详情' },
   { sel: '.tool-pre', name: '工具参数/结果块' },
-  { sel: '.tool-head', name: '工具卡头部' },
-  { sel: '.tool-badge', name: '工具状态徽章' },
+  { sel: '.tool-row', name: '工具卡头部' },
+  { sel: '.tool-status', name: '工具状态徽章' },
   { sel: '.tool-name', name: '工具名' },
   { sel: '.tool-args', name: '工具参数' },
-  { sel: '.thinking', name: '思考折叠块', pick: 'self' },
-  { sel: '.thinking-body', name: '思考内容' },
+  { sel: '.think-item', name: '思考折叠块', pick: 'self' },
+  { sel: '.think-text', name: '思考内容' },
+  /* 过程块（思考+工具卡的外层卡片，可见底色由它画）：不登记的话右击工具行、点
+     「改上级」会拿到 div:nth-of-type 结构链——同类命中不到兄弟，调完还随 DOM 漂走
+     （2026-11-12 用户实测：工具卡背景调不动、同类用不了） */
+  { sel: '.process', name: '过程块', pick: 'self' },
+  { sel: '.process-head', name: '过程标题行' },
   { sel: '.approval-box', name: '审批框' },
   { sel: '.term-panel', name: '终端面板', pick: 'self' },
   { sel: '.term-head', name: '终端标题栏' },
@@ -167,8 +176,6 @@ export const ELEMENT_ALIASES = [
   { sel: '.term-line', name: '终端输出行' },
   { sel: '.term-prompt', name: '终端命令提示符' },
   { sel: '.term-text', name: '终端输出文本' },
-  { sel: '.cp-bar', name: '改动条', pick: 'self' },
-  { sel: '.cp-btn', name: '改动条按钮' },
   { sel: '.new-chat', name: '新对话按钮' },
   { sel: '.chat-head', name: '顶栏', pick: 'self' },
   { sel: '.right-panel', name: '产物面板', pick: 'self' },
@@ -229,14 +236,16 @@ export const ELEMENT_ALIASES = [
   { sel: '.proj', name: '项目行' },
   { sel: '.proj-name', name: '项目名' },
   { sel: '.foot-btn', name: '侧栏底部按钮' },
-  { sel: '.cp-dock', name: '改动条容器', pick: 'self' },
-  { sel: '.cp-undo', name: '撤销按钮' },
   { sel: '.ctx-wrap', name: '上下文圆环容器', pick: 'self' },
   { sel: '.ctx-card', name: '上下文明细卡' },
   { sel: '.head-btn', name: '顶栏按钮' },
   { sel: '.user-text', name: '用户消息文字' },
   { sel: '.bar-dropdown', name: '下拉菜单', pick: 'self' },
   { sel: '.bar-item', name: '下拉菜单项' },
+  /* 侧栏菜单（视图切换/项目操作/会话更多）：按钮没类名，不登记就只能落到按位置数的
+     结构选择器——「同类全部」用不了、悬停态也改不动（2026-11-12 用户圈选） */
+  { sel: '.side-menu', name: '侧栏菜单', pick: 'self' },
+  { sel: '.side-menu button', name: '侧栏菜单项' },
 ];
 // 取色/透明度解析：支持 rgb()/rgba()、Chromium 解析 color-mix 后给出的
 // color(srgb r g b / a)（分量是 0-1 小数），以及十六进制（源头声明经 var 解析后
@@ -519,6 +528,41 @@ export function hexWithAlpha(hex, opacityPct) {
   const b = parseInt(m[1].slice(4, 6), 16);
   return `rgba(${r}, ${g}, ${b}, ${a})`;
 }
+// 拆 box-shadow 的层：逗号分层，但括号里的逗号（rgba()）不算层
+function splitShadowLayers(shadow) {
+  const out = [];
+  let depth = 0;
+  let cur = '';
+  for (const ch of String(shadow || '')) {
+    if (ch === '(') depth++;
+    else if (ch === ')') depth--;
+    if (ch === ',' && depth === 0) {
+      if (cur.trim()) out.push(cur.trim());
+      cur = '';
+    } else cur += ch;
+  }
+  if (cur.trim()) out.push(cur.trim());
+  return out;
+}
+// 从 computed box-shadow 里找「inset 描边环」：inset 0 0 0 Npx color（spread>0）。
+// 选中态描边（设置导航 active/主题三选/chips）按 v2 定稿用 box-shadow 环画而不用
+// border——真 border 会让按钮尺寸跳 2px。微调面板的「描边」读数必须也认它，
+// 否则环元素显示 0px 而线照画（2026-11-12 用户圈出）。
+// 返回 { width, color, others }：width=环宽 px；color=环色原文（rgb() 形式）；
+// others=去掉环层后的其余层原文（面板预览重建时保留，不把别的层洗掉）。
+export function parseInsetRing(shadow) {
+  const layers = splitShadowLayers(shadow);
+  for (let i = 0; i < layers.length; i++) {
+    const lay = layers[i];
+    if (!/\binset\b/i.test(lay)) continue;
+    const lens = [...lay.matchAll(/(-?[\d.]+)px/g)].map((m) => parseFloat(m[1]));
+    // x y blur spread 四段长度，第四段（spread）才是环宽；三段的是普通投影不是环
+    if (lens.length < 4 || !(lens[3] > 0)) continue;
+    const color = (lay.match(/(rgba?\([^)]*\)|#[0-9a-f]{3,8})/i) || [])[1] || '';
+    return { width: lens[3], color, others: layers.filter((_, j) => j !== i) };
+  }
+  return null;
+}
 // 微调规则 → CSS（拼在手动 CSS 之前，手写 CSS 永远有最终话语权）；
 // 只输出当初亲手改过的属性（有键才输出），没动过的背景/颜色不会凭空出现。
 // background 用 background-color 而非简写，避免盖掉原有的渐变/图片/transparent 语义
@@ -531,6 +575,13 @@ export function microCss(tweaks, inFrame = false) {
   const imp = inFrame ? ' !important' : '';
   for (const t of Object.values(tweaks || {})) {
     if (!t || !t.sel) continue;
+    // 历史存下的位置链规则（带 :nth-of-type(...)、无 data-mt 标记）：只锚位置，
+    // DOM 一挪就漂到别的元素上（用户「调完又反弹」的老根子）。新版这类元素落成
+    // 单元素规则（带 uid）；老规则没有 uid 无法安全复现，直接不输出。
+    // 只拦「按序号数位置」的链——body、.process 这类普通标签/类选择器是稳定锚点，
+    // 不能误杀（2026-11-12：上一版用 /^[a-z]/ 把插件面板的 body 透明规则也杀了，
+    // 项目文件面板变回黑底）
+    if (!t.uid && /:nth-of-type\(/.test(t.sel)) continue;
     const decls = [];
     if (t.color) decls.push(`color: ${t.color}${imp}`);
     if (t.bgImage) {
@@ -540,8 +591,14 @@ export function microCss(tweaks, inFrame = false) {
     } else if (t.bg) {
       decls.push(`background-color: ${hexWithAlpha(t.bg, t.bgOpacity ?? 100)}${imp}`);
     }
-    if (t.border) decls.push(`border-style: solid${imp}`, `border-width: ${t.border}${imp}`);
-    if (t.borderColor) decls.push(`border-color: ${t.borderColor}${imp}`);
+    if (t.ring != null && String(t.ring) !== '') {
+      // 描边环（box-shadow inset 画的选中描边）：宽度走环不走 border——border 会让
+      // 元素跳 2px 布局，正是当初选中态改用环的原因。环宽拖到 0 = 去线（box-shadow:none）
+      const w = parseInt(t.ring, 10) || 0;
+      if (w > 0) decls.push(`box-shadow: inset 0 0 0 ${w}px ${t.ringColor || 'var(--g6)'}${imp}`);
+      else decls.push(`box-shadow: none${imp}`);
+    } else if (t.border) decls.push(`border-style: solid${imp}`, `border-width: ${t.border}${imp}`);
+    if (!(t.ring != null && String(t.ring) !== '') && t.borderColor) decls.push(`border-color: ${t.borderColor}${imp}`);
     if (t.blur != null && String(t.blur) !== '' && (parseInt(t.blur, 10) || 0) !== 0) decls.push(`backdrop-filter: blur(${parseInt(t.blur, 10) || 0}px)${imp}`);
     if (t.radius) decls.push(`border-radius: ${t.radius}${imp}`);
     if (t.fontSize) decls.push(`font-size: ${t.fontSize}${imp}`);

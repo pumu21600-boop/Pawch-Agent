@@ -90,7 +90,9 @@
     color: var(--g7);
   }
   .ws-chip.active {
-    border-color: var(--g5);
-    color: var(--g7);
+    /* 选中口径统一（2026-11-12）：橙字高亮无底色描边；底色模式铺 --sel-bg */
+    background: var(--sel-bg);
+    border-color: transparent;
+    color: var(--sel-fg);
   }
 </style>

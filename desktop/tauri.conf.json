@@ -15,6 +15,7 @@
         "height": 860,
         "minWidth": 900,
         "minHeight": 600,
+        "center": true,
         "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --remote-debugging-port=9223 --remote-debugging-address=127.0.0.1",
         "decorations": false,
         "dragDropEnabled": false

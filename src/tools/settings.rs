@@ -43,6 +43,10 @@ pub(crate) struct SettingsPatch {
     pub top_p: Option<f64>,
     pub thinking: Option<String>,
     pub thinking_style: Option<String>,
+    /// API 格式：openai/anthropic/responses（空=按端点特征推初值）
+    pub protocol: Option<String>,
+    /// 自动补后缀（默认 true）：false=Base URL 即最终地址
+    pub auto_suffix: Option<bool>,
     pub capabilities: Option<ModelCapabilities>,
     // —— 普通：子系统配置 ——
     pub roles: Option<RolesSettings>,
@@ -126,6 +130,8 @@ pub(crate) fn apply_patch(s: &mut Settings, p: &SettingsPatch) -> Result<Vec<Str
         top_p: p.top_p,
         thinking: p.thinking.clone(),
         thinking_style: p.thinking_style.clone(),
+        protocol: p.protocol.clone(),
+        auto_suffix: p.auto_suffix,
         capabilities: p.capabilities.clone(),
         ..Default::default()
     };
@@ -156,6 +162,8 @@ pub(crate) fn apply_patch(s: &mut Settings, p: &SettingsPatch) -> Result<Vec<Str
         (p.top_p.is_some(), "top_p"),
         (p.thinking.is_some(), "thinking"),
         (p.thinking_style.is_some(), "thinking_style"),
+        (p.protocol.is_some(), "protocol"),
+        (p.auto_suffix.is_some(), "auto_suffix"),
         (p.capabilities.is_some(), "capabilities"),
     ] {
         if given {
@@ -165,7 +173,38 @@ pub(crate) fn apply_patch(s: &mut Settings, p: &SettingsPatch) -> Result<Vec<Str
 
     // 2) 角色路由 / 功能开关 / 沙箱 CPU 上限——与 put_settings 同语义
     if let Some(roles) = p.roles.clone() {
-        s.roles = Some(roles);
+        // 2026-11-10：整表 patch 改为「按键合并」——只覆盖传到的字段，其余保留现状。
+        // 旧实现直接整体替换，模型只想改摘要时会把预算/子代理/降级链静默清空。
+        // 清空 fallbacks 用点号路径 roles.fallbacks=[]（整表空数组无法区分「未传」）。
+        let mut base = s.roles.clone().unwrap_or_default();
+        if roles.summary.is_some() {
+            base.summary = roles.summary;
+        }
+        if roles.vision.is_some() {
+            base.vision = roles.vision;
+        }
+        if roles.video.is_some() {
+            base.video = roles.video;
+        }
+        if roles.audio.is_some() {
+            base.audio = roles.audio;
+        }
+        if roles.embedding.is_some() {
+            base.embedding = roles.embedding;
+        }
+        if roles.budget.is_some() {
+            base.budget = roles.budget;
+        }
+        if roles.subagent.is_some() {
+            base.subagent = roles.subagent;
+        }
+        if roles.subagent_mode.is_some() {
+            base.subagent_mode = roles.subagent_mode;
+        }
+        if !roles.fallbacks.is_empty() {
+            base.fallbacks = roles.fallbacks;
+        }
+        s.roles = Some(base);
         changed.push("roles".into());
     }
     if let Some(features) = p.features.clone() {
@@ -657,8 +696,11 @@ mod tests {
             top_p: None,
             thinking: None,
             thinking_style: None,
+            protocol: None,
+            auto_suffix: true,
             capabilities: Default::default(),
             capabilities_user_set: false,
+            model_params: Default::default(),
         }
     }
 
@@ -880,8 +922,11 @@ mod approval_posture_tests {
             top_p: None,
             thinking: None,
             thinking_style: None,
+            protocol: None,
+            auto_suffix: true,
             capabilities: Default::default(),
             capabilities_user_set: false,
+            model_params: Default::default(),
         }
     }
 

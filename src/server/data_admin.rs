@@ -1207,6 +1207,40 @@ pub(super) async fn data_open(Json(req): Json<OpenReq>) -> Result<Json<Value>, (
     Ok(Json(json!({ "ok": true, "path": path.display().to_string() })))
 }
 
+// —— 界面微调规则导出（2026-11-12）——
+// 原来走浏览器下载：WebView2 的下载目录由系统定，前端拿不到路径，用户问「导出到哪了」。
+// 改成服务端写 <数据目录>/exports/<名>.json，真实路径回给界面显示；同名自动加序号。
+#[derive(Debug, Deserialize)]
+pub(super) struct MicroExportReq {
+    pub json: String,
+    #[serde(default)]
+    pub filename: String,
+}
+
+pub(super) async fn micro_export(
+    Json(req): Json<MicroExportReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let dir = crate::config::data_root().join("exports");
+    std::fs::create_dir_all(&dir).map_err(|e| err_json(format!("创建导出目录失败: {e}")))?;
+    // 只取文件名部分，防路径穿越
+    let raw = req.filename.trim();
+    let base = raw.rsplit(['/', '\\']).next().unwrap_or("").trim();
+    let stem = if base.is_empty() {
+        format!("ui-css-rules-{}", chrono::Local::now().format("%Y%m%d-%H%M%S"))
+    } else {
+        base.trim_end_matches(".json").to_string()
+    };
+    let mut path = dir.join(format!("{stem}.json"));
+    let mut i = 1u32;
+    while path.exists() && i <= 999 {
+        path = dir.join(format!("{stem}-{i}.json"));
+        i += 1;
+    }
+    std::fs::write(&path, req.json.as_bytes())
+        .map_err(|e| err_json(format!("写入导出文件失败: {e}")))?;
+    Ok(Json(json!({ "ok": true, "path": path.display().to_string() })))
+}
+
 fn err_json(msg: impl Into<String>) -> (StatusCode, Json<Value>) {
     (StatusCode::BAD_REQUEST, Json(json!({ "error": msg.into() })))
 }

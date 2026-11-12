@@ -142,11 +142,15 @@ impl CronSpec {
         let time = if full_min && full_hour {
             "每分钟".to_string()
         } else if full_min {
-            // 等步进（*/n）→ 每 n 分钟；否则枚举分钟
-            match even_step(&self.minutes) {
+            // 等步进（*/n）→ 每分钟/每 n 分钟；否则枚举分钟。
+            // 2026-11-10：小时受限时必须把窗口说出来——`* 9-18 * * *` 曾被描述成
+            // 干巴巴的「每 1 分钟」，9-18 点的限制整段消失。
+            let per_min = match even_step(&self.minutes) {
+                Some(1) => "每分钟".to_string(),
                 Some(step) if self.minutes[0] == 0 => format!("每 {step} 分钟"),
                 _ => format!("每小时 {} 分", list(&self.minutes)),
-            }
+            };
+            format!("{}内{}", hours_window(&self.hours), per_min)
         } else if full_hour {
             // 等步进分钟（0,30 → 每 30 分钟；0,15,30,45 → 每 15 分钟）
             match even_step(&self.minutes) {
@@ -207,6 +211,28 @@ fn even_step(v: &[u32]) -> Option<u32> {
 
 fn list(v: &[u32]) -> String {
     v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",")
+}
+
+/// 小时集合的人话窗口：连续段合并成区间（9–18 点），不连续列举（9、12、15 点）。
+/// 只用于「分钟全量 + 小时受限」这类描述，避免「每 1 分钟」把小时限制吞掉。
+fn hours_window(hours: &[u32]) -> String {
+    let mut ranges: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < hours.len() {
+        let start = hours[i];
+        let mut end = start;
+        while i + 1 < hours.len() && hours[i + 1] == end + 1 {
+            i += 1;
+            end = hours[i];
+        }
+        ranges.push(if end > start {
+            format!("{start}–{end} 点")
+        } else {
+            format!("{start} 点")
+        });
+        i += 1;
+    }
+    ranges.join("、")
 }
 
 const WEEK_CN: [&str; 7] = ["日", "一", "二", "三", "四", "五", "六"];
@@ -298,5 +324,19 @@ mod tests {
         assert_eq!(parse("0 9 * * 1,3").unwrap().describe(), "每周一三 09:00");
         // 每小时整点（分钟只有 0）
         assert_eq!(parse("0 * * * *").unwrap().describe(), "每小时 0 分");
+    }
+
+    /// 2026-11-10：分钟全量 + 小时受限时必须保留小时窗口（曾只显示「每 1 分钟」，
+    /// 9-18 点的限制整段消失）。
+    #[test]
+    fn describe_keeps_hour_window_when_minutes_full() {
+        let d = parse("* 9-18 * * *").unwrap().describe();
+        assert!(d.contains("9–18 点"), "{d}");
+        assert!(d.contains("每分钟"), "{d}");
+        let d2 = parse("*/30 9-18 * * *").unwrap().describe();
+        // 分钟非全量时走字段枚举（不是本条 bug 的形态），但小时限制必须在
+        assert!(d2.contains("9,10") && d2.contains("0,30"), "{d2}");
+        let d3 = parse("* 9,12,15 * * *").unwrap().describe();
+        assert!(d3.contains("9 点、12 点、15 点"), "{d3}");
     }
 }

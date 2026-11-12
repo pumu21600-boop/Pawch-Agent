@@ -27,6 +27,12 @@ pub struct SettingsUpdate {
     pub provider_id: Option<String>,
     #[serde(default)]
     pub base_url: Option<String>,
+    /// 传输协议（API 格式）：openai/anthropic/responses（auto/空=按端点特征推初值）
+    #[serde(default)]
+    pub protocol: Option<String>,
+    /// 自动补后缀（true=按惯例补 /v1/messages 等；false=Base URL 原样直发）
+    #[serde(default)]
+    pub auto_suffix: Option<bool>,
     #[serde(default)]
     pub model: Option<String>,
     /// 弹窗里勾选保存的模型列表（多选）；Some 则整体替换
@@ -57,6 +63,9 @@ pub struct SettingsUpdate {
     /// 模型能力标记（工具调用/图片/视频/音频解析）。Some = 用户手动勾选并保存
     #[serde(default)]
     pub capabilities: Option<crate::config::settings::ModelCapabilities>,
+    /// 每个模型各自的参数覆盖（整表替换，键=模型 id；不含的模型即删除覆盖）
+    #[serde(default)]
+    pub model_params: Option<std::collections::BTreeMap<String, crate::config::settings::ModelParams>>,
     /// 角色路由映射（摘要/标题/多模态旁路/降级链）
     #[serde(default)]
     pub roles: Option<crate::config::settings::RolesSettings>,
@@ -159,6 +168,20 @@ pub(crate) fn apply_settings_update(s: &mut Settings, req: &SettingsUpdate) -> R
         if let Some(v) = &req.base_url {
             c.base_url = v.trim().to_string();
         }
+        if let Some(v) = req.auto_suffix {
+            c.auto_suffix = v;
+        }
+        if let Some(v) = &req.protocol {
+            // 词表严格校验（auto/openai/anthropic）：「设了没生效」比报错更难查
+            let v = v.trim().to_lowercase();
+            c.protocol = match v.as_str() {
+                "" | "auto" => None,
+                "openai" | "anthropic" | "responses" => Some(v),
+                other => {
+                    return Err(format!("protocol={other} 不在词表（openai/anthropic/responses）"));
+                }
+            };
+        }
         if let Some(v) = &req.model {
             let v = v.trim().to_string();
             if c.model != v {
@@ -198,6 +221,9 @@ pub(crate) fn apply_settings_update(s: &mut Settings, req: &SettingsUpdate) -> R
         if let Some(v) = &req.thinking_style.as_deref() {
             let v = v.trim().to_lowercase();
             c.thinking_style = if v.is_empty() || v == "auto" { None } else { Some(v.to_string()) };
+        }
+        if let Some(mp) = &req.model_params {
+            c.model_params = mp.clone();
         }
         if let Some(caps) = &req.capabilities {
             c.capabilities = caps.clone();
@@ -374,12 +400,108 @@ pub(super) async fn list_models(
     if api_key.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "未设置 API key" })));
     }
-    match state.gateway.list_models(&base_url, &api_key).await {
+    // 「API 格式」锁定跟随激活配置：锁了 Anthropic Messages 就按 /v1/models + x-api-key 拉
+    let active = s.active();
+    let (protocol, suffix_auto) = match active {
+        Some(c) => (c.effective_protocol(), c.auto_suffix),
+        None => (gateway::Protocol::OpenAiCompletions, true),
+    };
+    match state.gateway.list_models_with(&base_url, &api_key, protocol, suffix_auto).await {
         Ok(models) => (StatusCode::OK, Json(json!({ "models": models }))),
         Err(e) => {
             observability::event(EventType::Error, json!({ "message": e.to_string() }));
             (StatusCode::BAD_GATEWAY, Json(json!({ "error": e.to_string() })))
         }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TestModelRequest {
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: String,
+    pub model: String,
+}
+
+/// 单模型连通性测试：用该模型真发一条极短补全（max_tokens=16、不思考）。
+/// 与「测试连接」（只拉模型清单）不同——这里验的是这个模型能不能出话。
+/// 请求显式给的 base_url/key 优先，否则回落当前激活配置。
+pub(super) async fn test_model(
+    State(state): State<AppState>,
+    Json(req): Json<TestModelRequest>,
+) -> (StatusCode, Json<Value>) {
+    let s = state.settings.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let base_url = if req.base_url.trim().is_empty() {
+        s.effective_base_url()
+    } else {
+        req.base_url.trim().to_string()
+    };
+    let api_key = if !req.api_key.trim().is_empty() {
+        req.api_key.trim().to_string()
+    } else {
+        s.get_key()
+            .or_else(|| std::env::var("DEEPSEEK_API_KEY").ok())
+            .unwrap_or_default()
+    };
+    let model = req.model.trim().to_string();
+    if base_url.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "base_url 为空" })));
+    }
+    if api_key.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "未设置 API key" })));
+    }
+    if model.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "模型 id 为空" })));
+    }
+    let preset = gateway::providers::find(&s.provider_id());
+    let mut params = match preset {
+        Some(p) => gateway::ChatParams::from_preset(p),
+        None => gateway::ChatParams::default(),
+    };
+    params.max_tokens = Some(16);
+    params.thinking = None;
+    params.base_url = Some(base_url.clone());
+    params.tools_enabled = false;
+    params.vision = false;
+    // 「API 格式」跟随激活配置（2026-11-11）：锁了 Anthropic Messages 就按
+    // /v1/messages + x-api-key 真发，测试结果如实回报协议与目标 URL——失败不再黑盒
+    params.protocol = Some(s.active_or_default().effective_protocol());
+    params.suffix_auto = s.active_or_default().auto_suffix;
+    let eff = params.protocol.unwrap_or_else(|| s.active_or_default().effective_protocol());
+    let protocol_str = eff.as_str();
+    let endpoint = gateway::Gateway::endpoint_url_with(&base_url, eff, params.suffix_auto);
+    let ctx = gateway::UsageCtx::aux("", "test");
+    let prompt = json!([{ "role": "user", "content": "只回复 ok" }]);
+    let started = std::time::Instant::now();
+    let r = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        state.gateway.complete(&ctx, &base_url, &model, &api_key, &prompt, &params),
+    )
+    .await;
+    match r {
+        Ok(Ok(reply)) => {
+            let reply: String = reply.trim().chars().take(60).collect();
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "latency_ms": started.elapsed().as_millis() as u64,
+                    "reply": reply,
+                    "protocol": protocol_str,
+                    "url": endpoint,
+                })),
+            )
+        }
+        Ok(Err(e)) => {
+            observability::event(EventType::Error, json!({ "kind": "model.test_failed", "model": model, "message": e.to_string() }));
+            // 失败也带协议与目标 URL：用户能立刻看出「按错协议打错门」这类配置问题
+            (StatusCode::BAD_GATEWAY, Json(json!({ "error": e.to_string(), "protocol": protocol_str, "url": endpoint })))
+        }
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(json!({ "error": "测试超时（30 秒），渠道没有响应" })),
+        ),
     }
 }
 
@@ -461,8 +583,11 @@ fn config_state_json(s: &Settings, global_budget: u64) -> Value {
                 "top_p": c.top_p,
                 "thinking": c.thinking,
                 "thinking_style": c.thinking_style,
+                "protocol": c.effective_protocol().as_settings_str(),
+                "auto_suffix": c.auto_suffix,
                 "capabilities": c.capabilities,
                 "capabilities_user_set": c.capabilities_user_set,
+                "model_params": c.model_params,
             })
         }).collect::<Vec<Value>>(),
         "active_config_id": s.active_config_id,
@@ -475,13 +600,19 @@ fn config_state_json(s: &Settings, global_budget: u64) -> Value {
         "context_length": active.context_length,
         // 渠道覆盖后的生效窗口（圆环分母 / 压缩线同一把尺子；前端不再自己猜全局值）。
         // 0 视同未设（手工改出来的 0 不该把窗口压成 0）。
-        "context_window": active.context_length.filter(|v| *v > 0).unwrap_or(global_budget),
+        // 按当前模型取（模型级覆盖 > 配置级）
+        "context_window": active
+            .params_for(&active.effective_model())
+            .context_length
+            .filter(|v| *v > 0)
+            .unwrap_or(global_budget),
         "max_output_tokens": active.max_output_tokens,
         "temperature": active.temperature,
         "top_p": active.top_p,
         "thinking": active.thinking,
         "capabilities": active.capabilities,
         "capabilities_user_set": active.capabilities_user_set,
+        "model_params": active.model_params,
         "has_key": key.is_some(),
         "key_hint": key_hint_of(key),
         // 工作区 + / 思考参数形态覆盖（前端按它渲染档位菜单与全协议规范）
@@ -492,6 +623,9 @@ fn config_state_json(s: &Settings, global_budget: u64) -> Value {
         "workspace_folders": s.workspace_folders,
         "thinking_style_override": active.thinking_style,
         "thinking_style": effective_thinking_style(active, preset),
+        // 「API 格式」选择器与「自动补后缀」勾选框的回显
+        "protocol": active.effective_protocol().as_settings_str(),
+        "auto_suffix": active.auto_suffix,
         "roles": s.roles,
         "features": s.features,
         // 压缩线回传给前端（漏了它 applyState 会把输入框弹回默认 85）
@@ -517,11 +651,12 @@ fn effective_thinking_style(
         Some(v) => TF::parse(v).map(|f| f.as_str()).unwrap_or("auto"),
         // auto：端点探测（预设 thinking_format 是探测认不出时的兜底）
         _ => {
-            let compat = gateway::compat::resolve(
+            let compat = gateway::compat::resolve_with_protocol(
                 Some(c.provider_id.as_str()),
                 Some(&c.effective_base_url()),
                 &c.model,
                 preset.and_then(|p| p.thinking_format),
+                Some(c.effective_protocol()),
             );
             if compat.protocol == gateway::compat::Protocol::AnthropicMessages {
                 "anthropic"
@@ -553,8 +688,11 @@ mod tests {
             top_p: None,
             thinking: None,
             thinking_style: None,
+            protocol: None,
+            auto_suffix: true,
             capabilities: Default::default(),
             capabilities_user_set: false,
+            model_params: Default::default(),
         }
     }
 
@@ -596,27 +734,30 @@ mod tests {
             top_p: None,
             thinking: Some("off".into()),
             thinking_style: Some("qwen".into()),
+            protocol: None,
+            auto_suffix: true,
             capabilities: Default::default(),
             capabilities_user_set: false,
+            model_params: Default::default(),
         };
-        let p = build_chat_params(&c, preset);
+        let p = build_chat_params(&c, preset, "");
         assert_eq!(p.thinking_format, Some(gateway::compat::ThinkingFormat::Qwen));
         // 覆盖后 off 真的会发 enable_thinking:false
         let body = gateway::build_body("m", &json!([]), true, &p, None);
         assert_eq!(body["enable_thinking"], json!(false));
         // 旧设置值自动映射：thinking_object → zai
         c.thinking_style = Some("thinking_object".into());
-        let p = build_chat_params(&c, preset);
+        let p = build_chat_params(&c, preset, "");
         assert_eq!(p.thinking_format, Some(gateway::compat::ThinkingFormat::Zai));
         // none：任何思考参数都不发（none 用 openai 形态但不发档位=零思考字段）
         c.thinking_style = Some("none".into());
-        let p = build_chat_params(&c, gateway::providers::find("zhipu"));
+        let p = build_chat_params(&c, gateway::providers::find("zhipu"), "");
         let body = gateway::build_body("glm-4.6", &json!([]), true, &p, None);
         assert!(body.get("thinking").is_none() && body.get("enable_thinking").is_none());
         // auto：端点探测（zhipu 官方域名 → zai 形态）
         c.thinking_style = None;
         c.thinking = Some("on".into());
-        let p = build_chat_params(&c, gateway::providers::find("zhipu"));
+        let p = build_chat_params(&c, gateway::providers::find("zhipu"), "");
         let body = gateway::build_body("glm-4.6", &json!([]), true, &p, None);
         assert_eq!(p.thinking_format, None, "auto 不写覆盖，探测说了算");
         assert_eq!(body["thinking"], json!({"type":"enabled"}), "探测出 zai 形态后 on 生效");
@@ -641,8 +782,11 @@ mod tests {
             top_p: None,
             thinking: None,
             thinking_style: None,
+            protocol: None,
+            auto_suffix: true,
             capabilities: Default::default(),
             capabilities_user_set: false,
+            model_params: Default::default(),
         };
         // 自定义中转（空地址探测不出）→ openai 形态兜底
         c.provider_id = "custom".into();
@@ -677,13 +821,16 @@ mod tests {
             top_p: None,
             thinking: None,
             thinking_style: None,
+            protocol: None,
+            auto_suffix: true,
             capabilities: Default::default(),
             capabilities_user_set: false,
+            model_params: Default::default(),
         };
         // 输入栏 🧠 菜单发的档位要能持久化（期间被 put_settings 吞掉的老问题）
         for lvl in ["low", "medium", "high", "on", "off"] {
             c.thinking = Some(lvl.into());
-            let p = build_chat_params(&c, gateway::providers::find("openai"));
+            let p = build_chat_params(&c, gateway::providers::find("openai"), "");
             assert_eq!(p.thinking.as_deref(), Some(lvl));
         }
     }
@@ -701,7 +848,7 @@ mod tests {
         };
         let _ = apply_settings_update(&mut s, &req);
         assert_eq!(s.active().unwrap().thinking_style.as_deref(), Some("zai"));
-        let mut p = build_chat_params(s.active().unwrap(), gateway::providers::find("custom"));
+        let mut p = build_chat_params(s.active().unwrap(), gateway::providers::find("custom"), "");
         // 端点探测对中转域名给 openai 兜底；显式覆盖必须赢
         p.thinking = Some("on".into());
         let body = gateway::build_body(
@@ -831,7 +978,7 @@ mod tests {
             ..Default::default()
         };
         let _ = apply_settings_update(&mut s, &req);
-        let p = build_chat_params(s.active().unwrap(), gateway::providers::find("custom"));
+        let p = build_chat_params(s.active().unwrap(), gateway::providers::find("custom"), "");
         assert!(!p.tools_enabled);
         let body = gateway::build_body(
             "m",
@@ -842,7 +989,7 @@ mod tests {
         );
         assert!(body.get("tools").is_none(), "tools=false 时请求体不得携带 tools");
         // 对照：默认（不勾掉）→ tools_enabled=true，agent 循环携带 tools
-        let p = build_chat_params(&test_config(), gateway::providers::find("custom"));
+        let p = build_chat_params(&test_config(), gateway::providers::find("custom"), "");
         assert!(p.tools_enabled);
     }
 

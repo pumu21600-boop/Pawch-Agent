@@ -350,7 +350,7 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "computer",
-            description: "操作电脑（仅桌面应用/系统界面；页面在内置浏览器里时，看页面用 browser 的 screenshot，别截整个桌面）：截屏看屏幕 + 键鼠控制（SendInput）+ 窗口聚焦 + 启动应用。一个工具按 method 覆盖：screenshot 截虚拟屏 PNG（结果里内联图片，你直接能看见屏幕；全尺寸存工作区 screenshots/ 供用户看），配 region={x,y,w,h}（屏幕坐标）只截局部、可加 scale 放大——小控件（开关/圆点/小按钮）一律先截局部，别在整屏缩略图上估坐标；cursor/screen_size/windows 坐标与窗口清单（只读）；**find 按名字找控件（UI Automation）：给个名字片段（如 \"系统代理\"），直接返回控件及其同一行按钮/开关的精确中心坐标——找按钮/开关先用它，别在截图上估**；focus 按标题或句柄把窗口带到前台（能破解前台锁；被拒时看返回诊断）；click/move/scroll/drag 鼠标——**click 点完会回一张 2 倍放大的局部图：红色十字就是你的点击点，并告诉你这块区域点完有没有变化**；十字没压住目标，就量「十字→目标」的图上距离 ÷2 改坐标再点一次（别原地微调，也别整屏重截），verify=false 可关回执；type 灌文本（Unicode 直输，中文没问题）；key 组合键（\"ctrl+c\"、\"alt+f4\"、\"enter\"）；launch 打开应用/文档：**给应用名就行**（如 \"Tabbit\"、\"Clash Verge\"，自己会去桌面和开始菜单找），也会等窗口出现、直接带到前台并回 hwnd——一次调用就够，别再 dir/where 找路径、也别启动后先 windows 再 screenshot 摸底；进程独立存活，不受 shell 命令结束清理——**开应用用它，别用 shell 的 start/Start-Process**。坐标用屏幕绝对坐标（截图上的像素位置即坐标，内联图有缩放时按结果里的比例换算）。键盘没反应时先看返回里的焦点窗口诊断。键鼠动作按会话审批档走闸（只读档每次问）。",
+            description: "操作电脑（仅桌面应用/系统界面；页面在内置浏览器里时，看页面用 browser 的 screenshot，别截整个桌面）。**配置类动作（接 MCP、建技能、改渠道/定时任务）先走 settings/skill/配置文件，不要用本工具去设置页点 UI；本工具只做只有 GUI 才能做的桌面操作。** 截屏看屏幕 + 键鼠控制（SendInput）+ 窗口聚焦 + 启动应用。一个工具按 method 覆盖：screenshot 截虚拟屏 PNG（结果里内联图片，你直接能看见屏幕；全尺寸存工作区 screenshots/ 供用户看），配 region={x,y,w,h}（屏幕坐标）只截局部、可加 scale 放大——小控件（开关/圆点/小按钮）一律先截局部，别在整屏缩略图上估坐标；cursor/screen_size/windows 坐标与窗口清单（只读）；**find 按名字找控件（UI Automation）：给个名字片段（如 \"系统代理\"），直接返回控件及其同一行按钮/开关的精确中心坐标——找按钮/开关先用它，别在截图上估**；focus 按标题或句柄把窗口带到前台（能破解前台锁；被拒时看返回诊断）；click/move/scroll/drag 鼠标——**click 点完会回一张 2 倍放大的局部图：红色十字就是你的点击点，并告诉你这块区域点完有没有变化**；十字没压住目标，就量「十字→目标」的图上距离 ÷2 改坐标再点一次（别原地微调，也别整屏重截），verify=false 可关回执；type 灌文本（Unicode 直输，中文没问题）；key 组合键（\"ctrl+c\"、\"alt+f4\"、\"enter\"）；launch 打开应用/文档：**给应用名就行**（如 \"Tabbit\"、\"Clash Verge\"，自己会去桌面和开始菜单找），也会等窗口出现、直接带到前台并回 hwnd——一次调用就够，别再 dir/where 找路径、也别启动后先 windows 再 screenshot 摸底；进程独立存活，不受 shell 命令结束清理——**开应用用它，别用 shell 的 start/Start-Process**。坐标用屏幕绝对坐标（截图上的像素位置即坐标，内联图有缩放时按结果里的比例换算）。键盘没反应时先看返回里的焦点窗口诊断。键鼠动作按会话审批档走闸（只读档每次问）。",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -417,7 +417,7 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "settings",
-            description: "读取或修改本应用自身的运行时设置（settings.json）与 config.toml。get：全部设置快照（key 只给尾号）。schema（只读不受闸）：全部可改路径的自描述（路径/类型/可选值/默认/风险档）——set 之前先读它，别瞎猜键名。set 配 patch（顶层键或点号子路径，如 features.galaxy=false、roles.summary=主力配置名）：普通键静默生效；渠道指向键（base_url/model/provider_id/active_config_id，即请求往哪个端点、用哪个模型名发出去的路由参数）同档按审批走。set_config 配 key+value 改 config.toml（保注释，重启生效）；default_approval 必问。config 配 op：new=新建渠道配置并激活；delete+id=删配置（删密钥，按档位问）。mcp op=refresh+name 重连 MCP；workspace path 切换工作区（按档位问）；alias name 给工作区改显示名（细则见系统提示【工作区】节）；schedule_run id 立即跑定时任务（真花钱，按档位问）；memory op=reindex 重建记忆索引。范围外直接报错：api_key/clear_key（key 永不经模型之手，换 key 请用户到设置页）。审批档位 agent 没有任何通道可改，用户要切档请他去输入框上方的档位菜单手动切。第三方插件信任走 plugin 工具。除 get/schema/set_config 外受「中枢」闸（见系统提示「自我管理与探索纪律」）。",
+            description: "读取或修改本应用自身的运行时设置（settings.json）与 config.toml。get：全部设置快照（key 只给尾号）。schema（只读不受闸）：全部可改路径的自描述（路径/类型/可选值/默认/风险档）——set 之前先读它，别瞎猜键名。set 配 patch（顶层键或点号子路径，如 features.galaxy=false、roles.summary=主力配置名）：普通键静默生效；渠道指向键（base_url/model/provider_id/active_config_id，即请求往哪个端点、用哪个模型名发出去的路由参数）同档按审批走。set_config 配 key+value 改 config.toml（保注释，重启生效）；default_approval 必问。config 配 op：new=新建渠道配置并激活；delete+id=删配置（删密钥，按档位问）。mcp op=refresh+name 重连 MCP；加/改 MCP server 用 set patch={\"mcp_servers\":[...]}（整表替换，先 get 拿现状；字段看 schema）再 mcp op=refresh name=… 验证，不要开设置页用 computer 点；workspace path 切换工作区（按档位问）；alias name 给工作区改显示名（细则见系统提示【工作区】节）；schedule_run id 立即跑定时任务（真花钱，按档位问）；memory op=reindex 重建记忆索引。范围外直接报错：api_key/clear_key（key 永不经模型之手，换 key 请用户到设置页）。审批档位 agent 没有任何通道可改，用户要切档请他去输入框上方的档位菜单手动切。第三方插件信任走 plugin 工具。除 get/schema/set_config 外受「中枢」闸（见系统提示「自我管理与探索纪律」）。",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -486,7 +486,7 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "skill",
-            description: "技能管理正门：action=list 列出全部技能（含插件自带的，标注 source/plugin）；action=save 新建或覆盖一个技能（name + description 一句话 + content 正文：触发时机与步骤，markdown；落全局技能根，下一轮对话进系统提示索引）；action=delete 删除自建技能（插件自带技能拒删，想覆盖用 save 写同名自建版）。要创建技能就用本工具——不用也不要去文件系统里翻找。",
+            description: "技能管理正门：action=list 列出全部技能（含插件自带的，标注 source/plugin）；action=save 新建或覆盖一个技能（name + description 一句话 + content 正文：触发时机与步骤，markdown；落全局技能根，下一轮对话进系统提示索引）；action=delete 删除自建技能（插件自带技能拒删，想覆盖用 save 写同名自建版）。要创建技能就用本工具——不用也不要去文件系统里翻找，更不要开设置页用 computer 点。",
             parameters: json!({
                 "type": "object",
                 "properties": {

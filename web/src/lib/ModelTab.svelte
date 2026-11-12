@@ -1,4 +1,5 @@
 <script>
+  import { tick } from 'svelte';
   import Select from '../Select.svelte';
 
   export let tab = '';
@@ -13,6 +14,9 @@
   export let deleteConfig = () => {};
   export let providerId = '';
   export let onProviderChange = () => {};
+  /// 「API 格式」三选（openai/anthropic/responses）与「自动补后缀」勾选
+  export let protocol = 'openai';
+  export let autoSuffix = true;
   export let baseUrl = '';
   export let apiKey = '';
   export let typingHint = '';
@@ -20,70 +24,201 @@
   export let configName = '';
   export let model = '';
   export let savedModels = [];
+  /// 当前配置的「每模型参数覆盖」（键=模型 id）
+  export let modelParams = {};
   export let fetchModels = () => {};
-  export let ctxLen = 0;
-  export let maxOut = 0;
-  export let temperature = null;
-  export let topP = null;
   export let capabilities = { tools: true, vision: false, video: false, audio: false };
   export let autoSave = () => {};
+  export let confirm = async () => true;
 
-  // 模型从下拉改成输入框。两种填法等价——
-  // ① 直接手打模型 id（英文逗号分隔多个）；② 点「获取模型」勾选，勾完回填成同一串。
-  // 保存时解析成 models 列表；当前模型不在新表里就落到第一个（否则会指向被删掉的模型）。
-  // 输入框清空不落盘（防止手滑把整份清单清掉），失焦时回显已保存的清单。
-  let modelsText = '';
-  let modelsKey = '';
-  $: {
-    const key = (savedModels || []).join('\u0000');
-    if (key !== modelsKey) {
-      modelsKey = key;
-      modelsText = (savedModels || []).join(', ');
-    }
+  let openModel = ''; // 展开参数面板的模型
+  let addOpen = false; // 「+ 添加模型」展开的输入行
+  let addText = ''; // 手动添加模型 id
+  let addErr = '';
+  let addInput = null;
+  let rowTest = {}; // 模型 id → { state: 'testing'|'ok'|'fail', text }
+  let rowTestTimers = {}; // 结果 2 秒后自动收掉（避免测试记录常驻）
+
+  const CAPS = [
+    ['tools', '工具调用'],
+    ['vision', '图片解析'],
+    ['video', '视频解析'],
+    ['audio', '音频解析'],
+  ];
+  // 每模型可覆盖的四项数值参数
+  const NUM_FIELDS = [
+    ['context_length', '最大上下文长度'],
+    ['max_output_tokens', '最大输出长度'],
+    ['temperature', '温度'],
+    ['top_p', 'top_p'],
+  ];
+
+  /// 某模型的覆盖值（没填 = 空，运行时会回落配置级/渠道默认）
+  function eff(m, key) {
+    const p = (modelParams || {})[m] || {};
+    return p[key] !== undefined && p[key] !== null ? p[key] : null;
   }
-  function parseModels(s) {
-    const out = [];
-    for (const raw of String(s || '').split(',')) {
-      const m = raw.trim();
-      if (m && !out.includes(m)) out.push(m);
-    }
-    return out;
+  function hasOverride(m, key) {
+    return eff(m, key) !== null;
   }
-  function commitModels() {
-    const list = parseModels(modelsText);
-    const cur = savedModels || [];
-    const same = list.length === cur.length && list.every((m, i) => m === cur[i]);
-    if (same) {
-      modelsText = cur.join(', ');
-      return;
+  function effCaps(m) {
+    const p = (modelParams || {})[m] || {};
+    return p.capabilities || capabilities;
+  }
+
+  /// 改某个模型的一项覆盖：null/空 = 删除该项（回落配置级）；
+  /// 整条记录空了就把该模型从 model_params 里删掉
+  function patchModel(m, patch) {
+    const next = { ...(modelParams || {}) };
+    const cur = { ...(next[m] || {}) };
+    for (const [k, v] of Object.entries(patch)) {
+      if (v === null || v === undefined || v === '') delete cur[k];
+      else cur[k] = v;
     }
+    if (Object.keys(cur).length === 0) delete next[m];
+    else next[m] = cur;
+    modelParams = next;
+    autoSave({ model_params: next }, 0);
+  }
+  function setCap(m, key, val) {
+    patchModel(m, { capabilities: { ...effCaps(m), [key]: val } });
+  }
+  function setNum(m, key, raw) {
+    const s = String(raw == null ? '' : raw).trim();
+    const n = Number(s);
+    patchModel(m, { [key]: s === '' || !Number.isFinite(n) ? null : n });
+  }
+  async function removeModel(m) {
+    const list = (savedModels || []).filter((x) => x !== m);
     if (!list.length) {
-      modelsText = cur.join(', '); // 空清单不落盘：回显已保存的
+      rowTest = { ...rowTest, [m]: { state: 'fail', text: '至少要保留一个模型' } };
       return;
     }
+    if (!(await confirm(`删除模型「${m}」？`))) return;
     const nextModel = list.includes(model) ? model : list[0];
-    model = nextModel;
-    modelsText = list.join(', ');
-    autoSave({ models: list, model: nextModel }, 0);
+    const nextParams = { ...(modelParams || {}) };
+    delete nextParams[m];
+    if (openModel === m) openModel = '';
+    modelParams = nextParams;
+    autoSave({ models: list, model: nextModel, model_params: nextParams }, 0);
+  }
+  function openAdd() {
+    addOpen = true;
+    addErr = '';
+    tick().then(() => addInput?.focus());
+  }
+  function closeAdd() {
+    addOpen = false;
+    addText = '';
+    addErr = '';
+  }
+  function addModel() {
+    const id = addText.trim();
+    if (!id) return;
+    const list = savedModels || [];
+    if (list.includes(id)) {
+      addErr = '这个模型已经在列表里';
+      return;
+    }
+    closeAdd();
+    autoSave({ models: [...list, id], model: model || id }, 0);
+  }
+  /// 单模型连通性：后端用这个模型真发一条极短补全（不是只看模型清单）。
+  /// 结果带协议与目标 URL（2026-11-11）：失败能立刻看出「按错协议打错门」。
+  const protoLabel = (p) =>
+    p === 'anthropic-messages'
+      ? 'Anthropic Messages'
+      : p === 'openai-responses'
+        ? 'Responses'
+        : 'Chat Completions';
+  async function testModelConn(m) {
+    clearTimeout(rowTestTimers[m]);
+    rowTest = { ...rowTest, [m]: { state: 'testing', text: '测试中…' } };
+    try {
+      const r = await fetch('/api/models/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, model: m }),
+      });
+      const d = await r.json();
+      if (!r.ok || !d.ok) {
+        const where_ = d.url ? `（${protoLabel(d.protocol)} → ${d.url}）` : '';
+        throw new Error((d.error || 'HTTP ' + r.status) + where_);
+      }
+      rowTest = {
+        ...rowTest,
+        [m]: {
+          state: 'ok',
+          text: `连通（${d.latency_ms}ms · ${protoLabel(d.protocol)}）${d.reply ? ' · ' + d.reply : ''}`,
+        },
+      };
+    } catch (e) {
+      rowTest = { ...rowTest, [m]: { state: 'fail', text: '连接失败：' + (e.message || e) } };
+    }
+    // 结果只留 2 秒（用户 2026-11-10：连通提示两秒后消失）
+    rowTestTimers[m] = setTimeout(() => {
+      const next = { ...rowTest };
+      delete next[m];
+      rowTest = next;
+      delete rowTestTimers[m];
+    }, 2000);
+  }
+  /// 直接改模型 id：列表、model_params 的键、当前模型三处一起迁移
+  function renameModel(oldId, newId) {
+    const id = String(newId || '').trim();
+    const list = savedModels || [];
+    if (!id || id === oldId || list.includes(id)) return;
+    const nextList = list.map((x) => (x === oldId ? id : x));
+    const nextParams = { ...(modelParams || {}) };
+    if (nextParams[oldId] !== undefined) {
+      nextParams[id] = nextParams[oldId];
+      delete nextParams[oldId];
+    }
+    modelParams = nextParams;
+    if (openModel === oldId) openModel = id;
+    autoSave({ models: nextList, model: model === oldId ? id : model, model_params: nextParams }, 0);
+  }
+  function pickModel(m) {
+    if (m === model) return;
+    autoSave({ model: m }, 0);
   }
 </script>
 
 {#if tab === 'model'}
   <div class="field">
     <label>配置</label>
-    <div class="chips">
-      {#each configs as c}
-        <button
-          class="chip"
-          class:active={c.id === activeConfigId}
-          title={configLabel(c) + ' · ' + (c.model || '未选模型') + (c.has_key ? ' · 有key' : ' · 无key')}
-          on:click={() => manageConfig('apply', c.id)}
-        >
-          <span class="dot" class:haskey={c.has_key}></span>{configLabel(c)}
-        </button>
-      {/each}
-      <button class="chip add" on:click={newConfig}>新建配置</button>
-      <button class="chip del" on:click={deleteConfig}>删除当前</button>
+    <div class="config-row">
+      <Select
+        value={activeConfigId}
+        title="切换配置"
+        options={configs.map((c) => ({
+          value: c.id,
+          label: configLabel(c),
+          hint: c.has_key ? '' : '无key',
+        }))}
+        on:change={(e) => manageConfig('apply', e.detail)}
+      />
+      <button
+        class="cfg-del"
+        title={configs.length <= 1 ? '至少保留一套配置' : '删除当前配置'}
+        disabled={configs.length <= 1}
+        on:click={deleteConfig}
+      >
+        <svg
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.8"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        ><path d="M3 6h18" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" /><path
+            d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"
+          /></svg>
+      </button>
+      <button class="chip add" on:click={newConfig}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+        新建配置
+      </button>
     </div>
   </div>
 
@@ -113,6 +248,35 @@
         onProviderChange();
       }}
     />
+  </div>
+
+  <!-- API 格式三选（2026-11-11）：预设不背协议的账，任何厂商的双协议端点都从这里锁 -->
+  <div class="field">
+    <label>API 格式</label>
+    <Select
+      value={protocol}
+      title="API 格式"
+      options={[
+        { value: 'openai', label: 'Chat Completions（/chat/completions）' },
+        { value: 'anthropic', label: 'Anthropic Messages（/v1/messages）' },
+        { value: 'responses', label: 'Responses（/responses）' },
+      ]}
+      on:change={(e) => {
+        protocol = e.detail;
+        autoSave({ protocol });
+      }}
+    />
+    <label class="cap-check" title="不勾时 Base URL 就是最终地址，原样直发一个字符不加">
+      <input
+        type="checkbox"
+        checked={autoSuffix}
+        on:change={(e) => {
+          autoSuffix = e.currentTarget.checked;
+          autoSave({ auto_suffix: autoSuffix });
+        }}
+      />
+      自动补后缀
+    </label>
   </div>
 
   <div class="field">
@@ -145,220 +309,408 @@
   </div>
 
   <div class="field">
-    <label>模型（多个用英文逗号隔开）</label>
-    <div class="sub-row">
-      <input
-        class="model-input"
-        style="flex: 1;"
-        value={modelsText}
-        on:input={(e) => (modelsText = e.currentTarget.value)}
-        on:blur={commitModels}
-        on:keydown={(e) => {
-          if (e.key === 'Enter') {
-            e.preventDefault();
-            commitModels();
-          }
-        }}
-      />
-      <button class="btn primary" on:click={fetchModels}>获取模型</button>
+    <label>模型</label>
+    <div class="list-head">
+      <!-- 与「+ 新建配置」同款 chip 样式（2026-11-11：去掉主按钮配色，消掉割裂感） -->
+      <button class="chip add" on:click={fetchModels} title="从端点拉取模型清单">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg>
+        获取模型
+      </button>
+      <button class="chip add" on:click={openAdd} title="添加模型">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+        添加模型
+      </button>
     </div>
-  </div>
 
-  <div class="field">
-    <label>最大上下文长度（留空=恢复渠道默认）</label>
-    <input
-      class="num-input"
-      type="number"
-      min="0"
-      data-field="ctxLen"
-      bind:value={ctxLen}
-      title="决定上下文圆环预算与历史裁剪时机；新建配置默认 1000000"
-      on:change={() => autoSave({ context_length: Number(ctxLen) || 0 }, 0)}
-    />
-    <label>最大输出长度（留空=恢复渠道默认）</label>
-    <input
-      class="num-input"
-      type="number"
-      min="0"
-      data-field="maxOut"
-      bind:value={maxOut}
-      title="随请求作为 max_tokens 发给渠道。思考开启时自动加思考余量（配置值+max(配置值,8192)）——上游把思考和正文算进同一个额度，不加余量正文会被思考挤断；端点拒收会自动回退原值。新建配置默认 126000"
-      on:change={() => autoSave({ max_output_tokens: Number(maxOut) || 0 }, 0)}
-    />
-  </div>
+    {#if addOpen}
+      <div class="add-box">
+        <input
+          class="m-id-input"
+          bind:this={addInput}
+          bind:value={addText}
+          spellcheck="false"
+          on:keydown={(e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              addModel();
+            }
+            if (e.key === 'Escape') {
+              e.preventDefault();
+              closeAdd();
+            }
+          }}
+        />
+        <button class="btn primary" on:click={addModel}>添加</button>
+        <button class="btn ghost" on:click={closeAdd}>取消</button>
+      </div>
+      {#if addErr}<div class="add-err">{addErr}</div>{/if}
+    {/if}
 
-  <div class="field">
-    <label>采样参数（留空=渠道默认）</label>
-    <div class="sub-row">
-      <div class="param-name">温度</div>
-      <input
-        class="num-input"
-        type="number" step="0.1" min="0" max="2"
-        data-field="temperature"
-        bind:value={temperature}
-        title="temperature：越低越稳定，0=确定性输出"
-        on:change={() => autoSave({ temperature: temperature === null || temperature === '' ? -1 : Number(temperature) }, 0)}
-      />
-      <div class="param-name">top_p</div>
-      <input
-        class="num-input"
-        type="number" step="0.05" min="0" max="1"
-        data-field="topP"
-        bind:value={topP}
-        title="top_p：核采样截断"
-        on:change={() => autoSave({ top_p: topP === null || topP === '' ? -1 : Number(topP) }, 0)}
-      />
-    </div>
-    <div class="param-hint">-1 = 清除该项</div>
-  </div>
-
-  <div class="field">
-    <label>模型能力标记</label>
-    <div class="caps-row">
-      <label class="cap-check">
-        <input
-          type="checkbox"
-          bind:checked={capabilities.tools}
-          on:change={() => autoSave({ capabilities }, 0)}
-        />
-        工具调用
-      </label>
-      <label class="cap-check">
-        <input
-          type="checkbox"
-          bind:checked={capabilities.vision}
-          on:change={() => autoSave({ capabilities }, 0)}
-        />
-        图片解析
-      </label>
-      <label class="cap-check">
-        <input
-          type="checkbox"
-          bind:checked={capabilities.video}
-          on:change={() => autoSave({ capabilities }, 0)}
-        />
-        视频解析
-      </label>
-      <label class="cap-check">
-        <input
-          type="checkbox"
-          bind:checked={capabilities.audio}
-          on:change={() => autoSave({ capabilities }, 0)}
-        />
-        音频解析
-      </label>
-    </div>
+    {#each savedModels as m}
+      <div class="model-card" class:cur={m === model}>
+        <div class="model-row">
+          <span class="cur-dot" class:on={m === model} title={m === model ? '当前模型' : ''}></span>
+          <span class="model-name" title={m}>{m}</span>
+          <div class="row-actions">
+            <button
+              class="act"
+              class:busy={rowTest[m] && rowTest[m].state === 'testing'}
+              disabled={rowTest[m] && rowTest[m].state === 'testing'}
+              title="测试连通性"
+              on:click={() => testModelConn(m)}
+            >
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.8"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              ><g transform="rotate(45 12 12)"><path d="M12 22v-5" /><path d="M9 8V2" /><path d="M15 8V2" /><path
+                    d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"
+                  /></g></svg>
+            </button>
+            <button
+              class="act"
+              class:on={openModel === m}
+              title="编辑参数"
+              on:click={() => (openModel = openModel === m ? '' : m)}
+            >
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.8"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              ><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" /><path d="m15 5 4 4" /></svg>
+            </button>
+            <button class="act del" title="删除模型" on:click={() => removeModel(m)}>
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.8"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              ><path d="M3 6h18" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" /><path
+                  d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"
+                /></svg>
+            </button>
+          </div>
+        </div>
+        {#if rowTest[m]}
+          <div
+            class="row-test"
+            class:ok={rowTest[m].state === 'ok'}
+            class:fail={rowTest[m].state === 'fail'}
+          >{rowTest[m].text}</div>
+        {/if}
+        {#if openModel === m}
+          <div class="model-params">
+            {#if m !== model}
+              <button class="use-current" on:click={() => pickModel(m)}>设为当前模型</button>
+            {/if}
+            <div class="mp-row">
+              <div class="mp-label">模型 id</div>
+              <input
+                class="num-input m-id-input"
+                value={m}
+                spellcheck="false"
+                on:change={(e) => renameModel(m, e.currentTarget.value)}
+                on:keydown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    e.currentTarget.blur();
+                  }
+                }}
+              />
+            </div>
+            {#each NUM_FIELDS as [key, label]}
+              <div class="mp-row">
+                <div class="mp-label">{label}</div>
+                <input
+                  class="num-input"
+                  type="number"
+                  min="0"
+                  value={hasOverride(m, key) ? eff(m, key) : ''}
+                  on:change={(e) => setNum(m, key, e.currentTarget.value)}
+                />
+              </div>
+            {/each}
+            <div class="mp-row caps">
+              <div class="mp-label">模型能力</div>
+              <div class="caps-row">
+                {#each CAPS as [key, label]}
+                  <label class="cap-check">
+                    <input
+                      type="checkbox"
+                      checked={!!effCaps(m)[key]}
+                      on:change={(e) => setCap(m, key, e.currentTarget.checked)}
+                    />
+                    {label}
+                  </label>
+                {/each}
+              </div>
+            </div>
+          </div>
+        {/if}
+      </div>
+    {/each}
   </div>
 {/if}
 
 <style>
-  .chips {
+  /* 配置一行放下拉 + 删除 + 新建（2026-11-11 改版：chips 行换成下拉菜单） */
+  .config-row {
     display: flex;
-    gap: 9px;
-    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+  }
+  .config-row :global(.csel-wrap) {
+    flex: 1;
+    min-width: 0;
+  }
+  .cfg-del {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 34px;
+    height: 34px;
+    flex: none;
+    padding: 0;
+    border-radius: 8px;
+    border: 1.5px solid var(--g3);
+    background: transparent; /* 描边无底色（2026-11-11 设置统一样式） */
+    color: var(--g6);
+    cursor: pointer;
+  }
+  .cfg-del svg {
+    width: 15px;
+    height: 15px;
+  }
+  .cfg-del:hover {
+    color: var(--g7);
+    border-color: var(--g5);
+  }
+  .cfg-del:disabled {
+    opacity: 0.4;
+    cursor: default;
   }
   .chip {
     padding: 7px 13px;
     border-radius: 14px;
     border: 1px solid var(--g3);
-    background: var(--g1);
+    background: transparent; /* 描边无底色（2026-11-11 设置统一样式） */
     color: var(--g6);
     font-size: 12px;
     cursor: pointer;
   }
-  .chip.active {
-    background: var(--g3);
-    border-color: var(--g5);
-    color: var(--g7);
-  }
-  .dot {
-    display: inline-block;
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    margin-right: 6px;
-    background: var(--g4);
-    vertical-align: middle;
-  }
-  .dot.haskey {
-    background: var(--tint-green-fg);
-  }
   /* 设置面板统一黑白：彩色只留给「已存 Key」的绿点（.dot.haskey） */
   .chip.add {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
     color: var(--g6);
     border-color: var(--g3);
+  }
+  .chip.add svg {
+    width: 12px;
+    height: 12px;
+    flex: none;
   }
   .chip.add:hover {
     color: var(--g7);
     border-color: var(--g5);
   }
-  .chip.del {
-    color: var(--g6);
-    border-color: var(--g3);
+
+  /* 模型区只有一行按钮：左获取模型，右 + 添加模型——两个都是 chip.add 样式，
+     与上方「+ 新建配置」同款（标题在上面一行） */
+  .list-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
   }
-  .chip.del:hover {
-    color: var(--g7);
-    border-color: var(--g5);
+  .add-box {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-top: 2px;
   }
-  .del-key {
-    padding: 7px 10px;
-    font-size: 12px;
-    background: var(--g2);
+  .add-box .m-id-input {
+    flex: 1;
+    min-width: 0;
+  }
+  .add-err {
+    font-size: 11.5px;
+    color: var(--tint-red-fg);
+  }
+
+  .model-card {
+    display: flex;
+    flex-direction: column;
+    border: 1px solid var(--g3);
+    border-radius: 10px;
+    background: var(--g1);
+    transition: border-color 0.15s ease;
+  }
+  .model-card:hover {
     border-color: var(--g4);
+  }
+  .model-card.cur {
+    border-color: color-mix(in srgb, var(--brand) 45%, var(--g3));
+  }
+  .model-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 46px;
+    padding: 0 8px 0 12px;
+  }
+  .cur-dot {
+    flex: none;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: transparent;
+  }
+  .cur-dot.on {
+    background: var(--brand);
+  }
+  .model-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 13px;
     color: var(--g7);
   }
-  .del-key:hover {
-    background: var(--g3);
+  .model-card.cur .model-name {
+    color: var(--brand-text);
+  }
+  .row-actions {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+  }
+  .act {
+    display: grid;
+    place-items: center;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    border: 0;
+    border-radius: 7px;
+    background: transparent;
+    color: var(--g5);
+    cursor: pointer;
+  }
+  .act svg {
+    width: 15px;
+    height: 15px;
+  }
+  .act:hover {
+    background: var(--g2);
+    color: var(--g7);
+  }
+  .act.on {
+    /* 开关态钮：统一选中口径（橙字无底色；底色模式铺 --sel-bg） */
+    background: var(--sel-bg);
+    color: var(--sel-fg);
+  }
+  .act:disabled {
+    opacity: 0.45;
+    cursor: default;
+    background: transparent;
+  }
+  .act.del:hover {
+    background: var(--tint-red-bg);
+    color: var(--tint-red-fg);
+  }
+  .row-test {
+    padding: 0 12px 9px 26px;
+    font-size: 11.5px;
+    line-height: 1.5;
+    color: var(--g5);
+    word-break: break-word;
+  }
+  .row-test.ok {
+    color: var(--tint-green-fg);
+  }
+  .row-test.fail {
+    color: var(--tint-red-fg);
+  }
+
+  .m-id-input {
+    min-width: 0;
+    height: 32px;
+    padding: 0 10px;
+    border: 1px solid var(--g3);
+    border-radius: 8px;
+    background: var(--g1);
+    color: var(--g6);
+    font-size: 12.5px;
+    font-family: Consolas, 'Cascadia Code', monospace;
+  }
+  .m-id-input:focus {
+    outline: none;
     border-color: var(--g5);
+    color: var(--g7);
+  }
+
+  .model-params {
+    padding: 14px 16px 18px 26px;
+    border-top: 1px solid var(--g3);
+  }
+  .use-current {
+    margin-bottom: 8px;
+    padding: 3px 10px;
+    border: 1px solid color-mix(in srgb, var(--brand) 40%, var(--g3));
+    border-radius: 6px;
+    background: transparent;
+    color: var(--brand-text);
+    font-size: 11.5px;
+    cursor: pointer;
+  }
+  .use-current:hover {
+    background: color-mix(in srgb, var(--brand) 12%, transparent);
+  }
+  .mp-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 12px;
+  }
+  .mp-row.caps {
+    display: block;
+    margin-bottom: 0;
+  }
+  .mp-label {
+    flex: none;
+    width: 150px;
+    font-size: 12px;
+    line-height: 1.6;
+    color: var(--g6);
+  }
+  .mp-row .num-input {
+    flex: 1;
+    min-width: 0;
   }
   .caps-row {
     display: flex;
-    gap: 14px;
+    gap: 12px 22px;
     flex-wrap: wrap;
-    background: var(--g1);
-    border: 1px solid var(--g2);
-    border-radius: 8px;
-    padding: 8px 12px;
+    padding: 6px 0 0;
   }
   .cap-check {
-    display: flex;
+    display: inline-flex;
+    gap: 5px;
     align-items: center;
-    gap: 6px;
-    font-size: 13px;
-    color: var(--g6);
-    cursor: pointer;
-  }
-  .cap-check input {
-    cursor: pointer;
-  }
-  .num-input {
-    /* width:100% 必须把内边距/边框算在宽度里：否则每个输入框多出 22px，
-       设置页底部会凭空长出一条横向滚动条（2026-11-01 真机实测） */
-    box-sizing: border-box;
-    width: 100%;
-    background: var(--g1);
-    color: var(--g7);
-    border: 1px solid var(--g2);
-    border-radius: 6px;
-    padding: 6px 8px;
-    font-size: 12px;
-  }
-  .param-name {
     font-size: 12px;
     color: var(--g6);
-    margin: 6px 0 4px;
-  }
-  /* 已保存 key 的圆点遮罩：后端只回尾号，真实 key 不出内存，圆点只是「已存」标记 */
-  .api-key::placeholder {
-    color: var(--g7);
-    letter-spacing: 2px;
-  }
-  /* 自绘下拉（Select 组件）在各容器里的尺寸：组件内部样式管外观，这里只调整体布局 */
-  .field > :global(.csel-wrap) {
-    width: 100%;
-  }
-  .sub-row > :global(.csel-wrap) {
-    flex: 1 1 auto;
-    width: auto;
+    cursor: pointer;
   }
 </style>

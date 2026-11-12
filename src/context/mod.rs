@@ -39,11 +39,82 @@ fn is_display_only(m: &Value) -> bool {
     m.get("display_only").and_then(Value::as_bool) == Some(true)
 }
 
-/// 单条消息估算（role 开销 + content + tool_calls；`count_reasoning` 时含 reasoning_content）。
-/// 思考是否计入**跟随回放判定**（should_preserve_replay）：DeepSeek/zai 契约与白名单
-/// 模型每轮把思考重发进 prompt，本地预算必须看见；剥离渠道思考不进上下文、不计入
-/// （切勿对所有模型一律计入，否则剥离渠道会被过度裁剪）。
-fn estimate_message(m: &Value, count_reasoning: bool) -> u64 {
+/// 思考计入上下文的口径（估算 / 压缩守卫 / 圆环共用）：
+/// - `None`：不回放，思考不占上下文
+/// - `All`：按渠道契约整段回放（Chat Completions 的 DeepSeek/Kimi 系）
+/// - `Replayable`：只算真能回放的思考（Anthropic 带签名 thinking 块 /
+///   Responses 带 encrypted_content 的 reasoning 条目）——没有回放元数据的
+///   历史思考不会发出去，不能计入
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReasoningCount {
+    #[default]
+    None,
+    All,
+    Replayable,
+}
+
+impl From<bool> for ReasoningCount {
+    fn from(v: bool) -> Self {
+        if v { Self::All } else { Self::None }
+    }
+}
+
+fn counts_reasoning(m: &Value, mode: ReasoningCount) -> bool {
+    match mode {
+        ReasoningCount::None => false,
+        ReasoningCount::All => true,
+        ReasoningCount::Replayable => {
+            // 块序列是最新形状（多思考块 / redacted 密文块 / Responses 多条 reasoning）。
+            // 只认真的能回放的块：thinking 带签名、redacted 带密文、reasoning 带密文
+            let has_blocks = m.get("reasoning_blocks").and_then(Value::as_array).is_some_and(|arr| {
+                arr.iter().any(|b| match b.get("type").and_then(Value::as_str).unwrap_or("") {
+                    "thinking" => b.get("signature").and_then(Value::as_str).is_some_and(|s| !s.is_empty()),
+                    "redacted_thinking" => b.get("data").and_then(Value::as_str).is_some_and(|s| !s.is_empty()),
+                    "reasoning" => b
+                        .get("encrypted_content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| !s.is_empty()),
+                    _ => false,
+                })
+            });
+            has_blocks
+                || m.get("reasoning_signature").and_then(Value::as_str).is_some_and(|s| !s.is_empty())
+                || m.get("reasoning_encrypted").and_then(Value::as_str).is_some_and(|s| !s.is_empty())
+        }
+    }
+}
+
+/// 加密/密文思考条目的代币估算（2026-11-11）：服务端会把密文展开成思考 token
+/// 计费/占上下文，本地只能按长度保守估——base64 解码后字节 ≈ 原文，token ≈ bytes/4
+/// （即 base64 长度 × 3/16）。redacted_thinking 的 data 同理。
+fn encrypted_reasoning_tokens(m: &Value) -> u64 {
+    let mut total = 0u64;
+    if let Some(arr) = m.get("reasoning_blocks").and_then(Value::as_array) {
+        for b in arr {
+            match b.get("type").and_then(Value::as_str).unwrap_or("") {
+                "reasoning" => {
+                    if let Some(enc) = b.get("encrypted_content").and_then(Value::as_str) {
+                        total += (enc.len() as u64 * 3 / 16).max(1);
+                    }
+                }
+                "redacted_thinking" => {
+                    if let Some(d) = b.get("data").and_then(Value::as_str) {
+                        total += (d.len() as u64 * 3 / 16).max(1);
+                    }
+                }
+                _ => {}
+            }
+        }
+    } else if let Some(enc) = m.get("reasoning_encrypted").and_then(Value::as_str) {
+        total += (enc.len() as u64 * 3 / 16).max(1);
+    }
+    total
+}
+
+/// 单条消息估算（role 开销 + content + tool_calls；按 `mode` 决定思考是否计入）。
+/// 思考是否计入必须跟随「是否真的会回放进请求」——剥离渠道/不可回放的历史思考
+/// 不进上下文、不计入（切勿一律计入，否则回滚重算会把没发出去的思考算进圆环）。
+fn estimate_message(m: &Value, mode: ReasoningCount) -> u64 {
     if is_display_only(m) {
         return 0;
     }
@@ -51,10 +122,14 @@ fn estimate_message(m: &Value, count_reasoning: bool) -> u64 {
     if let Some(c) = m.get("content") {
         total += value_tokens(c);
     }
-    if count_reasoning
-        && let Some(c) = m.get("reasoning_content").and_then(Value::as_str)
-    {
-        total += estimate_tokens(c);
+    if counts_reasoning(m, mode) {
+        let text_tokens = m
+            .get("reasoning_content")
+            .and_then(Value::as_str)
+            .map(estimate_tokens)
+            .unwrap_or(0);
+        // 可见摘要与密文估算是同一份思考的两种口径（取大），不重复相加
+        total += text_tokens.max(encrypted_reasoning_tokens(m));
     }
     if let Some(calls) = m.get("tool_calls").and_then(Value::as_array) {
         for call in calls {
@@ -81,8 +156,11 @@ fn value_tokens(v: &Value) -> u64 {
     }
 }
 
-pub fn estimate_messages(messages: &[Value], count_reasoning: bool) -> u64 {
-    messages.iter().map(|m| estimate_message(m, count_reasoning)).sum()
+/// 整段消息估算（生产侧统一走 `estimate_breakdown`，这里只给单测当「总额」尺子）。
+#[cfg(test)]
+pub fn estimate_messages(messages: &[Value], count_reasoning: impl Into<ReasoningCount>) -> u64 {
+    let mode = count_reasoning.into();
+    messages.iter().map(|m| estimate_message(m, mode)).sum()
 }
 
 /// 分类占比（前端「上下文容量」卡片用）：各分类之和 == estimate_messages。
@@ -107,31 +185,35 @@ impl Breakdown {
     }
 }
 
-pub fn estimate_breakdown(messages: &[Value], count_reasoning: bool) -> Breakdown {
+pub fn estimate_breakdown(messages: &[Value], count_reasoning: impl Into<ReasoningCount>) -> Breakdown {
+    let mode = count_reasoning.into();
     let mut b = Breakdown::default();
     for m in messages {
         if is_display_only(m) {
             continue;
         }
         match m.get("role").and_then(Value::as_str).unwrap_or("") {
-            "system" => b.system += estimate_message(m, false),
-            "tool" => b.tools += estimate_message(m, false),
-            "user" => b.messages += estimate_message(m, false),
+            "system" => b.system += estimate_message(m, mode),
+            "tool" => b.tools += estimate_message(m, mode),
+            "user" => b.messages += estimate_message(m, mode),
             "assistant" => {
                 if let Some(c) = m.get("content") {
                     b.messages += value_tokens(c);
                 }
-                if count_reasoning
-                    && let Some(c) = m.get("reasoning_content").and_then(Value::as_str)
-                {
-                    b.messages += estimate_tokens(c);
+                if counts_reasoning(m, mode) {
+                    let text_tokens = m
+                        .get("reasoning_content")
+                        .and_then(Value::as_str)
+                        .map(estimate_tokens)
+                        .unwrap_or(0);
+                    b.messages += text_tokens.max(encrypted_reasoning_tokens(m));
                 }
                 if let Some(calls) = m.get("tool_calls").and_then(Value::as_array) {
                     b.other += 8 * calls.len() as u64 + calls.iter().map(value_tokens).sum::<u64>();
                 }
                 b.other += 4;
             }
-            _ => b.other += estimate_message(m, false),
+            _ => b.other += estimate_message(m, mode),
         }
     }
     b
@@ -266,6 +348,46 @@ mod tests {
         assert_eq!(replayed, stripped + 100, "回放渠道：思考按 CJK 1 token/字计入");
         assert_eq!(estimate_breakdown(&msgs, true).messages, 2 + 100, "breakdown 同口径");
         assert_eq!(estimate_breakdown(&msgs, false).messages, 2);
+    }
+
+    #[test]
+    fn replayable_counts_only_signed_or_encrypted_reasoning() {
+        // Anthropic/Responses 只回放带签名/加密条目的思考：旧消息（无元数据）不算
+        let msgs = vec![
+            json!({"role":"assistant","content":"答","reasoning_content":"思".repeat(100)}),
+            json!({"role":"assistant","content":"答","reasoning_content":"思".repeat(100),"reasoning_signature":"sig"}),
+            json!({"role":"assistant","content":"答","reasoning_content":"思".repeat(100),"reasoning_encrypted":"enc"}),
+        ];
+        let none = estimate_messages(&msgs, ReasoningCount::None);
+        let replayable = estimate_messages(&msgs, ReasoningCount::Replayable);
+        let all = estimate_messages(&msgs, ReasoningCount::All);
+        assert_eq!(replayable, none + 200, "只计两条可回放的思考");
+        assert_eq!(all, none + 300, "All 全计");
+        assert!(none < replayable && replayable < all);
+    }
+
+    #[test]
+    fn encrypted_and_redacted_blocks_are_priced_by_cipher_length() {
+        // 块序列没有 legacy 字段时也要计入；密文块按 base64 长度估算（len*3/16）
+        let plain = json!({"role":"assistant","content":"答"});
+        let enc = json!({"role":"assistant","content":"答",
+            "reasoning_blocks":[{"type":"reasoning","encrypted_content":"A".repeat(160)}]});
+        let red = json!({"role":"assistant","content":"答",
+            "reasoning_blocks":[{"type":"redacted_thinking","data":"B".repeat(160)}]});
+        let base = estimate_messages(&[plain], ReasoningCount::Replayable);
+        let with_enc = estimate_messages(std::slice::from_ref(&enc), ReasoningCount::Replayable);
+        let with_red = estimate_messages(&[red], ReasoningCount::Replayable);
+        assert_eq!(with_enc, base + 30, "160*3/16=30");
+        assert_eq!(with_red, base + 30);
+        assert_eq!(
+            estimate_messages(std::slice::from_ref(&enc), ReasoningCount::None),
+            base,
+            "不回的渠道不计"
+        );
+        // 可见摘要与密文估算取大、不重复相加
+        let both = json!({"role":"assistant","content":"答","reasoning_content":"短",
+            "reasoning_blocks":[{"type":"reasoning","encrypted_content":"A".repeat(160)}]});
+        assert_eq!(estimate_messages(&[both], ReasoningCount::Replayable), base + 30);
     }
 
 

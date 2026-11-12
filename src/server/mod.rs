@@ -45,6 +45,7 @@ pub(crate) use crate::config::AgentConfig;
 pub(crate) use crate::core::agent::{self, AgentEvent, LoopOutcome};
 
 mod chat;
+pub(crate) mod attachments; // 输入框附件用系统程序打开（文档类预览兜底，2026-11-10）
 pub(crate) mod auth;
 pub(crate) mod compact; // 2026-11-07 收尾静默压缩（触发判定 + 后台任务）
 pub(crate) mod data_admin;
@@ -176,6 +177,7 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/settings", get(get_settings).put(put_settings))
         .route("/api/settings/schema", get(crate::server::settings::get_settings_schema))
         .route("/api/models", post(list_models))
+        .route("/api/models/test", post(test_model))
         .route("/api/configs", post(manage_configs))
         .route("/api/workspace", get(get_workspace).post(set_workspace))
         .route("/api/approvals", post(decide_approval))
@@ -190,6 +192,12 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         )
         // 刷新回来认领正在跑的一轮：断线取消的 30 秒宽限内有效（2026-11-07）
         .route("/api/chat/revive", post(revive))
+        // 输入框附件「用系统程序打开」（文档类预览兜底）：body 带 base64，限额同 /api/chat
+        .route(
+            "/api/attachments/open",
+            post(crate::server::attachments::open_attachment)
+                .layer(axum::extract::DefaultBodyLimit::max(40 * 1024 * 1024)),
+        )
         // 刷新后重新附着直播：补发 after 之后漏掉的事件，再接上正在跑的一轮
         .route("/api/chat/attach", get(attach))
         // 无头会话：程序化唤醒一条会话跑完整轮，结构化返回（子代理/定时/CLI 的共同底座）
@@ -204,6 +212,8 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         // 完成记录 × 掉一条（落盘；壳重启/弹窗重开都不复活）
         .route("/api/schedules/notice", delete(dismiss_schedule_notice))
         .route("/api/session", get(get_session).delete(clear_session))
+        // 压缩失败后手动重试：清「暂停」标记，下一轮收尾重新走触发判定（2026-11-10）
+        .route("/api/compact/retry", post(crate::server::compact::retry))
         .route("/api/sessions", get(list_sessions))
         .route("/api/running", get(crate::server::sessions::running_sessions))
         .route("/api/sessions/new", post(new_session))
@@ -251,6 +261,9 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/data/import", post(data_admin::data_import))
         .route("/api/data/import/progress", get(data_admin::data_import_progress))
         .route("/api/data/open", post(data_admin::data_open))
+        // 界面微调规则导出（2026-11-12）：写 <数据目录>/exports/ 并回真实路径——
+        // 浏览器下载落哪前端拿不到，用户问「导出到哪了」
+        .route("/api/micro/export", post(data_admin::micro_export))
         // 自定义背景媒体（2026-11-03：视频也能当壁纸）；上传走原始字节，上限 300MB
         .route(
             "/api/wallpaper",

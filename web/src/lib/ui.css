@@ -93,6 +93,42 @@
   --brand-ink: #47220e;
 }
 
+/* 点击瞬间的灰蓝高亮是 WebView2 的 tap-highlight（默认 rgba(0,0,0,.18)），
+   跟描边风格不搭——全局关掉（2026-11-12 用户圈选「点击瞬间还有底色」） */
+* {
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* —— 2026-11-11 全局「透明+描边」：玻璃面板层 ——
+   控件透明+1.5px 描边（.btn/.field/.icon-act 已按此口径）；
+   侧栏/顶栏/右面板/菜单走半透明玻璃：壁纸能透出来，但文字仍有可读的底。
+   浮层（菜单/弹窗）比面板更实，避免背后的正文透上来压字。 */
+:root {
+  --glass-panel: color-mix(in srgb, var(--g0) 78%, transparent);
+  --glass-chrome: color-mix(in srgb, var(--g1) 78%, transparent);
+  /* 浮层底子用 g2（凸起面）不用 g1：浅色下 g1 近纯白，开在玻璃弹窗/壁纸上
+     就是「旁边微橙、菜单白」的割裂感（2026-11-11 用户圈出）；g2 与弹窗同调。
+     透明度 92% 不动：盖住正文可读性靠的是这一层。 */
+  --glass-float: color-mix(in srgb, var(--g2) 92%, transparent);
+}
+
+/* —— 选中态统一（2026-11-12 用户拍板）：全局两种口径，组件一律引用变量别写死 ——
+   默认 hl = 文字高亮：选中只把文字/图标点橙，不铺底、不描边；
+   根元素带 [data-sel='bg'] = 背景高亮：选中铺 g3 浅底，文字回到普通亮色。
+   切换入口在设置→主题外观（App.svelte applySelStyle 写 data-sel 并通知插件 iframe）。 */
+:root {
+  --sel-fg: var(--brand-text);
+  --sel-bg: transparent;
+  /* 选中描边两档（2026-11-12 用户拍板）：设置页的按钮/chip 选中要描边（--sel-line），
+     设置导航栏要更浅一档（--sel-line-soft）——按品牌橙低透明度铺底，跟橙字同调 */
+  --sel-line: color-mix(in srgb, var(--brand-text) 50%, transparent);
+  --sel-line-soft: color-mix(in srgb, var(--brand-text) 28%, transparent);
+}
+:root[data-sel='bg'] {
+  --sel-fg: var(--g7);
+  --sel-bg: var(--g3);
+}
+
 /* 画布兜底（2026-11-04 浅色走查实测）：壁纸模式下 body 会被置透明，html 没有底色时
    浏览器画布直接透出来——深色画布配浅色主题=聊天区整块黑。html 永远垫主题底色。 */
 html {
@@ -135,51 +171,97 @@ body.has-wallpaper::before {
 .btn {
   padding: 9px 17px;
   border-radius: 8px;
-  border: 1px solid var(--g3);
-  background: var(--g2);
+  /* 2026-11-11 全局「透明+描边」：控件层统一透明底 + 1.5px 描边，hover 只加深描边；
+     品牌橙只留发送键与运行指示（用户拍板），主按钮靠字重区分。 */
+  border: 1.5px solid var(--g3);
+  background: transparent;
   color: var(--g7);
   font-size: 13px;
   font-weight: 550;
   cursor: pointer;
-  transition: background 0.15s ease, border-color 0.15s ease, filter 0.15s ease;
+  transition: border-color 0.15s ease, color 0.15s ease, filter 0.15s ease;
 }
 .btn:hover {
-  background: var(--g3);
+  background: transparent;
+  border-color: var(--g5);
 }
 .btn:disabled {
   opacity: 0.5;
   cursor: default;
 }
-/* 主按钮：哑光浅陶土底（2026-11-04 减淡：去高亮渐变对比与光晕感，按钮不再抢视线） */
+/* 主按钮：不再用品牌橙填充（设置页 v2 口径推到全局），只保留字重 */
 .btn.primary {
-  background: linear-gradient(180deg,
-    color-mix(in srgb, var(--brand) 72%, #fff),
-    color-mix(in srgb, var(--brand-deep) 64%, #fff));
-  border-color: transparent;
-  color: var(--brand-ink);
+  background: transparent;
+  border-color: var(--g3);
+  color: var(--g7);
   font-weight: 620;
 }
 .btn.primary:hover {
-  filter: brightness(1.04);
+  border-color: var(--g5);
+  filter: none;
 }
 .btn.danger {
-  background: var(--g2);
-  border-color: var(--g4);
-  color: var(--g7);
+  background: transparent;
+  border-color: color-mix(in srgb, var(--tint-red-fg) 45%, var(--g3));
+  color: var(--tint-red-fg);
 }
 .btn.danger:hover {
-  background: var(--g3);
-  border-color: var(--g5);
+  background: transparent;
+  border-color: var(--tint-red-fg);
 }
 .btn.ghost {
   background: transparent;
 }
-/* 选中态（分段开关：用量报表的分组/范围选择等） */
+/* 选中态（分段开关：用量报表的分组/范围选择等）：统一走选中口径变量
+   （文字高亮=橙字无底；底色模式=铺 --sel-bg），不再用描边区分 */
 .btn.active {
-  background: var(--g3);
+  background: var(--sel-bg);
+  border-color: transparent;
+  color: var(--sel-fg);
+  font-weight: 650;
+}
+/* 带前置小图标的按钮（「新建 XX」统一加号） */
+.btn-plus {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+.btn-plus svg {
+  width: 14px;
+  height: 14px;
+  flex: none;
+}
+/* 设置类列表的紧凑图标动作（编辑/重连/删除/打开/刷新…） */
+.icon-act {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--g5);
+  cursor: pointer;
+}
+.icon-act svg {
+  width: 15px;
+  height: 15px;
+}
+.icon-act:hover {
+  background: transparent;
   border-color: var(--g5);
   color: var(--g7);
-  font-weight: 650;
+}
+.icon-act:disabled {
+  opacity: 0.45;
+  cursor: default;
+  background: transparent;
+}
+.icon-act.danger:hover {
+  background: var(--tint-red-bg);
+  color: var(--tint-red-fg);
 }
 
 /* —— 基元：弹窗骨架 —— */
@@ -193,7 +275,8 @@ body.has-wallpaper::before {
   z-index: 20;
 }
 .modal {
-  background: var(--g2);
+  /* 浮层盖住正文：玻璃也要比面板更实（92%），否则背后的字会透出来 */
+  background: color-mix(in srgb, var(--g2) 92%, transparent);
   border: 1px solid var(--g3);
   border-radius: 10px;
   width: 560px;
@@ -224,7 +307,9 @@ body.has-wallpaper::before {
    （agent:resize 协议）——下边缘贴内容，不在确定按钮下方留空白 */
 .ext-popup {
   box-sizing: border-box;
-  background: var(--g2);
+  /* 弹窗型插件（插件制作器等）：玻璃 97%——制作器直接压在聊天正文上，透太多会把
+     背后的字透成「阴影」（用户 2026-11-11 圈出来），收窄到只剩一点透感 */
+  background: color-mix(in srgb, var(--g2) 97%, transparent);
   border: 1px solid var(--g3);
   border-radius: 10px;
   width: min(560px, calc(100vw - 48px));
@@ -264,8 +349,8 @@ body.has-wallpaper::before {
 .field select {
   padding: 8px 11px;
   border-radius: 9px;
-  border: 1px solid var(--g3);
-  background: var(--g1);
+  border: 1.5px solid var(--g3);
+  background: transparent;
   color: var(--g7);
   font-size: 13px;
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
@@ -277,8 +362,8 @@ body.has-wallpaper::before {
 .field input:focus,
 .field select:focus {
   outline: none;
-  border-color: color-mix(in srgb, var(--brand) 45%, var(--g3));
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand) 12%, transparent);
+  border-color: var(--g6);
+  box-shadow: none;
 }
 /* 原生下拉的弹出层由浏览器绘制：根元素的 color-scheme 不一定传导到弹出层，
    必须在 select 元素自身声明，并给 option 显式配色，否则深色主题下是白底浅字 */
@@ -343,10 +428,10 @@ select option:checked {
   align-items: center;
   gap: 10px;
   padding: 9px 12px;
-  border: 1px solid var(--g3);
+  border: 1.5px solid var(--g3);
   border-radius: 10px;
   margin-bottom: 6px;
-  background: var(--g2);
+  background: transparent;
 }
 .plug-ico {
   flex: none;

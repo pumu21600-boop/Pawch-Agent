@@ -15,23 +15,8 @@ use super::gate::ChatGate;
 use super::subagent;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-/// 无头运行期间的工作区切换守卫：Drop 还原全局根。
-/// 放在跑整轮的任务里（随任务生命周期）——取消/超时后任务在后台收尾期间
-/// 工作区保持切换态，收尾完才还原，不会漏还原也不会提前还。
-/// 审计 05：用户中途主动切换过工作区就以用户为准——守卫只把「还是我设的那个值」
-/// 还原回旧的，绝不覆盖用户在跑期间做的选择（任务自身的文件操作已由
-/// run_task 的 ws 参数钉住，不依赖全局）。
-struct WorkspaceGuard {
-    old: std::path::PathBuf,
-    guarded: std::path::PathBuf,
-}
-impl Drop for WorkspaceGuard {
-    fn drop(&mut self) {
-        if crate::tools::workspace_root() == self.guarded {
-            crate::tools::set_workspace_root(&self.old);
-        }
-    }
-}
+/// 无头轮最后一次 ContextUsage 槽：(projected, window, system_tokens, tools_schema_tokens)
+type LastCtxSlot = std::sync::Arc<std::sync::Mutex<Option<(u64, u64, u64, u64)>>>;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct HeadlessRequest {
@@ -218,22 +203,28 @@ pub(crate) async fn run_headless_inner(
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    // 按 config_id 选配置跑（定时任务选模型）；找不到/没传 = 当前激活配置
-    let active_cfg = if req.config_id.trim().is_empty() {
-        s.active_or_default().clone()
+    // 按 config_id 选配置跑（定时任务选模型）；没传 = 当前激活配置。
+    // 2026-11-10：配置被删了不再静默错配——旧实现回落激活配置却继续用旧模型名，
+    // 请求 404 或花在错误端点上且无任何提示。
+    let (active_cfg, cfg_missing) = if req.config_id.trim().is_empty() {
+        (s.active_or_default().clone(), None)
     } else {
-        s.configs
-            .iter()
-            .find(|c| c.id == req.config_id)
-            .cloned()
-            .unwrap_or_else(|| s.active_or_default().clone())
+        match s.configs.iter().find(|c| c.id == req.config_id) {
+            Some(c) => (c.clone(), None),
+            None => (
+                s.active_or_default().clone(),
+                Some(req.config_id.trim().to_string()),
+            ),
+        }
     };
+    // 配置已失效时请求级模型名也可能属于旧配置，一并忽略（用激活配置的默认模型）
+    let eff_model = if cfg_missing.is_some() { "" } else { &req.model };
     let cfg = (*state.agent_cfg).clone();
     let sandbox_cfg = (*state.sandbox_cfg).clone();
     // 上下文预算：当前模型设了上下文长度就用它（覆盖全局 [context].budget_tokens）
     let ctx_cfg = {
         let mut c = (*state.context_cfg).clone();
-        if let Some(cl) = active_cfg.context_length {
+        if let Some(cl) = active_cfg.params_for(&active_cfg.effective_model()).context_length {
             c.budget_tokens = cl;
         }
         // 任务级显式覆盖最优先（定时任务高级选项填的）
@@ -274,6 +265,22 @@ pub(crate) async fn run_headless_inner(
         }),
     );
 
+    // 任务指定工作区：显式钉住本轮的工作目录——提示词、项目 brief、文件工具与
+    // 会话归属全用它，**不再改进程全局工作区根**（旧实现跑任务期间会把同时在聊
+    // 的前台会话也拽进任务目录；两个任务同 tick 还会把全局根恢复乱，2026-11-10
+    // 审查 P1）。目录不存在直接拒绝，不带着死路径跑整轮。
+    let ws_override = req.workspace.trim().to_string();
+    if !ws_override.is_empty() && !std::path::Path::new(&ws_override).is_dir() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("任务工作区目录不存在: {ws_override}"),
+        ));
+    }
+    let pinned_ws = if ws_override.is_empty() {
+        crate::tools::workspace_root()
+    } else {
+        std::path::PathBuf::from(&ws_override)
+    };
     // 历史：被唤醒的已有会话接着自己的上下文跑；新会话就是这一条消息
     let mut history = state
         .session
@@ -287,14 +294,19 @@ pub(crate) async fn run_headless_inner(
         .get(&session_id)
         .and_then(|f| f.compact.clone())
         .map(|r| crate::compact::CompactView::from_record(&r));
-    let ch = assemble_turn_channels(&state, &s, &active_cfg, &req.model, &req.base_url, &req.api_key);
-    let system_prompt = turn_system_prompt(&state, &ch.primary).await;
+    let ch = assemble_turn_channels(&state, &s, &active_cfg, eff_model, &req.base_url, &req.api_key);
+    let system_prompt = turn_system_prompt(&state, &ch.primary, &pinned_ws).await;
     // 新会话第一轮：项目现状 brief 并进首条 user 消息（不进系统提示，保缓存前缀，
     // 与 /api/chat 同一路径——见 turn.rs 的 inject_brief_into_first_user 纪律注释）
-    let brief = first_turn_brief(&state, &session_id).await;
+    let brief = first_turn_brief(&state, &session_id, &pinned_ws).await;
     inject_brief_into_first_user(&mut history, &brief);
 
     let mut notices = ch.notices.clone();
+    if let Some(id) = &cfg_missing {
+        notices.push(format!(
+            "任务指定的配置「{id}」已不存在，本轮改用当前激活配置（旧模型名也已忽略）"
+        ));
+    }
     if let Some(n) = mode_notice {
         notices.push(n);
     }
@@ -367,34 +379,21 @@ pub(crate) async fn run_headless_inner(
             None
         };
 
-    // 任务指定工作区：跑前切过去（会话也记到该项目下），跑完 Drop 还原全局根
-    let ws_override = req.workspace.trim().to_string();
     // 子代理子会话首次落盘就通知侧栏刷新：原来子代理轮一律不推 sessions_changed，
     // 新会话要手动刷新页面才看得见（要刷新才看得见）。
     let is_child = !req.parent_session.trim().is_empty();
     let child_announced = AtomicBool::new(false);
+    // 收尾压缩用（2026-11-10 用户拍板启用）：spawn 内需要 AppState 调 maybe_start
+    let state_for_compact = state.clone();
 
     // 整轮（含排队追加消息的有界续跑）跑在独立任务里：取消守卫随任务生命周期，
     // 超时后任务仍在后台收尾也保持着「会话在跑」的登记——不会出现双写会话文件。
     let handle = tokio::spawn(async move {
         let cancel = run_flag.clone();
         let _run = CancelRun::from_flag(cancel_registry.clone(), &sid, run_flag);
-        // 守卫随任务生命周期：取消/超时后后台收尾期间工作区保持切换态，收尾完才还原
-        let pinned_ws = if ws_override.is_empty() {
-            crate::tools::workspace_root()
-        } else {
-            std::path::PathBuf::from(&ws_override)
-        };
-        let _ws_guard = if ws_override.is_empty() {
-            None
-        } else {
-            let p = std::path::PathBuf::from(&ws_override);
-            if p.is_dir() {
-                Some(WorkspaceGuard { guarded: p.clone(), old: crate::tools::set_workspace_root(&p) })
-            } else {
-                None
-            }
-        };
+        // 本轮最后一次 ContextUsage（pre/window/system/tools_schema）——收尾压缩
+        // 与前台同一把尺子，不能用别处估出来的数
+        let last_ctx: LastCtxSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
         let mut status = "done".to_string();
         let mut error: Option<String> = None;
         let mut followups = 0u32;
@@ -468,6 +467,9 @@ pub(crate) async fn run_headless_inner(
                     }
                     // 上下文占用：与 /api/chat 同一条落盘路径（无头轮也续圆环快照）
                     agent::AgentEvent::ContextUsage { pressure, projected, window, breakdown } => {
+                        // 收尾压缩的尺子（2026-11-10）：只记录最后一次，与前台同口径
+                        *last_ctx.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some((projected, window, breakdown.system, breakdown.tools_schema));
                         let snap = {
                             let mut u = col_task.usage.lock().unwrap_or_else(|e| e.into_inner());
                             u.apply_context(pressure, projected, window, &breakdown);
@@ -484,7 +486,8 @@ pub(crate) async fn run_headless_inner(
                         let mut messages = messages;
                         crate::server::chat::strip_brief_from_first_user(&mut messages);
                         *col_task.last_snapshot.lock().unwrap_or_else(|e| e.into_inner()) = messages.clone();
-                        if let Err(e) = session_mgr.save(&sid, &messages, None) {
+                        // 会话归属用本轮钉住的工作区（不再依赖被抢改的全局根）
+                        if let Err(e) = session_mgr.save_with_workspace(&sid, &messages, None, Some(&pinned_ws)) {
                             observability::event(
                                 EventType::Error,
                                 json!({ "message": format!("会话落盘失败: {e}") }),
@@ -550,11 +553,33 @@ pub(crate) async fn run_headless_inner(
             next.extend(turn_msgs);
             history = next;
         }
+        // 静默压缩：无头轮（定时任务/CLI）收尾同样触发（2026-11-10 用户拍板启用）——
+        // fixed 会话长跑不再无限增长。取消/出错的轮不压（与前台同纪律）；尺子用本轮
+        // 最后一次 ContextUsage，与圆环/前台触发同源。
+        if status == "done"
+            && let Some((pre, window, sys, tools_schema)) =
+                *last_ctx.lock().unwrap_or_else(|e| e.into_inner())
+        {
+            crate::server::compact::maybe_start(
+                &state_for_compact,
+                crate::server::compact::CompactTrigger {
+                    session_id: sid.clone(),
+                    gateway: gateway.clone(),
+                    primary: ch.primary.clone(),
+                    summary_role: ch.summary.clone(),
+                    emit: None,
+                    pre_tokens: pre,
+                    tools_schema_tokens: tools_schema,
+                    system_tokens: sys,
+                    max_tool_result_chars: ctx_cfg.max_tool_result_chars,
+                    window,
+                },
+            );
+        }
         // 钩子（027）：任务结束挂点（Done / Cancelled / 出错都算结束；含续跑轮）
         crate::hooks::session_end(&sid).await;
         // 档位登记只属于这一轮：跑完还原成跑前的值（跑前没有就摘掉，新会话不留
-        // 隐性档位）。用户中途在界面切过档（当前值不再是本轮写入的）就以用户为准，
-        // 同 WorkspaceGuard 的「只还我自己设的那个值」纪律。
+        // 隐性档位）。用户中途在界面切过档（当前值不再是本轮写入的）就以用户为准。
         if let Ok(mut m) = approval_modes.write()
             && m.get(&sid).map(String::as_str) == Some(inserted_mode.as_str())
         {

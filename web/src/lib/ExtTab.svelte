@@ -38,8 +38,13 @@
 
   <!-- 「新建插件」与技能/MCP 同款——表单默认收起，点开才占地方 -->
   <div class="sub-row">
-    <button class="btn primary" on:click={openMaker}>新建插件</button>
-    <button class="btn" on:click={() => loadExt()}>刷新</button>
+    <button class="btn primary btn-plus" on:click={openMaker}>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+      新建插件
+    </button>
+    <button class="icon-act" title="刷新" aria-label="刷新" on:click={() => loadExt()}>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg>
+    </button>
   </div>
   {#if extCreateOpen}
     <div class="field">
@@ -70,6 +75,7 @@
       <div class="plug-meta">
         <div class="plug-title">{e.title}</div>
         <div class="plug-desc">{e.description || e.dir}</div>
+        {#if e.skills?.length}<div class="plug-desc">自带技能：{e.skills.join('、')}</div>{/if}
       </div>
       {#if e.draft}<span class="plug-chip warn">草稿</span>{/if}
       {#if e.origin === 'model_generated'}<span class="plug-chip">模型自产</span>{/if}
@@ -81,7 +87,7 @@
         <button class="btn ghost" on:click={() => discardExt(e)}>丢弃</button>
       {:else}
         {#if e.settings_entry && !isDockExt(e)}<button class="btn ghost" on:click={() => openExtPage(e, e.settings_entry)} disabled={!e.ok || e.enabled === false}>设置</button>{/if}
-        {#if e.entry && !isDockExt(e)}<button class="btn ghost" on:click={() => openExt(e)} disabled={!e.ok || e.enabled === false}>打开</button>{/if}
+        {#if e.entry && !isDockExt(e)}<button class="icon-act" title="打开插件" aria-label="打开" on:click={() => openExt(e)} disabled={!e.ok || e.enabled === false}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6"/><path d="M20 4 10 14"/><path d="M20 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h5"/></svg></button>{/if}
         {#if e.origin === 'user'}
           <button class="btn ghost danger" on:click={() => removeExt(e)} title="删除插件目录（不可恢复）">删除</button>
         {/if}
@@ -101,6 +107,7 @@
         <div class="plug-meta">
           <div class="plug-title">{e.title}</div>
           <div class="plug-desc">{e.description || e.dir}</div>
+          {#if e.skills?.length}<div class="plug-desc">自带技能：{e.skills.join('、')}</div>{/if}
         </div>
         {#if e.draft}<span class="plug-chip warn">草稿</span>{/if}
         {#if e.origin === 'model_generated'}<span class="plug-chip">模型自产</span>{/if}
@@ -112,7 +119,7 @@
           <button class="btn ghost" on:click={() => discardExt(e)}>丢弃</button>
         {:else}
           {#if e.settings_entry && !isDockExt(e)}<button class="btn ghost" on:click={() => openExtPage(e, e.settings_entry)} disabled={!e.ok || e.enabled === false}>设置</button>{/if}
-          {#if e.entry && !isDockExt(e)}<button class="btn ghost" on:click={() => openExt(e)} disabled={!e.ok || e.enabled === false}>打开</button>{/if}
+          {#if e.entry && !isDockExt(e)}<button class="icon-act" title="打开插件" aria-label="打开" on:click={() => openExt(e)} disabled={!e.ok || e.enabled === false}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6"/><path d="M20 4 10 14"/><path d="M20 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h5"/></svg></button>{/if}
           {#if e.origin === 'user'}
             <button class="btn ghost danger" on:click={() => removeExt(e)} title="删除插件目录，不可恢复">删除</button>
           {/if}
@@ -141,7 +148,9 @@
       {/if}
     </div>
     <span class="flex-sp"></span>
-    <button class="btn ghost" disabled={!gitRuntime} on:click={() => loadGitRuntime(true)} title="重新跑一遍 git.exe 发现链">重新检测</button>
+    <button class="icon-act" disabled={!gitRuntime} on:click={() => loadGitRuntime(true)} title="重新检测：重新跑一遍 git.exe 发现链" aria-label="重新检测">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg>
+    </button>
   </div>
   <div class="plug-row" title="沙箱执行机制归内核（Job Objects 整树击杀 + 受限 token）；这里看生效档位、跑自检">
     <div class="plug-ico">
@@ -156,7 +165,9 @@
       {/if}
     </div>
     <span class="flex-sp"></span>
-    <button class="btn ghost" disabled={sandboxProbeBusy} on:click={runSandboxProbe} title="真拉起受限进程跑探针套件，验证隔离机制（Job Objects / 受限 token）">{sandboxProbeBusy ? '检测中…' : '检测'}</button>
+    <button class="icon-act" disabled={sandboxProbeBusy} on:click={runSandboxProbe} title={sandboxProbeBusy ? '检测中…' : '检测：真拉起受限进程跑探针套件，验证隔离机制（Job Objects / 受限 token）'} aria-label="检测">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.5-3 8.4-7 10-4-1.6-7-5.5-7-10V6z"/><path d="M9.2 12l2 2 3.6-3.8"/></svg>
+    </button>
     {#if sandboxProbe}
       {#if sandboxProbe.error}
         <span class="plug-chip warn" title={sandboxProbe.error}>检测失败</span>

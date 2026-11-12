@@ -299,6 +299,11 @@ pub async fn command(args: &str, max_chars: usize) -> Result<String, String> {
         }
         other => other,
     };
+    // 先记时间戳再执行：窗口失焦时 agent 页的「不藏」判定要在本条命令开始前就生效
+    // （否则第一条 screenshot 会在隐藏的 webview 上挂住）。
+    if let Ok(s) = current_session().await {
+        s.agent_touched_ms.store(now_ms(), Ordering::Relaxed);
+    }
     let out = dispatch(cmd, max_chars).await.map_err(String::from);
     // agent 碰过浏览器（不论成败）就记时间戳——面板据此自动唤起右侧栏。
     // 与面板显隐分开：agent 的触碰只唤醒界面，不直接把 webview 弹到聊天区上空。

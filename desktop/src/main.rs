@@ -26,6 +26,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
@@ -50,6 +51,65 @@ const CTL_ADDR: (&str, u16) = ("127.0.0.1", 9225);
 const GUARD_PORT: u16 = 9224;
 /// child webview 弹窗防护：window.open 直接掐掉（on_new_window 再兜一层）
 const POPUP_GUARD_JS: &str = "window.open = function () { return null; };";
+/// 网页面板帧率封顶 60fps（2026-11-09）：child webview 默认跟着显示器刷新率跑，
+/// 120Hz 屏上一个 three.js 动画实测 125fps，渲染开销翻倍。把 rAF 封在 60fps——
+/// 普通网页无感，动画/游戏类降到 60 帧，CPU 省近一半。只注入网页面板的 webview，
+/// 主界面与菜单不受影响。
+///
+/// 同一帧窗口内**批量派发**所有等待中的回调（不是每个回调各自节流）：
+/// 页面里多个动画循环共用同一个 60fps 节奏，谁也饿不死谁；回调抛错照常上报
+/// （setTimeout 重抛成未捕获异常），不影响同批其它回调。
+/// cancelAnimationFrame 对未派发的 id 生效，已派发的按规范是 no-op。
+/// 另暴露 `__pawchSetRafPaused(v)`：窗口被完全遮挡/最小化时服务端经 CDP 调它
+/// 冻结页面动画（最后一帧留在屏上，切回来无缝），见 session.rs 的 set_raf_paused。
+const RAF_LIMIT_JS: &str = r#"(function () {
+  if (!window.requestAnimationFrame) return;
+  var raf = window.requestAnimationFrame.bind(window);
+  var FRAME = 1000 / 60;
+  var last = 0;
+  var nextId = 1;
+  var pending = {};
+  var cancelled = {};
+  var running = false;
+  // 窗口被完全遮挡/最小化时的冻结开关：服务端经 CDP 调用。停掉原生 rAF 循环
+  // （pending 保留），恢复时接着跑——页面最后一帧留在屏上，切回来无缝。
+  var paused = false;
+  window.__pawchSetRafPaused = function (v) {
+    paused = !!v;
+    if (!paused && !running && Object.keys(pending).length) {
+      running = true;
+      raf(tick);
+    }
+  };
+
+  function tick(t) {
+    if (paused) { running = false; return; }
+    if (t - last < FRAME - 1) { raf(tick); return; }
+    last = t;
+    var batch = pending;
+    pending = {};
+    for (var id in batch) {
+      var slot = batch[id];
+      if (cancelled[id]) { delete cancelled[id]; continue; }
+      try { slot.cb(t); } catch (e) { setTimeout(function () { throw e; }, 0); }
+    }
+    // 本批结束：批内取消的 id 已处理完，清掉避免 map 无限增长（批外取消走 pending/无效）
+    cancelled = {};
+    if (Object.keys(pending).length) { raf(tick); }
+    else { running = false; }
+  }
+
+  window.requestAnimationFrame = function (cb) {
+    var id = nextId++;
+    pending[id] = { cb: cb };
+    if (!running) { running = true; raf(tick); }
+    return id;
+  };
+  window.cancelAnimationFrame = function (id) {
+    if (pending[id]) { delete pending[id]; return; }
+    cancelled[id] = true;
+  };
+})();"#;
 /// 网页面板滚动条跟随应用主题（浅色模式下深色页面/未声明
 /// color-scheme 的页面把滚动条画成深色，跟浅色面板不搭）。首选色系（prefers-color-
 /// scheme）跟着窗口主题走、窗口主题跟应用主题走，所以这里监听它切换即可：
@@ -440,6 +500,173 @@ impl WebviewHost {
     }
 }
 
+/// 控制通道的上行写端（壳 → 服务）；未连接时 None，指令静默丢弃。
+/// 目前只上行 focus（窗口前后台切换），见 `notify_focus`。
+static CTL_WRITER: Mutex<Option<TcpStream>> = Mutex::new(None);
+/// 焦点事件序号：失焦延迟发送期间又来了新事件（快速 Alt-Tab/文件对话框）就不发旧的。
+static FOCUS_TICK: AtomicU64 = AtomicU64::new(0);
+
+fn ctl_send(line: &str) {
+    match CTL_WRITER.lock() {
+        Ok(mut g) => match g.as_mut() {
+            Some(w) => {
+                if let Err(e) = w.write_all(line.as_bytes()).and_then(|_| w.flush()) {
+                    slog(&format!("ctl_send 失败: {e}"));
+                }
+            }
+            None => slog("ctl_send：控制通道未连接"),
+        },
+        Err(e) => slog(&format!("ctl_send 锁中毒: {e}")),
+    }
+}
+
+use windows_sys::Win32::Foundation::RECT;
+use windows_sys::Win32::UI::WindowsAndMessaging::EnumWindows;
+
+/// 主窗口在屏幕上是否真的「看得见」：未最小化、窗口没被藏、且**没有被更高层的
+/// 可见窗口完全盖住**。部分可见（侧并排）就算看得见——页面照常渲染，跟 ZCode 一致；
+/// 完全盖住才算看不见（冻结页面动画）。
+///
+/// 近似 Chromium 的遮挡检测。第一版只看前台窗口的矩形：任务管理器这类小窗在
+/// 前台时，Pawch 明明被别的窗口盖死却被判成「看得见」，页面在屏幕外照常渲染
+/// （真机 2026-11-09：放背面 CPU 19.6%）。改为按 Z 序枚举：只统计排在我们前面的
+/// 可见顶层窗口（跳过最小化/工具窗/穿透窗/cloaked 的 UWP），矩形并集完全覆盖
+/// 主窗口才算「看不见」。
+fn main_window_on_screen(main: isize) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsIconic, IsWindowVisible};
+    if unsafe { IsIconic(main as _) } != 0 {
+        return false;
+    }
+    if unsafe { IsWindowVisible(main as _) } == 0 {
+        return false;
+    }
+    let mut ctx = OcclusionCtx { main, rects: Vec::new(), reached_self: false };
+    unsafe { EnumWindows(Some(collect_windows_above), &mut ctx as *mut OcclusionCtx as isize) };
+    // 没枚举到自己的窗口（桌面异常）：按可见处理，宁可白渲染也不误冻
+    if !ctx.reached_self {
+        return true;
+    }
+    let mut mr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    if unsafe { GetWindowRect(main as _, &mut mr) } == 0 {
+        return true;
+    }
+    !rects_fully_cover(&mr, &ctx.rects)
+}
+
+struct OcclusionCtx {
+    main: isize,
+    /// 排在主窗口前面的可见窗口矩形（Z 序从上往下，到主窗口为止）
+    rects: Vec<RECT>,
+    reached_self: bool,
+}
+
+/// EnumWindows 回调：按 Z 序收集排在我们前面的可见窗口；遇到主窗口即停。
+unsafe extern "system" fn collect_windows_above(hwnd: isize, lparam: isize) -> i32 {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongW, GetWindowRect, IsIconic, IsWindowVisible, GWL_EXSTYLE, WS_EX_TOOLWINDOW,
+        WS_EX_TRANSPARENT,
+    };
+    use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+    let ctx = &mut *(lparam as *mut OcclusionCtx);
+    if hwnd == ctx.main {
+        ctx.reached_self = true;
+        return 0; // 0 = 停止枚举
+    }
+    if IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
+        return 1;
+    }
+    // 工具窗/穿透窗不挡视线；cloaked 的 UWP 窗口在屏幕上没有实际内容
+    let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+    if ex & (WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW) != 0 {
+        return 1;
+    }
+    let mut cloaked: u32 = 0;
+    let code = DwmGetWindowAttribute(
+        hwnd,
+        DWMWA_CLOAKED as u32,
+        &mut cloaked as *mut u32 as *mut core::ffi::c_void,
+        std::mem::size_of::<u32>() as u32,
+    );
+    if code == 0 && cloaked != 0 {
+        return 1;
+    }
+    let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    if GetWindowRect(hwnd, &mut r) != 0 && r.right > r.left && r.bottom > r.top {
+        ctx.rects.push(r);
+    }
+    1
+}
+
+/// 遮挡矩形并集是否完全盖住 target：y 轴切成带，每带内 x 区间并集必须无缝铺满。
+fn rects_fully_cover(target: &RECT, occluders: &[RECT]) -> bool {
+    let mut rs: Vec<RECT> = occluders
+        .iter()
+        .filter(|r| r.left < target.right && r.right > target.left && r.top < target.bottom && r.bottom > target.top)
+        .copied()
+        .collect();
+    if rs.is_empty() {
+        return false;
+    }
+    let mut ys: Vec<i32> = vec![target.top, target.bottom];
+    for r in &rs {
+        ys.push(r.top.max(target.top));
+        ys.push(r.bottom.min(target.bottom));
+    }
+    ys.sort_unstable();
+    ys.dedup();
+    for band in ys.windows(2) {
+        let (ya, yb) = (band[0], band[1]);
+        if yb <= ya {
+            continue;
+        }
+        // 垂直方向完全跨过这一带的遮挡矩形，取它们与 target 相交的 x 区间
+        let mut xs: Vec<(i32, i32)> = rs
+            .iter()
+            .filter(|r| r.top <= ya && r.bottom >= yb)
+            .map(|r| (r.left.max(target.left), r.right.min(target.right)))
+            .collect();
+        xs.sort_unstable();
+        let mut cursor = target.left;
+        let mut covered = false;
+        for (l, r) in xs {
+            if l > cursor {
+                covered = false;
+                break;
+            }
+            if r > cursor {
+                cursor = r;
+            }
+            if cursor >= target.right {
+                covered = true;
+                break;
+            }
+        }
+        if !covered && cursor < target.right {
+            return false;
+        }
+    }
+    true
+}
+
+/// 窗口可见性变化 → 通知服务端：看不见时冻结可见网页的动画（rAF 停住，最后一帧
+/// 留在屏上，切回来无缝），露出来立即恢复。只看「是否被完全遮挡」，部分可见照常渲染。
+/// 失焦/遮挡延迟 1.2s 再发：文件对话框/右键菜单这类瞬时切换不触发冻结。
+fn notify_focus(visible: bool) {
+    slog(&format!("窗口可见事件 visible={visible}"));
+    let tick = FOCUS_TICK.fetch_add(1, Ordering::Relaxed) + 1;
+    if visible {
+        ctl_send("{\"op\":\"focus\",\"focused\":true}\n");
+        return;
+    }
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(1200));
+        if FOCUS_TICK.load(Ordering::Relaxed) == tick {
+            ctl_send("{\"op\":\"focus\",\"focused\":false}\n");
+        }
+    });
+}
+
 /// 控制通道客户端：连上服务端 9225，按行收 JSON 指令并执行；断线 1s 重连。
 fn spawn_ctl_client(app: tauri::AppHandle) {
     thread::spawn(move || {
@@ -451,6 +678,10 @@ fn spawn_ctl_client(app: tauri::AppHandle) {
                 if let Some(w) = w.as_mut() {
                     let hello = json!({ "op": "hello", "pid": std::process::id(), "cdp": CDP_PORT });
                     let _ = w.write_all(format!("{hello}\n").as_bytes());
+                }
+                // 上行写端（focus）：同一个套接字的独立克隆
+                if let Ok(mut g) = CTL_WRITER.lock() {
+                    *g = sock.try_clone().ok();
                 }
                 let mut r = BufReader::new(sock);
                 let mut line = String::new();
@@ -472,6 +703,9 @@ fn spawn_ctl_client(app: tauri::AppHandle) {
                     }
                 }
                 slog("控制通道断开，1s 后重连");
+                if let Ok(mut g) = CTL_WRITER.lock() {
+                    *g = None;
+                }
             }
             thread::sleep(Duration::from_secs(1));
         }
@@ -625,6 +859,7 @@ fn dispatch(app: &tauri::AppHandle, op: &Value) {
             let mut builder = WebviewBuilder::new(&label, WebviewUrl::External(parsed))
                 .additional_browser_args(BROWSER_ARGS)
                 .initialization_script(POPUP_GUARD_JS)
+                .initialization_script(RAF_LIMIT_JS)
                 .initialization_script(SCROLLBAR_THEME_JS)
                 .on_new_window(|_url, _features| tauri::webview::NewWindowResponse::Deny);
             // 空白页（about:blank/未落地的页面）画布色跟主题走，别让系统深色把
@@ -900,6 +1135,24 @@ fn main() {
                         let _ = w.hide();
                     }
                 });
+                // 可见性轮询：窗口被完全遮挡/最小化时让服务端冻结页面动画（rAF 停住，
+                // 最后一帧留在屏上，切回来无缝）；部分可见照常渲染（对齐 ZCode）。
+                // 用轮询不用 Tauri 的 Focused 事件——真机上事件不可靠（见
+                // main_window_on_screen 注释）。
+                if let Ok(hwnd) = win.hwnd() {
+                    let main = hwnd.0 as isize;
+                    std::thread::spawn(move || {
+                        let mut last: Option<bool> = None;
+                        loop {
+                            let visible = main_window_on_screen(main);
+                            if last != Some(visible) {
+                                last = Some(visible);
+                                notify_focus(visible);
+                            }
+                            thread::sleep(Duration::from_millis(500));
+                        }
+                    });
+                }
                 // 身份标记补打：壳窗口里的前端页面是启动时加载的，用户可能在浏览器里
                 // 还开着一个旧版页面——两者都往服务端报面板矩形，服务端只认带壳标记的那个。
                 // 页面刷新会丢掉注入，故按周期重打（脚本幂等，重复执行零副作用）。
