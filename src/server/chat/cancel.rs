@@ -110,6 +110,11 @@ pub(crate) async fn cancel_status(State(state): State<AppState>, Query(q): Query
             // 这里给回权威清单，前端在 running 时铺回；模型取走后这里自然变空，
             // 之后由会话文件里的 steered 行接力展示。
             "pending_steers": state.steer.steer_texts(session),
+            // 挂着的排队文本（2026-11-12）：前端「排队中」气泡可能来自刷新快照/服务端
+            // 接管，比真实队列旧——消息已经送达跑成，气泡还挂着；点引导/立即发送会把
+            // 同一句再投一遍。前端拿它对账：文本不在 pending_queued/pending_steers
+            // 且对话里已有同文正式消息 → 只清气泡，不再投递。
+            "pending_queued": state.steer.queued_texts(session),
         }))
     }
 }

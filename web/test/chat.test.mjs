@@ -25,10 +25,12 @@ import {
   parseTodoArgs,
   latestTodoRun,
   latestTodoInMessages,
+  latestTodoCall,
   filesTouchedInMessages,
   attachAskToToolPart,
   settleAskOnParts,
   fileUserIndexOf,
+  outboxNotYetSent,
 } from '../src/lib/chat.js';
 
 test('审批记录挂在最后一个同名工具段上，决定回填按 id 命中', () => {
@@ -453,9 +455,10 @@ test('latestTodoInMessages：跨消息取最后一次 todo，清空后不翻旧�
   // 最后一次是空清单（清零）：返回 null，不能回退到更早的清单
   const d = mk('d', '{"todos":[]}');
   assert.equal(latestTodoInMessages([a, c, d]), null);
-  // 最后一次是坏参数同理
+  // 最后一次是坏参数：回退上一份**可解析**清单（流式半截不能让 dock 闪没）；
+  // 显式空清单才算清零（2026-11-13 latestTodoCall 改口径）
   const e = mk('e', '{半截');
-  assert.equal(latestTodoInMessages([a, e]), null);
+  assert.equal(latestTodoInMessages([a, e]).todos[0].content, '旧任务', '半截回退上一份完整清单');
   assert.equal(latestTodoInMessages([]), null);
 });
 
@@ -575,4 +578,60 @@ test('fileUserIndexOf 与 mergeAssistantRun 闭环：合并产物直接喂序数
   // 引导标记落在 a1 的 parts 尾部（边界处）
   const steerPart = view.find((x) => x.role === 'assistant' && (x.parts || []).some((p) => p.type === 'steer'));
   assert.ok(steerPart, '合并产物里有 steer part');
+});
+
+test('outboxNotYetSent：刷新快照恢复排队时剔掉已送达的条目，保留合法重复', () => {
+  const item = (id, text, ts) => ({ id, text, ts });
+  const msg = (content, ts, extra = {}) => ({ role: 'user', content, ts, ...extra });
+
+  // 排队在前(1000)、正式消息在后(1500)：已送达 → 剔除（真机重复投递的来路）
+  assert.deepEqual(
+    outboxNotYetSent([item('q1', '同一句', 1000)], [msg('同一句', 1500)]),
+    []
+  );
+  // 用户后来又排了一句同文（排队时间晚于已有正式消息）：合法重复，保留
+  assert.equal(
+    outboxNotYetSent([item('q2', '同一句', 2000)], [msg('同一句', 1500)]).length,
+    1
+  );
+  // 文案不同、或还没有正式消息：保留
+  assert.equal(outboxNotYetSent([item('q3', '另一句', 1000)], [msg('同一句', 1500)]).length, 1);
+  assert.equal(outboxNotYetSent([item('q4', '同一句', 1000)], []).length, 1);
+  // 排队气泡不算「已送达」（还没变成正式消息）；引导行算（已并入并落盘）
+  assert.equal(
+    outboxNotYetSent([item('q5', '同一句', 1000)], [msg('同一句', 1500, { queued: true })]).length,
+    1
+  );
+  assert.equal(
+    outboxNotYetSent([item('q6', '同一句', 1000)], [msg('同一句', 1500, { steered: true })]).length,
+    0
+  );
+  // 空/坏条目：空表兜底；没 id 的丢弃（铺回气泡必须有 id）
+  assert.deepEqual(outboxNotYetSent([], [msg('x', 1)]), []);
+  assert.deepEqual(outboxNotYetSent([{ text: 'x', ts: 1 }], []), []);
+  // 内容块数组的消息按文本比对
+  assert.equal(
+    outboxNotYetSent([item('q7', '同一句', 1000)], [msg([{ type: 'text', text: '同一句' }], 1500)]).length,
+    0
+  );
+});
+
+test('latestTodoCall：清单带指纹（条目内容拼接、不含状态），状态更新不算新调用', () => {
+  const a = { id: 'a', role: 'assistant', parts: [{ type: 'tool', name: 'todo', args: '{"todos":[{"content":"旧任务","status":"completed","priority":"low"}]}' }] };
+  const hit = latestTodoCall([a]);
+  assert.equal(hit.ref, '旧任务', '指纹=内容拼接');
+  assert.equal(hit.todos[0].content, '旧任务');
+  // 只把状态从 completed 改回 pending：指纹不变（dock 不当新清单）
+  const b = { id: 'b', role: 'assistant', parts: [{ type: 'tool', name: 'todo', args: '{"todos":[{"content":"旧任务","status":"pending"}]}' }] };
+  assert.equal(latestTodoCall([a, b]).ref, '旧任务');
+  // 条目内容变了 = 新清单
+  const c = { id: 'c', role: 'assistant', parts: [{ type: 'tool', name: 'todo', args: '{"todos":[{"content":"新任务一"},{"content":"新任务二"}]}' }] };
+  assert.notEqual(latestTodoCall([a, c]).ref, '旧任务');
+  // 半截参数不可解析：回退到上一份可解析清单（最新的完整清单仍生效）；空表兜底
+  const d = { id: 'd', role: 'assistant', parts: [{ type: 'tool', name: 'todo', args: '{"todos":[{"content":"半截"' }] };
+  assert.equal(latestTodoCall([a, d]).ref, '旧任务');
+  assert.equal(latestTodoCall([]), null);
+  // 同一条消息里后面的调用优先（整表替换=最新生效）
+  const e = { id: 'e', role: 'assistant', parts: [{ type: 'content', text: 'x' }, { type: 'tool', name: 'todo', args: '{"todos":[{"content":"后写的"}]}' }] };
+  assert.equal(latestTodoCall([a, e]).ref, '后写的');
 });

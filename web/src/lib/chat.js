@@ -309,6 +309,31 @@ export function fileUserIndexOf(list, id) {
   return n;
 }
 
+/// 刷新/重载恢复排队快照时，剔除**其实已经送达**的条目（2026-11-12 真机）。
+/// 快照可能比出队旧：消息在出队时已经作为正式 user 消息发出（会话文件/消息数组
+/// 里有它），outbox 里那份却还留着——刷新后铺回一个「排队中」气泡，用户点
+/// 「引导/立即发送」就会把同一句话再投一遍（截图里同一问题出现两份的来路）。
+/// 判据：同文本、非排队/非引导的正式用户消息，时间戳不早于条目的排队时间
+/// （排队在前、送达在后）。排队时间比正式消息晚的保留——那是用户之后又排了
+/// 一句同文消息，属于合法重复，不能吞。
+export function outboxNotYetSent(items, msgs) {
+  const text = (c) => (typeof c === 'string' ? c : Array.isArray(c) ? c.map((p) => (p && p.text) || '').join('') : '');
+  const list = msgs || [];
+  return (items || []).filter((it) => {
+    if (!it || !it.id) return false;
+    const t = typeof it.text === 'string' ? it.text : '';
+    if (!t) return true;
+    return !list.some(
+      (m) =>
+        m &&
+        m.role === 'user' &&
+        !m.queued &&
+        text(m.content) === t &&
+        Number(m.ts || 0) >= Number(it.ts || 0)
+    );
+  });
+}
+
 /// 工具结果回填到历史 parts（按 tool_call_id 精确匹配）
 export function attachToolPreview(parts, toolCallId, preview) {
   if (!parts || !toolCallId) return parts || [];
@@ -324,23 +349,29 @@ export function attachToolPreview(parts, toolCallId, preview) {
 const TODO_STATUS = ['pending', 'in_progress', 'completed'];
 const TODO_PRIORITY = ['high', 'medium', 'low'];
 
-/// 解析 todo 工具参数为清单。参数是流式 JSON（可能半截），解析失败返回 null（卡不渲染）
-export function parseTodoArgs(args) {
+/// 解析 todo 工具参数为条目数组：合法 JSON 且 todos 是数组 → 数组（**可能为空**，
+/// 空数组=模型清零清单，调用方要区分）；半截 JSON / 没有 todos 键 → null。
+function parseTodoList(args) {
   try {
     const v = JSON.parse(args);
     if (!v || !Array.isArray(v.todos)) return null;
-    const todos = v.todos
+    return v.todos
       .filter((t) => t && typeof t.content === 'string' && t.content.trim())
       .map((t) => ({
         content: String(t.content),
         status: TODO_STATUS.includes(t.status) ? t.status : 'pending',
         priority: TODO_PRIORITY.includes(t.priority) ? t.priority : 'medium',
       }));
-    if (!todos.length) return null;
-    return { todos };
   } catch {
     return null;
   }
+}
+
+/// 解析 todo 工具参数为清单。参数是流式 JSON（可能半截），解析失败或空清单返回
+/// null（卡不渲染、dock 不显示）。
+export function parseTodoArgs(args) {
+  const list = parseTodoList(args);
+  return list && list.length ? { todos: list } : null;
 }
 
 /// 消息里最后一次 todo 调用的清单（清单语义=最新一次整表替换生效；无则 null）
@@ -356,10 +387,14 @@ export function latestTodoRun(parts) {
   return null;
 }
 
-/// 当前会话的清单：从消息流末尾往前找**最后一次** todo 调用（整表替换=最新生效）。
-/// 关键：找到最后一次就停——哪怕它是空清单（清零）或坏参数，也返回 null，
-/// 不能继续往前翻出上一轮的旧清单（2026-11-03 输入框上方 dock 用）。
-export function latestTodoInMessages(messages) {
+/// 最近一次 todo 调用：清单（可能为空数组=清零）+ 判同指纹。指纹=条目内容拼接
+/// （**不含状态**）——任务清单 dock 拿它判「是不是一次新的清单调用」：叉掉/手动
+/// 收起的手动态只能被跨轮的**新条目**重置，不能被「发了条消息」或「条目只更新了
+/// 状态」冲掉（2026-11-13 真机：叉掉后下一条消息又冒出来）。不用消息 id 当指纹：
+/// 重建视图（刷新/回滚/对账）会换 id，会把叉掉的手动态误判成新调用。
+/// 向前扫到第一份**可解析**的参数为止：半截 JSON 回退上一份完整清单（流式期
+/// dock 不能闪没）；显式空清单原样返回（清零语义，调用方负责藏 dock）。
+export function latestTodoCall(messages) {
   const arr = messages || [];
   for (let i = arr.length - 1; i >= 0; i--) {
     const m = arr[i];
@@ -367,10 +402,18 @@ export function latestTodoInMessages(messages) {
     const parts = messageParts(m);
     for (let j = parts.length - 1; j >= 0; j--) {
       const p = parts[j];
-      if (p && p.type === 'tool' && p.name === 'todo') return parseTodoArgs(p.args);
+      if (p && p.type === 'tool' && p.name === 'todo') {
+        const todos = parseTodoList(p.args);
+        if (todos !== null) return { ref: todos.map((t) => t.content).join('\n'), todos };
+      }
     }
   }
   return null;
+}
+
+export function latestTodoInMessages(messages) {
+  const hit = latestTodoCall(messages);
+  return hit && hit.todos.length ? { todos: hit.todos } : null;
 }
 
 /// 会话里 agent 写过/改过的文件（按首次出现顺序去重）。

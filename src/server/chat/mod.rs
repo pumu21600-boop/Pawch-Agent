@@ -393,10 +393,11 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
         // 「排队中」气泡上点引导 = **原地升级**那条排队消息（2026-11-07）：
         // 同文本的 Queued 条目改档，不再排一条新的——否则原条目本轮收尾被排水，
         // 同一句话既显示「已引导」又被当成新一轮发出去。
-        // 「立即发送」不走升级（语义是停轮重启）：队列里已有同文本排队条目就直接用
-        // 它（它本来就是新一轮的那条消息），没有才入队——仍按 Queued 入队。
-        let promoted = req.promote && mode == SteerMode::Steer && state.steer.promote(&session_id, &text, mode);
-        let already_queued = mode == SteerMode::Interrupt && state.steer.has_queued(&session_id, &text);
+        // 「立即发送」也走升级（2026-11-12）：同文本的条目已经在队列里（排队或已引导）
+        // 就改档，不再排一条新的——否则重启后的 followup 会把同一句话跑两遍
+        //（引导一条 + 打断一条）。找不到才按 Queued 入队。
+        let promoted = req.promote && state.steer.promote(&session_id, &text, mode);
+        let already_queued = mode == SteerMode::Interrupt && state.steer.has_pending(&session_id, &text);
         let pending = if promoted || already_queued {
             state.steer.pending(&session_id)
         } else {
@@ -462,8 +463,11 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
             let extra = state.steer.drain_all(&session_id);
             let snap = session.get(&session_id).map(|s| s.messages).unwrap_or_default();
             let mut merged = if snap.is_empty() { history.clone() } else { snap };
+            // 接管 = 这些队列消息由**本次请求**起成新一轮：它们没有并进任何正在跑的
+            // 轮，落盘/展示必须是普通用户消息（to_turn_message，不许标 steered——
+            // 2026-11-12 真机：接管把引导落成「已引导」静默行，实际却被当新一轮回答）。
             for s in &extra {
-                merged.push(s.to_message());
+                merged.push(s.to_turn_message());
             }
             observability::event(
                 EventType::State,
@@ -1440,8 +1444,9 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
         steer_queue.take_restart(&session_id);
         // 025/027：一轮跑完后还剩的排队消息（缺省模式，或最后一个决策点之后才到的——
         // 含错过补取窗口的引导）→ 用最后一轮快照当上下文，紧接着再跑一轮
-        // （同一个 SSE 流）：「进了队列的消息一定被处理」。带 mode：followup 的
-        // 消息按 引导=steered 静默 / 排队=普通消息 呈现（规则见 SteerMsg::to_message）。
+        // （同一个 SSE 流）：「进了队列的消息一定被处理」。这些消息成了**新一轮的
+        // 开头**，用 to_turn_message 落盘（引导也不标 steered：它没并进任何轮，
+        // 标了界面就说「已引导」而实际已被当新一轮回答，2026-11-12 真机回归）。
         let extra = steer_queue.drain_all(&session_id);
         if extra.is_empty() {
             send(json!({ "done": true }));
@@ -1494,7 +1499,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
             EventType::State,
             json!({ "kind": "steer", "phase": "followup", "session": session_id, "count": extra.len() }),
         );
-        let turn_msgs: Vec<Value> = extra.iter().map(|s| s.to_message()).collect();
+        let turn_msgs: Vec<Value> = extra.iter().map(|s| s.to_turn_message()).collect();
         // 通知前端：这些排队消息现在开始跑了（气泡从「排队中」转成正式消息、开新回答气泡）
         send(json!({ "turn": { "messages": turn_msgs } }));
         next.extend(turn_msgs);

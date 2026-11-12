@@ -549,7 +549,8 @@ pub(crate) async fn run_headless_inner(
             if next.is_empty() {
                 next = history.clone();
             }
-            let turn_msgs: Vec<Value> = extra.iter().map(|s| s.to_message()).collect();
+            // 续跑轮的第一条用户消息：不标 steered（没并进上一轮，见 SteerMsg::to_turn_message）
+            let turn_msgs: Vec<Value> = extra.iter().map(|s| s.to_turn_message()).collect();
             next.extend(turn_msgs);
             history = next;
         }

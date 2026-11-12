@@ -291,6 +291,43 @@ fn body_error(data: &Value) -> Option<&Value> {
     data.get("error").filter(|v| !v.is_null())
 }
 
+/// 渠道错误正文 → 一行人话。整页 HTML 原样进错误消息会糊满对话气泡
+/// （2026-11-13 真机：中转源站掉线回 Cloudflare 530 隧道页，几屏幕 HTML 刷进会话
+/// 还随错误落盘）。规则：HTML 页不贴原文，认出 Cloudflare 隧道类错误给一句
+/// 「渠道服务方的问题」；其余正文截 300 字符（JSON 错误的 message 都在最前面，
+/// 够定位；全文在 gateway.error 日志事件里）。
+fn humanize_error_body(status: u16, text: &str) -> String {
+    let t = text.trim();
+    let lower = t.to_ascii_lowercase();
+    let looks_html = lower.starts_with("<!doctype") || lower.contains("<html");
+    if looks_html {
+        if lower.contains("cloudflare")
+            && (lower.contains("tunnel error") || lower.contains("error code: 1033"))
+        {
+            return "渠道的 Cloudflare 隧道不可达（1033：源站不在线/隧道断开）——渠道服务方的问题，稍后重试或换渠道".into();
+        }
+        if lower.contains("cloudflare") {
+            return format!("渠道返回了 Cloudflare 错误页（渠道侧拦截/源站异常，HTTP {status}）——稍后重试或换渠道");
+        }
+        return "渠道返回了一个网页错误页（HTML，正文省略）——详情见服务日志 gateway.error".into();
+    }
+    let mut s: String = t.chars().take(300).collect();
+    if t.chars().count() > 300 {
+        s.push('…');
+    }
+    s
+}
+
+/// 日志事件里的错误正文上限：整页 HTML 全文写进 agent.jsonl 会加速日志轮转
+/// 把任务边界挤掉（时间线空白教训），5-8KB 的错误页截到 2KB 足够定位。
+fn log_body(text: &str) -> String {
+    let mut s: String = text.chars().take(2000).collect();
+    if text.chars().count() > 2000 {
+        s.push('…');
+    }
+    s
+}
+
 /// embeddings 端点 URL：只给了主机时补 `/v1`，给了路径原样拼（与 chat_url 同款
 /// 根路径判定；2026-11-10 审查：embed 漏了这步，只填主机的配置必 404）。
 fn embed_url(base_url: &str) -> String {
@@ -829,20 +866,20 @@ impl Gateway {
             }
             observability::event(
                 EventType::Error,
-                json!({ "kind": "gateway.error", "status": status.as_u16(), "body": text }),
+                json!({ "kind": "gateway.error", "status": status.as_u16(), "body": log_body(&text) }),
             );
-            return Err(anyhow!("渠道返回 {status}: {text}"));
+            return Err(anyhow!("渠道返回 {status}: {}", humanize_error_body(status.as_u16(), &text)));
         }
 
         let (code, body) = auth_fail.or(last_fail).unwrap_or((404, String::new()));
         observability::event(
             EventType::Error,
-            json!({ "kind": "gateway.error", "status": code, "body": body }),
+            json!({ "kind": "gateway.error", "status": code, "body": log_body(&body) }),
         );
         let mut msg = format!("渠道返回 {code}");
         if !body.trim().is_empty() {
             msg.push_str(": ");
-            msg.push_str(&body);
+            msg.push_str(&humanize_error_body(code, &body));
         }
         msg.push_str(&format!("（已试 {} 个模型清单地址）", candidates.len()));
         Err(anyhow!(msg))
@@ -944,7 +981,7 @@ impl Gateway {
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
             record_usage(ctx, base_url, params.provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("error", format!("渠道返回 {status}")));
-            return Err(anyhow!("渠道返回 {status}: {text}"));
+            return Err(anyhow!("渠道返回 {status}: {}", humanize_error_body(status.as_u16(), &text)));
         }
         let data: Value = response.json().await.context("解析补全响应失败")?;
         if let Some(err) = body_error(&data) {
@@ -1026,7 +1063,7 @@ impl Gateway {
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
-            return Err(anyhow!("渠道返回 {status}: {text}"));
+            return Err(anyhow!("渠道返回 {status}: {}", humanize_error_body(status.as_u16(), &text)));
         }
         let data: Value = response.json().await.context("解析 embeddings 响应失败")?;
         let vecs: Vec<Vec<f64>> = data
@@ -1318,7 +1355,7 @@ impl Gateway {
             let text = response.text().await.unwrap_or_default();
             observability::event(
                 EventType::Error,
-                json!({ "kind": "gateway.error", "status": status.as_u16(), "body": text }),
+                json!({ "kind": "gateway.error", "status": status.as_u16(), "body": log_body(&text) }),
             );
             if status.is_server_error() {
                 // 5xx 已重试 5 次仍失败：把耗时与响应头落下来（server/cf-ray 判断是边缘还是
@@ -1338,7 +1375,12 @@ impl Gateway {
             }
             record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("error", format!("渠道返回 {status}")));
             let retry_hint = if status.is_server_error() { "（已自动重试 5 次仍失败）" } else { "" };
-            return Err(anyhow!("渠道返回 {status}{retry_hint}: {text}"));
+            // 错误消息只带一行人话：整页 HTML（Cloudflare 530 隧道页）不贴原文——
+            // 2026-11-13 真机它被糊进对话气泡还随错误落盘；全文在 gateway.error 日志里
+            return Err(anyhow!(
+                "渠道返回 {status}{retry_hint}: {}",
+                humanize_error_body(status.as_u16(), &text)
+            ));
         }
 
         // 200 但不是事件流（中转忽略 stream:true 回一个普通 JSON / HTML 错误页）：
@@ -1354,7 +1396,7 @@ impl Gateway {
             record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("error", format!("渠道返回非事件流（{ctype}）")));
             anyhow::bail!(
                 "渠道返回的不是事件流（Content-Type: {ctype}）：{}。请重试或更换渠道。",
-                text.chars().take(300).collect::<String>()
+                humanize_error_body(status.as_u16(), &text)
             );
         }
 

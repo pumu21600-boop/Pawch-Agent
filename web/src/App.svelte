@@ -26,11 +26,12 @@
     messageParts,
     mergeAssistantRun,
     fileUserIndexOf,
+    outboxNotYetSent,
     attachToolPreview,
     attachApprovalToToolPart,
     settleApprovalOnParts,
     parseTodoArgs,
-    latestTodoInMessages,
+    latestTodoCall,
     filesTouchedInMessages,
     attachAskToToolPart,
     settleAskOnParts,
@@ -222,11 +223,12 @@
     streaming = nowStreaming;
     controller = streams[k] ? streams[k].controller : null;
     messages = sessionMsgs[k] || [];
-    // 任务清单 dock：切会话 / 新任务开始 / 本轮结束都回到自动态
-    //（新任务自动展开、结束自动收起；用户手动状态不跨任务残留）
-    if (k !== todoDockKey || nowStreaming !== wasStreaming) {
+    // 任务清单 dock：只有**切会话**重置手动态。发消息/起止流不重置——叉掉的清单
+    // 不能被下一条消息召回，旧清单也不能在发消息瞬间自动弹开（2026-11-13 两问）；
+    // 跨轮新清单的判定在 trackTodoCall（按清单出处 + 流式轮）。
+    if (k !== todoDockKey) {
       todoDockPinned = null;
-      if (k !== todoDockKey || (!wasStreaming && nowStreaming)) todoDockDismissed = false;
+      todoDockDismissed = false;
       todoDockKey = k;
     }
     // 草稿附件的「未能保留」通知：等这条会话的消息数组存在了再补（否则会建出
@@ -2094,13 +2096,24 @@
   // 工具详情折叠（`${msgId}:${toolIndex}` → true=展开）：默认收起，点行展开参数/结果
   let toolFold = {};
   // —— 任务清单 dock（贴输入框上方、展开向上、与提问上下堆叠）——
-  // 清单语义=当前会话最后一次 todo 调用（整表替换）。跑着且有未完项时默认展开；
-  // 任务结束自动收成一行；用户可手动折叠，或点 × 收起整块（新任务/新会话再出现）。
-  let todoDockPinned = null; // null=跟随任务状态；true/false=用户手动展开/收起
-  let todoDockDismissed = false; // 用户叉掉：本任务内不再自动冒出
+  // 清单语义=当前会话最后一次 todo 调用（整表替换）。
+  // 手动态规则（2026-11-13 重写，两问同修）：
+  // - **自动展开只认「本轮里真的来了新的清单调用」**：发消息本身不展开旧清单
+  //  （旧规则 streaming && 有未完项 → 消息一发出上轮清单就弹开）；
+  // - **叉掉/手动收起跨消息、跨轮保留**：只有**条目内容变了且跨了轮**的新清单
+  //   （新一轮里模型真写了新任务）或切会话才重置——旧规则「新一轮开始就重置叉掉」
+  //   让下一条消息把叉掉的清单又召回来（真机 2026-11-13）；条目只更新状态不算新清单。
+  let todoDockPinned = null; // null=跟随自动规则；true/false=用户手动展开/收起
+  let todoDockDismissed = false; // 用户叉掉：新的清单调用出现前不再自动冒出
   let todoDockKey = null; // 上一次同步的会话 key（切会话重置手动态）
-  let todoDockPrevStream = false; // 上一次同步的流式态（起/止时重置手动态）
-  $: currentTodo = latestTodoInMessages(messages);
+  let todoSeenRef = null; // 最近一次见过的清单指纹（条目内容拼接，不含状态）
+  let todoSeenTurn = -1; // 该清单所属的流式轮（跨轮判定）
+  let todoSeenStreaming = false; // 上一刻的流式态（轮计数用）
+  let todoTurnNo = 0; // 流式轮计数（false→true 加一）
+  let todoAutoOpen = false; // 本轮出现过新清单调用（唯一的自动展开资格）
+  $: currentTodoCall = latestTodoCall(messages);
+  // 显式空清单（模型清零）= 藏 dock；currentTodo null = 没有清单
+  $: currentTodo = currentTodoCall && currentTodoCall.todos.length ? { todos: currentTodoCall.todos } : null;
   $: todoDoneN = currentTodo ? currentTodo.todos.filter((t) => t.status === 'completed').length : 0;
   $: todoHasUnfinished = !!currentTodo && currentTodo.todos.some((t) => t.status !== 'completed');
   $: todoCur = currentTodo
@@ -2109,7 +2122,29 @@
       currentTodo.todos[currentTodo.todos.length - 1]
     : null;
   $: todoDockVisible = !!currentTodo && !todoDockDismissed;
-  $: todoDockOpen = todoDockVisible && (todoDockPinned !== null ? todoDockPinned : streaming && todoHasUnfinished);
+  $: todoDockOpen = todoDockVisible && (todoDockPinned !== null ? todoDockPinned : todoAutoOpen && todoHasUnfinished);
+  // 轮计数先行（Svelte4 同 flush 按声明序执行：先记轮，再看清单出处）
+  $: trackTodoTurn(streaming);
+  $: trackTodoCall(currentTodoCall ? currentTodoCall.ref : null);
+  function trackTodoTurn(stream) {
+    if (stream && !todoSeenStreaming) {
+      todoTurnNo += 1;
+      todoAutoOpen = false; // 新轮开始：上一轮的自动展开资格清零
+    }
+    if (!stream) todoAutoOpen = false;
+    todoSeenStreaming = stream;
+  }
+  function trackTodoCall(ref) {
+    if (ref === todoSeenRef) return;
+    // 跨轮 = 会话里第一次出现清单，或它属于另一个流式轮 → 新任务，重置手动态
+    if (todoSeenRef === null || todoSeenTurn !== todoTurnNo) {
+      todoDockDismissed = false;
+      todoDockPinned = null;
+    }
+    todoSeenRef = ref;
+    todoSeenTurn = todoTurnNo;
+    todoAutoOpen = todoSeenStreaming; // 流式期间到来的清单才有自动展开资格
+  }
   function toggleTodoDock() {
     todoDockPinned = !todoDockOpen;
   }
@@ -4777,6 +4812,15 @@
               } else if (d.turn) {
                 // 排队的消息开始跑了：气泡从「排队中」转正式 + 新开一个回答气泡
                 // （已引导过的也算命中——正常到不了这里，但收尾竞态下别让它再补一条重复气泡）
+                // 新一轮开始，上一轮挂着的「已引导」提示作废：这些队列消息（含引导）
+                // 要么已经作为本轮开头被回答，要么随原轮结束——再挂「已引导」会让人
+                // 以为它们还在等某个决策点（2026-11-12 真机：引导被 followup 起成新轮，
+                // 提示却还在，看着像被吞了）。
+                if ((guided[skey] || []).length) {
+                  const nextGuided = { ...guided };
+                  delete nextGuided[skey];
+                  guided = nextGuided;
+                }
                 const adds = [];
                 for (const m of d.turn.messages || []) {
                   const q = (sessionMsgs[skey] || []).find((x) => (x.queued || x.steered) && x.role === 'user' && x.content === m.content);
@@ -5179,18 +5223,47 @@
     // 排队消息当新一轮发出去，用户就看到同一句话既「已引导」又自动重发（2026-11-07 真机）。
     const serverQueued = !!queuedMsg && !(outbox[key] || []).some((x) => x.id === itemId);
     const label = mode === 'steer' ? '引导' : '立即发送';
-    // 先出队（免得本轮结束时又自动发一遍）
+    const nAtt = (item.atts || []).length;
+    const sentText = item.text || (nAtt ? '请查看分析附带的媒体文件' : '');
+    const guidedText = nAtt ? `${item.text || '附件消息'}（附件 ${nAtt}）` : item.text;
+    // 先出队（免得本轮结束时又自动发一遍）。必须在任何 await 之前：问服务端的
+    // 空档里本轮若恰好收尾，drainOutbox 会把它当排队的下一轮再发一遍。
     outbox = { ...outbox, [key]: (outbox[key] || []).filter((x) => x.id !== itemId) };
     // 本页没有流不代表这一轮跑完了：页面重载/切回来后 streams 是空的，但服务端还在跑。
     // 这时按普通消息发出去只会再被服务端排进队列（点了引导还是「排队中」）。
-    // 问一下服务端，真在跑就照常带 steer/interrupt 合进去；确实空闲才走普通一轮。
-    let running = !!streams[key];
-    if (!running && key !== '@new') {
+    // 同时拿服务端的排队清单对账（2026-11-12 真机）：刷新快照/服务端接管恢复出来的
+    // 「排队中」气泡可能已经过期（消息早已送达并跑成，服务端队列里根本没它）——
+    // 这时再投一次就是同一句话出现两份。判据：不在 pending 清单 + 对话里已有同文
+    // 正式消息 → 只把过期气泡收掉，不再投递。真丢了（服务重启清空内存队列）的
+    // 消息不在对话里，照常补发，不吞。
+    let status = null;
+    if (key !== '@new' && (serverQueued || !streams[key])) {
       try {
-        const c = await fetch(`/api/cancel?session=${encodeURIComponent(key)}`).then((r) => r.json());
-        running = !!c.running;
+        status = await fetch(`/api/cancel?session=${encodeURIComponent(key)}`).then((r) => r.json());
       } catch {}
     }
+    if (serverQueued && status) {
+      const queued = status.pending_queued || [];
+      const steers = status.pending_steers || [];
+      // 这句已经在服务端等引导了（另一个窗口点过 / 上次点击已送达，气泡没来得及撤）：
+      // 只把本地标记补上，不再投一遍（再投一条 Steer = 同文两份）。
+      if (mode === 'steer' && steers.includes(sentText)) {
+        localSteers.push(sentText);
+        guided = { ...guided, [key]: [...(guided[key] || []), { text: guidedText }] };
+        updMsgs(key, (a) => a.filter((m) => m.id !== itemId));
+        return;
+      }
+      const delivered = (sessionMsgs[key] || []).some(
+        (m) => m.role === 'user' && !m.queued && contentText(m.content) === sentText
+      );
+      if (![...queued, ...steers].includes(sentText) && delivered) {
+        updMsgs(key, (a) => a.filter((m) => m.id !== itemId));
+        pushMsg(key, { id: nextId(), role: 'system', content: '[通知] 这条消息已经在对话里了，已从排队中移除' });
+        return;
+      }
+    }
+    let running = !!streams[key];
+    if (!running && status) running = !!status.running;
     if (!running) {
       // 这一轮已经跑完了：按正常一轮发出去
       await deliver(key, item.text, item.atts, { bubbleId: item.id, convs: item.convs });
@@ -5200,9 +5273,6 @@
       pushMsg(key, { id: nextId(), role: 'error', content: `「${label}」暂不支持带引用对话的消息：这一轮结束后会自动发出去。` });
       return;
     }
-    const nAtt = (item.atts || []).length;
-    const sentText = item.text || (nAtt ? '请查看分析附带的媒体文件' : '');
-    const guidedText = nAtt ? `${item.text || '附件消息'}（附件 ${nAtt}）` : item.text;
     // localSteers 只记引导：它靠服务端 steer 事件按序配对防重复补泡。
     // 立即发送不再产生 steer 事件（新语义=停轮重启，走 turn 事件转正），
     // 记进去反而会吞掉别的窗口真引导的同文消息。
@@ -7863,9 +7933,11 @@
   }
 
   function subagentUpsert(m, status) {
-    // 新的派发 = 提示重新冒头（叉掉只是收起这次，不是永久关掉）
-    if ((status === 'queued' || status === 'running') && m.parent) revealSubagentChip(m.parent);
-    const prev = subagentLive[m.dispatch] || {};
+    const known = subagentLive[m.dispatch];
+    // 新的派发 = 提示重新冒头（叉掉只是收起这次，不是永久关掉）；
+    // 同一个派发从排队→执行的状态变化不重新冒头，否则叉掉后马上又弹出来。
+    if (!known && (status === 'queued' || status === 'running') && m.parent) revealSubagentChip(m.parent);
+    const prev = known || {};
     // 整键替换（Svelte4 赋值才触发响应式；改属性不保险）
     subagentLive = {
       ...subagentLive,
@@ -7892,6 +7964,8 @@
   })();
   // 实时条只露排队中/执行中；终态不占常驻位（要回看走面板）
   $: subagentActive = subagentSessionLive.filter((d) => d.status === 'queued' || d.status === 'running');
+  // 实时条也受「本对话收起」控制：叉掉后同一批派发的状态变化不再弹回来
+  $: subagentStripVisible = subagentActive.length > 0 && !subagentChipHidden.includes(currentSessionId || '@new');
   // 常驻 chip：本对话派发过且全部结束；被叉掉（本会话）就不再显示
   $: subagentChipVisible =
     !subagentActive.length &&
@@ -8480,7 +8554,10 @@
   /// 刷新前排队、但还没发出去的消息：服务端会话文件里没有它们。
   /// 从快照恢复时先把「排队中」气泡铺回去，再接上正常出队流程。
   function restoreQueuedOutbox(key, items) {
-    const clean = items
+    // 快照可能比出队旧：消息其实已经送达并跑成，outbox 里却还留着——原样铺回会
+    // 出现一个假的「排队中」气泡，点引导/立即发送就把同一句再投一遍
+    // （2026-11-12 真机：同一问题在界面上出现两份）。先按已送达时间戳剔除。
+    const clean = outboxNotYetSent(items, sessionMsgs[key] || [])
       .filter((it) => it && it.id)
       .map((it) => ({ id: it.id, text: it.text || '', atts: it.atts || [], convs: it.convs || [], ts: it.ts || Date.now() }));
     if (!clean.length) return;
@@ -9402,20 +9479,14 @@
       <!-- 子代理实时条（主区、输入框上方；不落侧边栏）。必须放在 footer 里：
            输入框是 position:absolute 浮层，放它外面（普通流）会被整个盖住（实测 y 重叠
            82px，命中测试全落到 composer 上）。footer 子元素自带 pointer-events:auto。
-           只在有排队/执行中的派发时占位，终态即撤——回看走「查看全部」小弹窗 -->
-      {#if subagentActive.length}
+           只占一行「子代理 · N 个在跑」：点整行开卡片弹窗；× 只收起本对话提示，
+           不取消子代理（取消/查看明细都在弹窗里） -->
+      {#if subagentStripVisible}
         <div class="subagent-strip">
-          <div class="subagent-strip-head">
+          <button class="subagent-strip-open" on:click={openSubagentPanel} title="查看子代理详情">
             <span class="subagent-strip-title">子代理 · {subagentActive.length} 个在跑</span>
-            <button class="subagent-strip-more" on:click={openSubagentPanel}>查看全部</button>
-          </div>
-          {#each subagentActive as d (d.dispatch)}
-            <div class="subagent-row">
-              <span class="subagent-badge {d.status}">{d.status === 'queued' ? '排队中' : '执行中'}</span>
-              <span class="subagent-label" title={d.task}>{d.label}</span>
-              <button class="subagent-row-cancel" title="取消这个子代理" on:click={() => cancelSubagent(d.dispatch)}>×</button>
-            </div>
-          {/each}
+          </button>
+          <button class="chip-x" title="收起本对话的子代理提示" aria-label="收起" on:click={dismissSubagentChip}>×</button>
         </div>
       {:else if subagentChipVisible}
         <!-- 本会话派发过子代理（都跑完了）：留一颗不占地的小 chip，想回看就点；
@@ -9456,7 +9527,7 @@
                 <span class="todo-count">{todoDoneN}/{currentTodo.todos.length}</span>
                 <svg class="todo-caret" class:open={todoDockOpen} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
               </button>
-              <button class="todo-x" on:click={dismissTodoDock} title="收起任务清单（本任务内不再出现）" aria-label="收起任务清单">×</button>
+              <button class="todo-x" on:click={dismissTodoDock} title="收起任务清单（出现新的任务清单前不再冒出）" aria-label="收起任务清单">×</button>
             </div>
             {#if todoDockOpen}
               <div class="todo-body">
@@ -14919,53 +14990,35 @@
   /* —— 子代理（2026-10-20 第 2 轮；主区实时条 + 居中小弹窗，不落侧边栏）—— */
   .subagent-strip {
     margin: 0 16px 8px;
-    padding: 8px 10px;
+    padding: 7px 10px;
     background: var(--g2);
     border: 1px solid var(--g3);
     border-radius: 8px;
-    display: flex;
-    flex-direction: column;
-    gap: 5px;
-  }
-  .subagent-strip-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    font-size: 12px;
-    color: var(--g6);
-  }
-  .subagent-strip-title {
-    font-weight: 600;
-  }
-  .subagent-strip-more {
-    background: none;
-    border: none;
-    color: var(--tint-blue-fg);
-    font-size: 12px;
-    cursor: pointer;
-    padding: 2px 4px;
-  }
-  .subagent-strip-more:hover {
-    text-decoration: underline;
-  }
-  .subagent-row {
     display: flex;
     align-items: center;
     gap: 8px;
     font-size: 12px;
   }
-  .subagent-row-cancel {
-    margin-left: auto;
+  .subagent-strip-open {
+    flex: 1;
+    min-width: 0;
+    text-align: left;
     background: none;
-    border: none;
-    color: var(--g5);
-    font-size: 14px;
-    line-height: 1;
+    border: 0;
+    padding: 0;
+    color: var(--g6);
+    font: inherit;
     cursor: pointer;
-    padding: 0 4px;
   }
-  .subagent-row-cancel:hover {
-    color: var(--tint-red-fg);
+  .subagent-strip-open:hover {
+    color: var(--g7);
+  }
+  .subagent-strip-title {
+    font-weight: 600;
+  }
+  .subagent-strip .chip-x {
+    flex: none;
+    padding: 2px 4px;
   }
   .subagent-chiprow {
     display: flex;

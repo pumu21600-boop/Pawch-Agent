@@ -13,14 +13,13 @@
     #[test]
     fn channel_protocol_follows_config_lock() {
         // 媒体旁路等调用方靠它预判协议：配置锁定优先，未锁定时才看端点特征
-        let mut p = ChatParams::default();
-        p.protocol = Some(Protocol::AnthropicMessages);
+        let p = ChatParams { protocol: Some(Protocol::AnthropicMessages), ..Default::default() };
         assert_eq!(
             channel_protocol(&p, "https://api.stepfun.com/v1", "m"),
             Protocol::AnthropicMessages,
             "（StepFun 这类不带 /anthropic 段的地址）配置锁了就必须走 Messages"
         );
-        p.protocol = Some(Protocol::OpenAiResponses);
+        let p = ChatParams { protocol: Some(Protocol::OpenAiResponses), ..Default::default() };
         assert_eq!(channel_protocol(&p, "https://api.deepseek.com/v1", "m"), Protocol::OpenAiResponses);
         let p = ChatParams::default();
         assert_eq!(
@@ -1100,4 +1099,41 @@ async fn list_models_retries_same_url_with_other_auth_on_401() {
     assert_eq!(models, vec!["step-3.5-flash".to_string()]);
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     mock.join().unwrap();
+}
+
+/// 错误正文人话化（2026-11-13）：Cloudflare 530 隧道页整页 HTML 不再糊进对话气泡。
+#[test]
+fn humanize_error_body_cloudflare_tunnel_page_is_one_line() {
+    let page = "<!DOCTYPE html>\n<html class=\"no-js\" lang=\"en-US\">\n<head><title>Cloudflare Tunnel error | wb.sunguai.top | Cloudflare</title></head>\n<body>error code: 1033</body>\n</html>";
+    let msg = humanize_error_body(530, page);
+    assert!(msg.contains("1033"), "认出隧道错误码: {msg}");
+    assert!(msg.contains("渠道服务方"), "指明是渠道侧问题: {msg}");
+    assert!(!msg.contains("<html"), "正文 HTML 不得进错误消息: {msg}");
+}
+
+#[test]
+fn humanize_error_body_truncates_long_text_keeps_short_json() {
+    let long = "x".repeat(500);
+    let s = humanize_error_body(502, &long);
+    assert!(s.chars().count() <= 301, "非 HTML 正文截 300 字符加省略号");
+    assert!(s.ends_with('…'));
+    assert_eq!(
+        humanize_error_body(429, "{\"error\":\"rate limited\"}"),
+        "{\"error\":\"rate limited\"}",
+        "短 JSON 原样保留"
+    );
+    assert!(
+        humanize_error_body(520, "<html><title>Cloudflare</title></html>").contains("Cloudflare"),
+        "Cloudflare 错误页（非隧道）也给一行人话"
+    );
+}
+
+/// 日志事件正文上限：错误页全文不再整段写进 agent.jsonl（轮转挤掉任务边界教训）。
+#[test]
+fn log_body_caps_at_2000_chars() {
+    let big = "y".repeat(5000);
+    let s = log_body(&big);
+    assert_eq!(s.chars().count(), 2001, "2000 字符 + 省略号");
+    assert!(s.ends_with('…'));
+    assert_eq!(log_body("short"), "short");
 }
