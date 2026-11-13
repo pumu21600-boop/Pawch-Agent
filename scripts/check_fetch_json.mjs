@@ -7,8 +7,9 @@
 //   ② 把 Response 丢进 postMessage：结构化克隆直接抛
 //      "Failed to execute 'postMessage' on 'Window': Response object could not be cloned."，
 //     插件面板整个瘫掉，插件侧只看到这句天书（用量面板与价格页就是这么瘫的）。
-// 判据很粗但够用：每个 fetch( 调用点，往后 16 行内必须出现 .json()（或 .text()），
-// 否则报错；确实不该解析的（流式 SSE、发了就忘的 DELETE、apiJson 自身）进白名单并写理由。
+// 判据很粗但够用：每个 fetch( 调用点，往后 16 行内必须出现一次读响应体
+// （.json() / .text() / .blob() / .arrayBuffer() / .formData() 都算），
+// 否则报错；确实不该读的（流式 SSE、发了就忘的 DELETE、apiJson 自身）进白名单并写理由。
 //
 // 用法：node scripts/check_fetch_json.mjs   （退出码非 0 = 有漏网，CI/提交前跑一遍）
 import fs from 'node:fs';
@@ -45,6 +46,12 @@ const ALLOW = [
   [/fetch\('\/api\/chat\/revive'/, '刷新认领：发了就忘，不读响应体'],
   // 刷新后重新附着直播（/api/chat/attach）：URL 在下一行，响应体走 getReader() 流式解析（同 /api/chat）
   [/\? await fetch\($/, '重附着 SSE：流式响应走 getReader()，不能整体 json()'],
+  // 压缩重试：只判 r.ok 判成败，无响应体要读
+  [/await fetch\('\/api\/compact\/retry'/, '压缩重试：只判 r.ok，无响应体要读'],
+  // 导入换 token 后的探活：拉一次静态首页让服务补发新 cookie，响应体本身没用
+  [/await fetch\('\/', \{ cache: 'no-store' \}\)/, '重启后探活补发 cookie：不读响应体'],
+  // 前端错误上报：发了就忘（keepalive 保证页面关闭也送出），无响应体要读
+  [/fetch\('\/api\/client-log'/, '前端错误上报：发了就忘，不读响应体'],
 ];
 
 function walk(dir, out = []) {
@@ -65,7 +72,7 @@ for (const file of walk(SRC)) {
     if (line.trim().startsWith('//') || line.trim().startsWith('*')) return;
     checked += 1;
     const win = lines.slice(i, i + LOOKAHEAD).join('\n');
-    if (/\.json\(\)|\.text\(\)/.test(win)) return;
+    if (/\.json\(\)|\.text\(\)|\.blob\(\)|\.arrayBuffer\(\)|\.formData\(\)/.test(win)) return;
     const rel = path.relative(ROOT, file).replace(/\\/g, '/');
     if (ALLOW.some(([re]) => re.test(line))) return;
     bad.push(`${rel}:${i + 1}  ${line.trim().slice(0, 100)}`);
