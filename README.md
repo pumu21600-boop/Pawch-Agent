@@ -13,19 +13,19 @@
 [![Backend](https://img.shields.io/badge/Backend-Rust%20%2B%20axum-dea584?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 [![Frontend](https://img.shields.io/badge/Frontend-Svelte%20%2B%20Tauri-ff3e00?style=flat-square&logo=svelte)](https://tauri.app/)
 
-[下载安装包](https://github.com/pumu21600-boop/Pawch-Agent/releases) · [快速开始](#-快速开始) · [核心能力](#-核心能力) · [扩展生态](#-扩展生态) · [安全模型](#-安全模型)
+[下载安装包](https://github.com/pumu21600-boop/Pawch-Agent/releases) · [快速开始](#快速开始) · [核心能力](#核心能力) · [扩展生态](#扩展生态) · [安全模型](#安全模型)
 
 </div>
 
 ---
 
-## 📌 这是什么
+## 这是什么
 
 **Pawch Agent 是一个装在 Windows 本机的桌面级 Agent**：Rust（axum）服务 + Svelte 前端 + Tauri 桌面壳。会话、记忆、日志、用量台账全落本机；模型接你自己的渠道，Key 经 DPAPI 加密，不进日志、不进沙箱。
 
 ---
 
-## ✨ 核心能力
+## 核心能力
 
 ### 执行与上下文
 
@@ -61,7 +61,7 @@
 
 ---
 
-## 🧩 扩展生态
+## 扩展生态
 
 对外只有四个词：**Skill / MCP / 插件 / 沙箱**。
 
@@ -74,7 +74,7 @@
 
 ---
 
-## 🛡 安全模型
+## 安全模型
 
 | 审批档位 | 读 | 写 | 执行（shell / git） |
 |---|---|---|---|
@@ -91,7 +91,7 @@
 
 ---
 
-## 📸 界面预览
+## 界面预览
 
 ![聊天与内置浏览器](docs/assets/ui-chat.jpg)
 
@@ -101,7 +101,7 @@
 
 ---
 
-## 🚀 快速开始
+## 快速开始
 
 ### 方式一：安装包（推荐）
 
@@ -128,7 +128,7 @@ pawch-agent.exe run "总结 docs 目录里今天改过的文件" --json
 
 ---
 
-## 🔌 接入模型
+## 接入模型
 
 设置 → 模型配置：渠道 / 模型 / 角色三层解耦，改动即存即生效。
 
@@ -143,7 +143,7 @@ pawch-agent.exe run "总结 docs 目录里今天改过的文件" --json
 
 ---
 
-## 🧪 质量门禁
+## 质量门禁
 
 - CI（windows-latest）四条作业：clippy `-D warnings`、全量 Rust 测试、前端单测 + 构建 + 静态门禁、cargo-deny 供应链审计
 - 其中一条静态门禁专抓「fetch 之后忘接 `.json()`」——这个 bug 在本仓复发过两次，两次都是界面静默显示空值
@@ -151,7 +151,7 @@ pawch-agent.exe run "总结 docs 目录里今天改过的文件" --json
 
 ---
 
-## 📁 项目结构
+## 项目结构
 
 ```text
 src/          Rust 服务（axum）：执行循环、工具、网关、会话、记忆、插件宿主、沙箱
@@ -169,7 +169,7 @@ docs/         HTTP/SSE 接口、日志格式、插件契约
 
 ---
 
-## 📖 文档与参与
+## 文档与参与
 
 - [HTTP/SSE 接口](docs/api.md) —— 全部端点、方法与参数
 - [会话与日志格式](docs/jsonl-schema.md) —— JSONL 事件 schema
@@ -180,6 +180,6 @@ docs/         HTTP/SSE 接口、日志格式、插件契约
 
 ---
 
-## 📄 License
+## License
 
 [MIT](LICENSE)
