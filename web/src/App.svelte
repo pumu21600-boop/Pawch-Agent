@@ -218,6 +218,8 @@
   // 刷新「当前会话」的三个镜像变量（切会话、流开始/结束时调用）
   function syncCur() {
     const k = curKey();
+    // 换了会话：渲染完成后强制到最底（见 pendingJumpBottom 注释）
+    if (k !== lastRenderedKey) pendingJumpBottom = true;
     const wasStreaming = streaming;
     const nowStreaming = !!streams[k];
     streaming = nowStreaming;
@@ -651,12 +653,20 @@
 
   function closeMenusOnOutside(e) {
     if (e.target && e.target.closest && (e.target.closest('.bar-menu') || e.target.closest('.side-menu') || e.target.closest('.row-btn') || e.target.closest('.conv-more'))) return;
-    modelMenuOpen = false;
-    thinkMenuOpen = false;
-    approvalMenuOpen = false;
+    closeBarMenus();
     sideMenuOpen = false;
     sessMenuId = null;
     projMenuPath = null;
+  }
+
+  // 底栏浮层互斥：点过一个再点另一个时，前一个必须先收，否则两个 dropdown 会
+  // 叠在一起（审批菜单 + 模型菜单实测重叠，右侧被盖掉一截）
+  function closeBarMenus(keep = '') {
+    if (keep !== 'plus') plusMenuOpen = false;
+    if (keep !== 'ability') abilityMenuOpen = false;
+    if (keep !== 'model') modelMenuOpen = false;
+    if (keep !== 'think') thinkMenuOpen = false;
+    if (keep !== 'approval') approvalMenuOpen = false;
   }
 
   // —— 工作区切换 ——
@@ -741,6 +751,17 @@
 
   afterUpdate(() => {
     const dragging = resizing || rpResizing || termResizing;
+    // 打开会话（key 变化）：强制到最底并恢复钉底，估位落定前持续校正。
+    // 必须在锚定/钉底分支之前——换会话时旧视口状态（含 chatPinned）一律作废。
+    if (pendingJumpBottom && chatBody) {
+      pendingJumpBottom = false;
+      chatPinned = true;
+      chatBody.scrollTop = chatBody.scrollHeight;
+      // 估位→真实高度的爬升能持续数秒（探针实测 1.4s 还在长），窗口要给足且
+      // 中途不许「稳定 3 帧」提前收手（keep=true）；用户滚轮/触摸/按下立即让位
+      settleScrollAnchor({ bottom: true, ids: [] }, curKey(), 6000, true);
+    }
+    lastRenderedKey = curKey();
     // 结构更新（压缩重建/回滚/编辑）的视口锚定：在 DOM 更新后、绘制前把
     // 更新前那条可见消息放回同一位置。这比「整表重建后按高度差猜、再钉底」稳：
     // 高度差会被 content-visibility 的估位和图片加载打乱，猜不准就会弹。
@@ -771,6 +792,15 @@
   // 编辑/回滚不再走整表重载（本地只删尾部），所以不需要截断点锚。
   let pendingScrollAnchor = null;
   let scrollSettleToken = 0;
+  // 打开会话必须到最底（2026-11-13，间歇性「打开停在会话上面」的两处根源）：
+  // ① 钉底状态是上一条会话的——上滑阅读过（哪怕只滑一点）chatPinned 就是 false，
+  //    切会话谁也不滚，视口停在旧的数字偏移上（新列表更长时≈停在顶部）；
+  // ② 分块 content-visibility 的估位（块内条数×140px）远小于真实高度——打开瞬间
+  //    scrollTop=估位总高，随后底部块渲染出真实高度把总高撑大，视口没动就悬在
+  //    半空，且之后没有 DOM 更新能再触发钉底（没人再发消息就一直停在那）。
+  // 会话 key 变化时置位，afterUpdate 强制到底 + 估位落定前持续校正（与 swap 同款）。
+  let lastRenderedKey = null;
+  let pendingJumpBottom = false;
   // 编辑/回滚把可视区之后的消息删掉后，列表会变短、scrollTop 被浏览器钳位，
   // 看起来就是「往上弹」。这里只在列表末尾补一块**视口高度以内的**临时留白，
   // 让 scrollTop 保持原值；新内容长出来时留白自动收掉。不是钉底。
@@ -862,8 +892,11 @@
   }
 
   // content-visibility 的估位要几帧才换成真实高度：短窗口内持续把锚点放回原位，
-  // 高度连续稳定就收手；用户滚轮/触摸立即让位。
-  function settleScrollAnchor(a, key) {
+  // 高度连续稳定就收手；用户滚轮/触摸/按下立即让位。maxMs 默认 800ms 够 swap 用
+  // （中途重建，大部分块已是真实高度）；打开会话估位缺口大（块高度会长好几秒，
+  // 2026-11-13 真机探针：250ms 时 2295px 已贴底，1.4s 后真实 12206px、视口晾在
+  // 1563px），调用方给更长的窗口。
+  function settleScrollAnchor(a, key, maxMs = 800, keep = false) {
     const token = ++scrollSettleToken;
     const start = performance.now();
     let lastH = -1;
@@ -874,17 +907,22 @@
     if (chatBody) {
       chatBody.addEventListener('wheel', abort, { once: true, capture: true });
       chatBody.addEventListener('touchstart', abort, { once: true, capture: true });
+      chatBody.addEventListener('mousedown', abort, { once: true, capture: true });
     }
     const step = () => {
       if (token !== scrollSettleToken || key !== curKey() || !chatBody) return;
       applyScrollAnchor(a);
-      if (chatBody.scrollHeight === lastH) {
+      // keep=true（打开会话的贴底）：高度增长是突发成批的，探针实测会在中途出现
+      // >3 帧的停顿——「连续 3 帧稳定就收手」会提前退出，剩下的爬升把视口晾在
+      // 半空（真机 2026-11-13：1500ms 时 dist=9910，靠之后某次无关渲染才救回来）。
+      // 打开场景宁可多贴几秒：滚轮/触摸/按下都即时让位。
+      if (!keep && chatBody.scrollHeight === lastH) {
         if (++stable >= 3) return;
       } else {
         stable = 0;
         lastH = chatBody.scrollHeight;
       }
-      if (performance.now() - start < 800) requestAnimationFrame(step);
+      if (performance.now() - start < maxMs) requestAnimationFrame(step);
     };
     requestAnimationFrame(step);
   }
@@ -9705,7 +9743,9 @@
                 class="icon-btn"
                 title="添加上下文 / 选择能力"
                 on:click={() => {
-                  plusMenuOpen = !plusMenuOpen;
+                  const open = !plusMenuOpen;
+                  closeBarMenus(open ? 'plus' : '');
+                  plusMenuOpen = open;
                   abilityMenuOpen = false;
                 }}
               ><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></button>
@@ -9796,7 +9836,11 @@
               <button
                 class="pill approval-pill"
                 class:danger={approvalEffective === 'full-access'}
-                on:click={() => (approvalMenuOpen = !approvalMenuOpen)}
+                on:click={() => {
+                  const open = !approvalMenuOpen;
+                  closeBarMenus(open ? 'approval' : '');
+                  approvalMenuOpen = open;
+                }}
                 title="审批档位（按会话记忆，运行中切换下一步即生效）：只读=写/执行逐次问 · 自动=可动工作区与电脑高危先问 · 完全访问=全免审本机直跑"
                 aria-label={`审批档位：${APPROVAL_LABELS[approvalEffective] || approvalEffective}`}
               >
@@ -9884,8 +9928,10 @@
               <button
                 class="pill model-pill"
                 on:click={() => {
-                  modelMenuOpen = !modelMenuOpen;
-                  if (modelMenuOpen) menuExpandedCfg = activeConfigId;
+                  const open = !modelMenuOpen;
+                  closeBarMenus(open ? 'model' : '');
+                  modelMenuOpen = open;
+                  if (open) menuExpandedCfg = activeConfigId;
                 }}
                 title="切换模型（按配置分组）"
               >
@@ -9929,7 +9975,11 @@
               <button
                 class="pill think-pill"
                 class:active={thinkingOn}
-                on:click={() => (thinkMenuOpen = !thinkMenuOpen)}
+                on:click={() => {
+                  const open = !thinkMenuOpen;
+                  closeBarMenus(open ? 'think' : '');
+                  thinkMenuOpen = open;
+                }}
                 title={thinkHint}
               >
                 <span class="pill-label">思考:</span> {pillThinkLabel}
@@ -16077,6 +16127,9 @@
     max-width: 94vw;
     /* 固定高度：所有设置页统一窗口大小（以最高的「模型配置」页为准），短页留白，内容区自行滚动 */
     height: 85vh;
+    /* 设置是大面积正文面板，背后聊天文字在 92% 玻璃下会透成一层「阴影」；
+       收到 96%（与弹窗 97% 同口径），只留一点透感，不再干扰阅读 */
+    background: color-mix(in srgb, var(--g2) 96%, transparent);
   }
   /* 设置弹窗统一「描边无底色」v2（2026-11-11 用户复审定稿）：
      全部按钮/输入框透明底+灰描边——主按钮也不加橙（只保留字重），品牌橙不进设置弹窗；
