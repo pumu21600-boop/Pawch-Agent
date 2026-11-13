@@ -4,7 +4,7 @@
 
 # Pawch Agent
 
-**一个跑在你自己电脑里的 Windows 本地桌面 Agent —— 模型你配、数据在本地、把活真正干完**
+**一个运行在 Windows 本机的桌面级 AI Agent —— 自定义模型接入，数据本地留存，任务闭环执行**
 
 [![Release](https://img.shields.io/github/v/release/pumu21600-boop/Pawch-Agent?style=flat-square&label=Release&color=e8833a)](https://github.com/pumu21600-boop/Pawch-Agent/releases)
 [![CI](https://img.shields.io/github/actions/workflow/status/pumu21600-boop/Pawch-Agent/ci.yml?style=flat-square&label=CI)](https://github.com/pumu21600-boop/Pawch-Agent/actions/workflows/ci.yml)
@@ -12,7 +12,6 @@
 [![Platform](https://img.shields.io/badge/Platform-Windows-0078d6?style=flat-square&logo=windows11)](https://github.com/pumu21600-boop/Pawch-Agent/releases)
 [![Backend](https://img.shields.io/badge/Backend-Rust%20%2B%20axum-dea584?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 [![Frontend](https://img.shields.io/badge/Frontend-Svelte%20%2B%20Tauri-ff3e00?style=flat-square&logo=svelte)](https://tauri.app/)
-[![Stars](https://img.shields.io/github/stars/pumu21600-boop/Pawch-Agent?style=flat-square&label=Stars&color=f0c94c)](https://github.com/pumu21600-boop/Pawch-Agent/stargazers)
 
 [⬇️ 下载安装包](https://github.com/pumu21600-boop/Pawch-Agent/releases) · [🚀 快速开始](#-快速开始) · [✨ 核心能力](#-核心能力) · [🧩 扩展生态](#-扩展生态) · [🛡 安全模型](#-安全模型)
 
