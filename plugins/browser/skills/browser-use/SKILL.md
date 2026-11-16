@@ -1,6 +1,6 @@
 ---
 name: browser-use
-description: 用内置浏览器打开/点击/输入/测试网页与本地页面
+description: 用内置浏览器打开并点击输入或测试网页与本地页面
 ---
 
 # browser-use 技能（内置浏览器）

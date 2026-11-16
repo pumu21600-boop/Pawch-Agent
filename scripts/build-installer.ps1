@@ -1,8 +1,8 @@
 # build-installer.ps1 - build the Pawch Agent installer (Setup.exe + payload.zip).
 #
 # Prerequisites (already built):
-#   target\release\pawch-agent.exe
-#   desktop\target\release\Pawch Agent.exe      (optional; service-only without it)
+#   %PAWCH_TARGET_DIR%\release\pawch-agent.exe      (default D:\pawch-build\target)
+#   %PAWCH_TARGET_DIR%\release\Pawch Agent.exe      (optional; service-only without it)
 #   web\dist\index.html
 #
 # Output:
@@ -27,13 +27,18 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
+# Compile artifacts default to D: so C: does not fill up; override with PAWCH_TARGET_DIR.
+$targetDir = $env:PAWCH_TARGET_DIR
+if (-not $targetDir) { $targetDir = "D:\pawch-build\target" }
+$env:CARGO_TARGET_DIR = $targetDir
+
 function Info($m) { Write-Host "[installer] $m" -ForegroundColor Cyan }
 function Die($m) { Write-Host "[installer] ERROR: $m" -ForegroundColor Red; exit 1 }
 
-$svc = Join-Path $root "target\release\pawch-agent.exe"
-if (-not (Test-Path $svc)) { Die "target\release\pawch-agent.exe missing (cargo build --release)" }
+$svc = Join-Path $targetDir "release\pawch-agent.exe"
+if (-not (Test-Path $svc)) { Die "$svc missing (cargo build --release)" }
 if (-not (Test-Path (Join-Path $root "web\dist\index.html"))) { Die "web\dist\index.html missing (cd web; npm run build)" }
-$shell = Join-Path $root "desktop\target\release\Pawch Agent.exe"
+$shell = Join-Path $targetDir "release\Pawch Agent.exe"
 if (-not (Test-Path $shell)) { Write-Host "[installer] WARN: desktop shell missing - installer will be service-only" -ForegroundColor Yellow }
 
 if (-not $SkipPackage) {
@@ -68,7 +73,7 @@ $code = $LASTEXITCODE
 Pop-Location
 if ($code -ne 0) { Die "cargo build (installer) failed" }
 
-$setupSrc = Join-Path $root "installer\target\release\pawch-setup.exe"
+$setupSrc = Join-Path $targetDir "release\pawch-setup.exe"
 if (-not (Test-Path $setupSrc)) { Die "pawch-setup.exe missing" }
 
 $dest = Join-Path $root "dist-installer\Pawch Agent Setup"

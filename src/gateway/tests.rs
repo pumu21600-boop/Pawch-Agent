@@ -32,8 +32,8 @@
     #[test]
     fn thinking_inflates_max_tokens_budget() {
         // 思考开启时上游把 reasoning+正文算进同一个 max_tokens，用户配的
-        // 「最大输出长度」会被思考吃掉——发送值 = 配置值 + max(配置值, 8192)。
-        // 思考关闭/未配 → 原值（此时上限本就只约束正文）。
+        // 「最大输出长度」会被思考吃掉——发送值 = 配置值 + min(max(配置值, 8192), 64k)。
+        // 思考关闭/未配 → 原值（此时上限本就只约束正文）；配置 ≥128k 不扩容。
         let mut p = ChatParams { max_tokens: Some(4096), thinking: Some("high".into()), ..Default::default() };
         assert_eq!(effective_max_tokens(&p), Some(12288));
         p.thinking = Some("on".into());
@@ -45,6 +45,12 @@
         p.max_tokens = Some(12600);
         p.thinking = Some("high".into());
         assert_eq!(effective_max_tokens(&p), Some(25200), "配置值大于 8192 时按配置值翻倍");
+        p.max_tokens = Some(100_000);
+        assert_eq!(effective_max_tokens(&p), Some(165_536), "余量封顶 64k：100k 只多给 64k");
+        p.max_tokens = Some(131_072);
+        assert_eq!(effective_max_tokens(&p), Some(131_072), "配置 ≥128k 不扩容");
+        p.max_tokens = Some(384_000);
+        assert_eq!(effective_max_tokens(&p), Some(384_000), "巨值配置不再翻倍送出 768000");
         p.max_tokens = None;
         assert_eq!(effective_max_tokens(&p), None);
     }
@@ -796,7 +802,9 @@ Content-Length: 2
         let gw = Arc::new(Gateway::new());
         let params = ChatParams {
             provider_id: Some("deepseek".into()),
-            max_tokens: Some(384000),
+            // 100k 配置仍会扩容（+64k 封顶 → 165536）：≥128k 的新规则下不再扩容，
+            // 用这个量级保住「400 回退保留思考参数」的路径覆盖。
+            max_tokens: Some(100_000),
             thinking: Some("max".into()),
             ..Default::default()
         };
@@ -817,8 +825,8 @@ Content-Length: 2
 
         let captured = bodies.lock().unwrap().clone();
         assert_eq!(captured.len(), 2, "应有一次 400 回退重试: {captured:?}");
-        assert_eq!(captured[0]["max_tokens"].as_u64(), Some(768000), "首请求是扩容值");
-        assert_eq!(captured[1]["max_tokens"].as_u64(), Some(384000), "回退重试发配置原值");
+        assert_eq!(captured[0]["max_tokens"].as_u64(), Some(165536), "首请求是扩容值（100k + 64k 余量封顶）");
+        assert_eq!(captured[1]["max_tokens"].as_u64(), Some(100000), "回退重试发配置原值");
         assert!(
             Gateway::body_has_thinking_params(&captured[1]),
             "回退重试必须保留思考参数: {}",
@@ -897,7 +905,8 @@ Content-Length: 2
 
         let captured = bodies.lock().unwrap().clone();
         assert_eq!(captured.len(), 6, "1 次原请求 + 5 次重试: {captured:?}");
-        assert!(captured.iter().all(|b| b["max_tokens"].as_u64() == Some(768000)), "重试体保持一致");
+        // 384000 ≥128k 不扩容（2026-11-14）；断言的本意是重试体之间保持一致
+        assert!(captured.iter().all(|b| b["max_tokens"].as_u64() == Some(384000)), "重试体保持一致");
         assert!(matches!(out, Ok(ChatOutcome::Done(_))), "第 6 次成功后应正常完成");
         assert!(started.elapsed() >= std::time::Duration::from_secs(15), "5 次退避应累计 15s");
     }

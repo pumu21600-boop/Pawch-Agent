@@ -1,6 +1,6 @@
 ---
 name: docx
-description: 创建与保真修改 .docx：改字不动版式，原地覆盖原文件
+description: 创建或保真修改 .docx 并原地覆盖且不改版式
 ---
 
 # docx 技能（Word 文档）

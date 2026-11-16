@@ -1,1 +1,1 @@
-{"apiVersion":1,"source":"built_in","title":"css-ui工具","description":"界面微调：右键改样式，让 agent 调界面","version":"0.2.0","entry":"index.html","ui":[{"slot":"dock","id":"css-ui","title":"css-ui工具"}],"feature":"css_tool","permissions":["settings.feature"]}
+{"apiVersion":1,"source":"built_in","title":"css-ui工具","description":"右键修改样式并让 agent 调整界面的微调工具","version":"0.2.0","entry":"index.html","ui":[{"slot":"dock","id":"css-ui","title":"css-ui工具"}],"feature":"css_tool","permissions":["settings.feature"]}

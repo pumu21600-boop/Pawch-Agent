@@ -1,6 +1,6 @@
 ---
 name: builtin-capabilities
-description: 本应用自己的内置插件与功能开关说明（问「XX 是干嘛的/在哪开/为什么开着没效果」先读这份）
+description: 本应用内置插件与功能开关的说明
 ---
 
 # 内置能力说明（Pawch 自己的插件与开关）

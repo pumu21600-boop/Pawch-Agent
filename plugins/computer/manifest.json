@@ -2,6 +2,6 @@
   "apiVersion": 1,
   "source": "built_in",
   "title": "电脑操作",
-  "description": "允许 agent 截图、动键鼠、启动程序（关了就完全禁止）",
+  "description": "允许 agent 截图操作键鼠和启动程序并在关闭后完全禁止",
   "version": "0.1.0"
 }

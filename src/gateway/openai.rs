@@ -113,6 +113,11 @@ pub fn clamp_prompt_cache_key(session_id: &str) -> String {
 /// 发送值 = 配置值 + max(配置值, 8192)，给思考留出与正文同量级的余量；
 /// 端点硬上限拒收（400）时由 stream_chat 回退配置原值重试，不影响可用性。
 /// 思考关闭 / 未配 max_tokens → 原样返回（此时上限本就只约束正文，语义正确）。
+///
+/// 2026-11-14 收紧扩容幅度：翻倍公式对大配置会送出巨值——真机 deepseek 渠道配
+/// 384000 被翻成 768000，超模型 393216 硬上限吃 400 触发整套回退；且渠道照单
+/// 全收时等于放行超长流，放大读流中断的暴露面。规则改为：配置 ≥128k 不扩容
+/// （这个量级本身已足够思考挥霍）；以下余量封顶 64k。
 pub fn effective_max_tokens(params: &ChatParams) -> Option<u64> {
     let mt = params.max_tokens?;
     let thinking_on = params
@@ -123,7 +128,10 @@ pub fn effective_max_tokens(params: &ChatParams) -> Option<u64> {
     if !thinking_on {
         return Some(mt);
     }
-    Some(mt + mt.max(8192))
+    if mt >= 131_072 {
+        return Some(mt);
+    }
+    Some(mt.saturating_add(mt.clamp(8192, 65_536)))
 }
 
 /// 带 compat 的组装（供网关在发送前先做历史净化时复用同一次探测）。

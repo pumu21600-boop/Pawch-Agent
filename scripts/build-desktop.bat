@@ -15,7 +15,9 @@ if not exist "%VCVARS%" (
 )
 call "%VCVARS%" >nul
 cd /d %~dp0..
-set "OUT=desktop\target\release\Pawch Agent.exe"
+if not defined PAWCH_TARGET_DIR set "PAWCH_TARGET_DIR=D:\pawch-build\target"
+set "CARGO_TARGET_DIR=%PAWCH_TARGET_DIR%"
+set "OUT=%CARGO_TARGET_DIR%\release\Pawch Agent.exe"
 if exist "%OUT%" del "%OUT%"
 pushd desktop
 cargo build --release
@@ -25,7 +27,7 @@ if not "%RC%"=="0" (
   echo [build-desktop] cargo build failed ^(%RC%^)
   exit /b %RC%
 )
-move /Y "desktop\target\release\pawch-agent-desktop.exe" "%OUT%" >nul
+move /Y "%CARGO_TARGET_DIR%\release\pawch-agent-desktop.exe" "%OUT%" >nul
 if errorlevel 1 (
   echo [build-desktop] rename failed - is the shell still running?
   exit /b 1

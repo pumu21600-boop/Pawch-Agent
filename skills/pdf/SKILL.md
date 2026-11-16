@@ -1,6 +1,6 @@
 ---
 name: pdf
-description: PDF 文本提取/合并/拆分；HTML 排版转 PDF
+description: 提取 PDF 文本或合并拆分 PDF 并把 HTML 排版转成 PDF
 ---
 
 # pdf 技能

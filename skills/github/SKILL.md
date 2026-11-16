@@ -1,6 +1,6 @@
 ---
 name: github
-description: 用 gh CLI 操作 GitHub：PR/issue/release/CI
+description: 用 gh CLI 处理 GitHub 的协作发布与 CI 查询
 ---
 
 # GitHub 技能（gh CLI）

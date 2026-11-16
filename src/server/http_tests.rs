@@ -485,3 +485,23 @@ async fn html_document_gets_no_store_and_auth_cookie() {
     assert!(cookie.contains("pawch_token="), "首屏要下发访问令牌 cookie: {cookie}");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// 前端错误上报端点：合法 JSON → 204（落盘走全局 logger，这里只验 HTTP 契约与鉴权）。
+#[tokio::test]
+async fn client_log_accepts_payload_and_returns_204() {
+    let root = test_root("client-log");
+    let app = app(&root);
+    let body = json!({
+        "kind": "unhandledrejection",
+        "level": "error",
+        "message": "boom",
+        "stack": "at x (app.js:1:1)",
+        "file": "",
+        "line": 0,
+        "col": 0,
+        "url": "http://127.0.0.1:5173/"
+    });
+    let (status, _) = post_json(&app, "/api/client-log", body).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let _ = std::fs::remove_dir_all(&root);
+}

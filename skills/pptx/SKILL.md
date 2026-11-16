@@ -1,6 +1,6 @@
 ---
 name: pptx
-description: 创建与保真修改 .pptx：增量改字不动版式
+description: 创建或保真修改 .pptx 并做到增量改字不动版式
 ---
 
 # pptx 技能（演示文稿）

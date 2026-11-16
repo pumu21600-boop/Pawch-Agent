@@ -40,6 +40,11 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
+# Compile artifacts default to D: so C: does not fill up; override with PAWCH_TARGET_DIR.
+$targetDir = $env:PAWCH_TARGET_DIR
+if (-not $targetDir) { $targetDir = "D:\pawch-build\target" }
+$env:CARGO_TARGET_DIR = $targetDir
+
 function Info($m) { Write-Host "[package] $m" -ForegroundColor Cyan }
 function Warn($m) { Write-Host "[package] WARN: $m" -ForegroundColor Yellow }
 
@@ -55,8 +60,8 @@ if (-not $SkipBuild) {
     cargo build --release
     if ($LASTEXITCODE -ne 0) { throw "cargo build --release failed" }
 }
-$exe = Join-Path $root "target\release\pawch-agent.exe"
-if (-not (Test-Path $exe)) { throw "target\release\pawch-agent.exe not found (run without -SkipBuild)" }
+$exe = Join-Path $targetDir "release\pawch-agent.exe"
+if (-not (Test-Path $exe)) { throw "$exe not found (run without -SkipBuild)" }
 
 # --- 2. frontend ---
 $distSrc = Join-Path $root "web\dist"
@@ -81,7 +86,7 @@ New-Item -ItemType Directory -Path $out -Force | Out-Null
 
 Copy-Item $exe (Join-Path $out "pawch-agent.exe")
 # 桌面壳（窗口/托盘/内置浏览器宿主）是主入口；构建过就随包带，没构建才退化为纯服务
-$shell = Join-Path $root "desktop\target\release\Pawch Agent.exe"
+$shell = Join-Path $targetDir "release\Pawch Agent.exe"
 if (Test-Path $shell) {
     Copy-Item $shell (Join-Path $out "Pawch Agent.exe")
     Info "desktop shell included"

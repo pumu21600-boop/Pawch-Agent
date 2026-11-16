@@ -31,7 +31,31 @@ import {
   settleAskOnParts,
   fileUserIndexOf,
   outboxNotYetSent,
+  splitConvBlocks,
 } from '../src/lib/chat.js';
+
+test('splitConvBlocks：文件里的引用对话块还原成 chip，正文只留用户原话', () => {
+  const one = '帮我看下这个\n\n【引用对话：甲对话】\n用户: 问题一\n\n助手: 回答一\n【引用对话结束】';
+  const r1 = splitConvBlocks(one);
+  assert.equal(r1.text, '帮我看下这个');
+  assert.equal(r1.convs.length, 1);
+  assert.equal(r1.convs[0].title, '甲对话');
+  assert.equal(r1.convs[0].omitted, false);
+  assert.equal(r1.convs[0].text, '用户: 问题一\n\n助手: 回答一');
+
+  // 多段 + 长对话截断标记
+  const two =
+    '看这两个\n\n【引用对话：甲】\nA\n【引用对话结束】\n\n【引用对话：乙】\nB\n（该对话较长，此处只保留了最近部分）\n【引用对话结束】';
+  const r2 = splitConvBlocks(two);
+  assert.equal(r2.text, '看这两个');
+  assert.deepEqual(r2.convs.map((c) => c.title), ['甲', '乙']);
+  assert.equal(r2.convs[1].omitted, true);
+  assert.equal(r2.convs[1].text, 'B');
+
+  // 没有块：原样返回，不动用户自己打的字
+  assert.deepEqual(splitConvBlocks('普通一句'), { text: '普通一句', convs: [] });
+  assert.deepEqual(splitConvBlocks(''), { text: '', convs: [] });
+});
 
 test('审批记录挂在最后一个同名工具段上，决定回填按 id 命中', () => {
   let p = [];

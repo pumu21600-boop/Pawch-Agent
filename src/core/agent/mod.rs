@@ -17,6 +17,14 @@ use crate::observability::{self, EventType};
 use crate::recovery;
 use crate::tools::{self, ExecConfig};
 
+use rand::Rng;
+
+/// 每个渠道单步内的原地重试上限（不含首次请求）。对齐 ZCode「瞬态故障多试几次」
+/// 的口径，但不照抄它的 10 次：Pawch 每次重试是整轮重发（上下文全量再计费一次）
+/// 且界面走 StepReset（半截内容闪回），挂掉的渠道拖 10 次是几分钟白烧——取 3，
+/// 重试仍失败交给降级链的下一个渠道。
+const MAX_STREAM_RETRIES: u32 = 3;
+
 
 mod checkpoint;
 mod exec;
@@ -406,37 +414,60 @@ async fn run_chain(
                 Ok(ChatOutcome::Cancelled(_)) => return (outcome, notices, used),
                 Err(e) => {
                     // 流中断原地重试（2026-10-31 渠道实测：连写大文件的长流中途被上游
-                    // 掐断，降级链只有单渠道时直接失败）。读流失败/流超时是「上下文没变、
-                    // 从头重发同一请求」的瞬态故障——同渠道自动重试一次：前端半截内容由
-                    // StepReset 回滚（换渠道重试的现成机制），用户无感续跑。
+                    // 掐断，降级链只有单渠道时直接失败）。读流失败/流超时/响应头超时/
+                    // 结束标记前中断都是「上下文没变、从头重发同一请求」的瞬态故障——
+                    // 同渠道自动重试：前端半截内容由 StepReset 回滚（换渠道重试的现成
+                    // 机制），用户无感续跑。
+                    // 2026-11-14 对齐 ZCode 口径：重试 1→3 次、500ms 固定等待改指数退避
+                    // +抖动（连发容易撞同一个故障窗口）；「结束标记前中断」是网关 11-02
+                    // 新增的报错，原名单漏了它（报错注释声称会重试，实际直接换渠道——
+                    // 真机 11-14 被掐 34 秒后用户只能手动发「继续」）；「未返回响应头」
+                    // 是 send() 等响应头上限的报错。
                     let msg = e.to_string();
                     let transient = msg.contains("读流失败")
                         || msg.contains("模型流超时")
+                        || msg.contains("未返回响应头")
+                        || msg.contains("结束标记前中断")
                         || msg.contains("error sending request")
                         || msg.contains("connection")
                         // 网关对「发请求阶段网络失败」的人话包装（2026-11-02：原分类
                         // 只认英文子串，而网关把底层 cause 丢了 → 永远不重试）
                         || msg.contains("网络层不通");
-                    if transient
-                        && attempts_in_channel[i].load(std::sync::atomic::Ordering::Relaxed) == 0
-                    {
-                        attempts_in_channel[i].store(1, std::sync::atomic::Ordering::Relaxed);
+                    let retried = attempts_in_channel[i].load(std::sync::atomic::Ordering::Relaxed);
+                    if transient && retried < MAX_STREAM_RETRIES {
+                        attempts_in_channel[i].store(retried + 1, std::sync::atomic::Ordering::Relaxed);
                         on_event(AgentEvent::StepReset {
                             content: streamed_content.swap(0, std::sync::atomic::Ordering::Relaxed),
                             reasoning: streamed_reasoning.swap(0, std::sync::atomic::Ordering::Relaxed),
                         });
-                        let note = format!("输出流中断（{}），正在原渠道自动重试…", msg.chars().take(120).collect::<String>());
-                        on_event(AgentEvent::Notice(note.clone()));
-                        // 先只当临时提示（不 push 进 notices = 不落盘）：重试成功会 NoticeClear
-                        // 撤掉；重试也失败才在下面补进 notices 当历史（信息有用，留着）
-                        retry_note = Some(note);
+                        // 提示只发一条且文案稳定（重试成功 NoticeClear 按原文撤回；后续
+                        // 重试不叠新条——错误详情可能每次不同，多条会在界面上留尾巴）
+                        if retried == 0 {
+                            let note = format!("输出流中断（{}），正在原渠道自动重试…", msg.chars().take(120).collect::<String>());
+                            on_event(AgentEvent::Notice(note.clone()));
+                            // 先只当临时提示（不 push 进 notices = 不落盘）：重试成功会 NoticeClear
+                            // 撤掉；重试也失败才在下面补进 notices 当历史（信息有用，留着）
+                            retry_note = Some(note);
+                        }
                         observability::event(
                             EventType::State,
-                            json!({ "kind": "gateway.stream_retry", "step": step, "channel": ch.model }),
+                            json!({ "kind": "gateway.stream_retry", "step": step, "channel": ch.model, "attempt": retried + 1, "max": MAX_STREAM_RETRIES }),
                         );
-                        // 给上游半秒缓冲再重发（连发容易撞同一个故障窗口）
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        continue; // 同渠道重发（attempts_in_channel 挡住第二次）
+                        // 退避 2s/4s/8s + 一半以内抖动（对齐 ZCode 的指数退避；等待可被
+                        // 「停止」打断，「立即发送」的打断随下一次流式开头自然生效）
+                        let backoff_ms = 2000u64 << retried.min(2);
+                        let jitter: u64 = rand::thread_rng().gen_range(0..=backoff_ms / 2);
+                        tokio::select! {
+                            () = cancel.cancelled() => {
+                                observability::event(
+                                    EventType::State,
+                                    json!({ "kind": "cancel", "phase": "stream_retry_backoff", "step": step }),
+                                );
+                                return (Ok(ChatOutcome::Cancelled(None)), notices, used);
+                            }
+                            () = tokio::time::sleep(std::time::Duration::from_millis(backoff_ms + jitter)) => {}
+                        }
+                        continue; // 同渠道重发
                     }
                     // 重试也失败：这条提示留着当历史（这时才进 notices → 落盘）
                     if let Some(n) = retry_note.take() {

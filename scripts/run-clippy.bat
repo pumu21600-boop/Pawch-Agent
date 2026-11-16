@@ -10,4 +10,6 @@ if not exist "%VCVARS%" (
 )
 call "%VCVARS%" >nul
 cd /d %~dp0..
+if not defined PAWCH_TARGET_DIR set "PAWCH_TARGET_DIR=D:\pawch-build\target"
+set "CARGO_TARGET_DIR=%PAWCH_TARGET_DIR%"
 cargo clippy --bin pawch-agent %*

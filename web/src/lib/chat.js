@@ -785,3 +785,47 @@ export function toolIcon(kind) {
       return wrap('<path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4l-2.4 2.4-2.4-2.4Z"/>');
   }
 }
+
+// —— 引用 token 高亮（composer 浮层与用户气泡同一套，2026-11-15 阶段 C 自 App 迁入）：
+// /能力、@文件 画强调色；escape-first，正文纯文本可用 {@html}。
+  const COMPOSER_REF_RE = /(^|\s)([/@][^\s]+)/g;
+  function escHtml(s) {
+    return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+  }
+  export function highlightComposer(text) {
+    const s = text || '';
+    let out = '';
+    let last = 0;
+    COMPOSER_REF_RE.lastIndex = 0;
+    let m;
+    while ((m = COMPOSER_REF_RE.exec(s))) {
+      const start = m.index + m[1].length;
+      out += escHtml(s.slice(last, start)) + `<span class="ref">${escHtml(m[2])}</span>`;
+      last = start + m[2].length;
+    }
+    out += escHtml(s.slice(last));
+    return out;
+  }
+
+  // 发出去之后也要保留颜色：用户气泡里的 /技能、@引用 用同一套
+  // token 规则与强调色重绘。正文是纯文本，highlightComposer 里已 escape-first，可用 {@html}。
+  export function userMsgHtml(content) {
+    return highlightComposer(typeof content === 'string' ? content : String(content ?? ''));
+  }
+
+/// 引用对话块（App 的 convBlocks 生成）→ { text, convs }。会话文件里存的是拼好的
+/// 全文（模型上下文要它），但气泡只该显示「用户打的那句 + 引用 chip」。刷新、分叉、
+/// 重开会话都是从文件重建气泡——2026-11-16 用户实测：分叉后整段他人对话被铺进消息流。
+/// convs 里保留 body 原文：编辑重发要按原样拼回去（chip 只读 title）。
+export function splitConvBlocks(text) {
+  const s = String(text ?? '');
+  const convs = [];
+  const omittedMark = '\n（该对话较长，此处只保留了最近部分）';
+  const re = /\n\n【引用对话：([^\n]*?)】\n([\s\S]*?)\n【引用对话结束】/g;
+  const cleaned = s.replace(re, (_, title, body) => {
+    const omitted = body.endsWith(omittedMark);
+    convs.push({ title, text: omitted ? body.slice(0, -omittedMark.length) : body, omitted });
+    return '';
+  });
+  return { text: cleaned, convs };
+}

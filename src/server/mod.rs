@@ -46,6 +46,7 @@ pub(crate) use crate::core::agent::{self, AgentEvent, LoopOutcome};
 
 mod chat;
 pub(crate) mod attachments; // 输入框附件用系统程序打开（文档类预览兜底，2026-11-10）
+mod client_log; // 前端未捕获异常 / Promise 拒绝上报（2026-11-13 埋点补齐）
 pub(crate) mod auth;
 pub(crate) mod compact; // 2026-11-07 收尾静默压缩（触发判定 + 后台任务）
 pub(crate) mod data_admin;
@@ -82,6 +83,7 @@ pub(super) async fn computer_state() -> Json<Value> {
 }
 
 use chat::*;
+use client_log::*;
 use plugins::*;
 use gate::*;
 use git::*;
@@ -341,6 +343,7 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/review/diff", get(review_diff))
         .route("/api/shell", post(run_shell))
         .route("/api/skills", get(list_skills).post(post_skills))
+        .route("/api/client-log", post(post_client_log))
         .route("/api/health", get(|| async { "ok" }))
         .with_state(state);
 
@@ -361,9 +364,37 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
     app = app.layer(middleware::from_fn(guard_browser_plugin));
     // 本地访问令牌（D1）：/api/* 与 /cancel 必须带 Bearer 或同源 cookie
     app = app.layer(middleware::from_fn(auth::guard));
-    // HTML 文档响应下发令牌 cookie（最外层：静态页先拿到 cookie，页面内的 fetch 才带得上）
+    // HTML 文档响应下发令牌 cookie（在 auth 外层：静态页先拿到 cookie，页面内的 fetch 才带得上）
     app = app.layer(middleware::from_fn(auth::issue_cookie));
+    // 慢请求埋点放最外层：测的是含鉴权/静态页在内的总耗时，超过阈值才记一条
+    app = app.layer(middleware::from_fn(log_slow_requests));
     app
+}
+
+/// 慢请求阈值（毫秒）：只记超过这个值的请求，平时不写噪音。
+const SLOW_REQUEST_MS: u128 = 1000;
+
+/// 慢请求埋点：超过阈值的请求落一条 `state / kind=http.slow`（方法、路径、状态码、耗时）。
+/// 不记录 query 与请求体：本地服务里 query 可能夹带一次性令牌，路径已足够定位。
+async fn log_slow_requests(req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let started = std::time::Instant::now();
+    let response = next.run(req).await;
+    let ms = started.elapsed().as_millis();
+    if ms >= SLOW_REQUEST_MS {
+        observability::try_event(
+            EventType::State,
+            json!({
+                "kind": "http.slow",
+                "method": method.as_str(),
+                "path": path,
+                "status": response.status().as_u16(),
+                "ms": ms,
+            }),
+        );
+    }
+    response
 }
 
 /// 内置浏览器能力闸（插件开关 = 能力总闸）。

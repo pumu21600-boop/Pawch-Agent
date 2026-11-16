@@ -1,6 +1,6 @@
 ---
 name: xlsx
-description: 创建与保真修改 .xlsx：公式/样式/合并全保留
+description: 创建或保真修改 .xlsx 并保留公式样式与合并单元格
 ---
 
 # xlsx 技能（表格）

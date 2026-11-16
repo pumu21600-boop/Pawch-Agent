@@ -8,8 +8,8 @@
 //   5) 杀掉服务再起（同一数据目录），/api/session 仍能读回这轮消息（重启恢复）
 //
 // 用法（仓库根目录）：
-//   node scripts/e2e_smoke.mjs                 # 默认 target/debug/pawch-agent.exe
-//   node scripts/e2e_smoke.mjs --exe target/release/pawch-agent.exe
+//   node scripts/e2e_smoke.mjs                 # 默认 %CARGO_TARGET_DIR%/debug/pawch-agent.exe
+//   node scripts/e2e_smoke.mjs --exe <exe>      # 指定二进制
 //   node scripts/e2e_smoke.mjs --keep          # 保留临时目录，便于诊断
 //
 // 退出码：0 = 全过，1 = 有失败。mock 渠道用 scripts/mock_provider.mjs（默认 9399）。
@@ -21,8 +21,13 @@ import os from 'node:os';
 import path from 'node:path';
 
 const repo = path.resolve(import.meta.dirname, '..');
+const targetDir = process.env.CARGO_TARGET_DIR
+  ? path.resolve(process.env.CARGO_TARGET_DIR)
+  : process.env.PAWCH_TARGET_DIR
+    ? path.resolve(process.env.PAWCH_TARGET_DIR)
+    : path.join(repo, 'target');
 const argv = process.argv.slice(2);
-let exe = path.join(repo, 'target', 'debug', 'pawch-agent.exe');
+let exe = path.join(targetDir, 'debug', 'pawch-agent.exe');
 let keep = false;
 for (let i = 0; i < argv.length; i += 1) {
   if (argv[i] === '--exe') exe = path.resolve(argv[++i]);

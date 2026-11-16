@@ -233,6 +233,12 @@ impl Throttle {
     }
 }
 
+/// 流式请求的读体总闸：按请求放宽到 6 小时。客户端级 600s 总闸是「从建连到读体
+/// 结束」的全称死线（reqwest 语义），长思考/长输出的合法流会被它拦腰斩断——
+/// 2026-11-14 排查读流中断时定位。空闲保护不依赖它：读流循环有 120s 空闲闸，
+/// 等响应头阶段在 send() 里有 600s 上限。
+const STREAM_BODY_TOTAL: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
 fn build_client() -> reqwest::Client {
     // 构建失败（TLS 后端异常等）不该 panic 拖垮整个服务：退回默认配置的客户端，
     // 超时/连接超时用默认值，比「网关起不来」好得多。
@@ -600,13 +606,32 @@ impl Gateway {
         }
     }
 
-    /// 发请求；两类自愈：
+    /// 发请求（等响应头阶段上限 600s）：流式请求的读体总闸按请求放宽到 6 小时
+    /// （reqwest 客户端级 timeout 覆盖整个读体，长思考/长输出的流会被 600s 拦腰
+    /// 斩断），空闲保护交给读流循环的 120s 空闲闸；这里保留「渠道收下请求后
+    /// 装死」的兜底——600s 内必须见到响应头，与原客户端总闸对等待期的约束等价
+    /// （429/5xx 重试最坏 ~2 分钟也在限内）。
+    async fn send(
+        &self,
+        base_url: &str,
+        build: impl Fn(reqwest::Client) -> reqwest::RequestBuilder,
+    ) -> anyhow::Result<reqwest::Response> {
+        const HEADERS_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+        match tokio::time::timeout(HEADERS_WAIT, self.send_inner(base_url, build)).await {
+            Ok(r) => r,
+            Err(_) => Err(anyhow::anyhow!(
+                "渠道 600 秒未返回响应头（渠道或代理无响应，可重试）"
+            )),
+        }
+    }
+
+    /// 实际发请求；两类自愈：
     /// 1. 网络层失败（连接/超时类）→ 重建客户端重试一次（Clash 开关热恢复）；
     /// 2. 渠道 429 → 指数退避重试最多 3 次（尊重 Retry-After 头，缺省 1s/2s/4s），
     ///    仍 429 才把错误抛给上层。用户不该看见瞬时限流。
     ///
     /// `base_url` 决定用哪个客户端：环回主机（本地模型服务）永不走代理。
-    async fn send(
+    async fn send_inner(
         &self,
         base_url: &str,
         build: impl Fn(reqwest::Client) -> reqwest::RequestBuilder,
@@ -1230,7 +1255,7 @@ impl Gateway {
         // 总超时（600s），期间 cancel 标志无从检查（2026-10-20 修）。
         let sent = Self::or_cancel(
             cancel,
-            self.send(base_url, |c| Self::auth(c.post(&url), &channel.api_key, compat.protocol).json(&body)),
+            self.send(base_url, |c| Self::auth(c.post(&url), &channel.api_key, compat.protocol).json(&body).timeout(STREAM_BODY_TOTAL)),
         )
         .await;
         let Some(sent) = sent else {
@@ -1266,7 +1291,7 @@ impl Gateway {
             let retry_body = build_body_with_compat(model, &outgoing, true, &eff_params, tools, &compat, &ctx.session_id);
             let sent = Self::or_cancel(
                 cancel,
-                self.send(base_url, |c| Self::auth(c.post(&url), &channel.api_key, compat.protocol).json(&retry_body)),
+                self.send(base_url, |c| Self::auth(c.post(&url), &channel.api_key, compat.protocol).json(&retry_body).timeout(STREAM_BODY_TOTAL)),
             )
             .await;
             let Some(sent) = sent else {
@@ -1312,7 +1337,7 @@ impl Gateway {
             let retry_body = build_body_with_compat(model, &outgoing, true, &retry_params, tools, &compat, &ctx.session_id);
             let sent = Self::or_cancel(
                 cancel,
-                self.send(base_url, |c| Self::auth(c.post(&url), &channel.api_key, compat.protocol).json(&retry_body)),
+                self.send(base_url, |c| Self::auth(c.post(&url), &channel.api_key, compat.protocol).json(&retry_body).timeout(STREAM_BODY_TOTAL)),
             )
             .await;
             let Some(sent) = sent else {

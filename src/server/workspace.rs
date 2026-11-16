@@ -186,25 +186,32 @@ pub(super) async fn list_workspace_dir(
 
 /// GET /api/workspace/raw?path=xx —— 原样直出工作区文件字节（图片预览用）。
 /// 只给浏览器渲染，不解析成文本；工作区边界与 read_file 同一套硬拦，单文件上限 8MB。
+/// 2026-11-14 加 Range 分段支持（206）：视频/音频标签 seek 靠它——没有 Range 响应
+/// 时 WebView2 拖进度条无效（只能从头顺序播）；浏览器媒体栈总带 Range 头，所以
+/// 大于 8MB 的音视频也能播（无 Range 的直开仍守 8MB 上限）。单片读取封顶 8MB，
+/// 开放式区间（bytes=0-）按窗切，不整文件进内存。
 pub(super) async fn read_workspace_raw(
     Query(params): Query<std::collections::HashMap<String, String>>,
+    req_headers: axum::http::HeaderMap,
 ) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
     use axum::response::IntoResponse;
     const MAX_BYTES: u64 = 8 * 1024 * 1024;
+    const RANGE_CHUNK: u64 = 8 * 1024 * 1024;
     let path = params.get("path").map(|s| s.trim()).unwrap_or("").to_string();
     if path.is_empty() {
         return Err((StatusCode::BAD_REQUEST, Json(json!({ "error": "缺少 path" }))));
     }
-    let res = tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, &'static str, Option<&'static str>), String> {
+    let range_header = req_headers
+        .get(axum::http::header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let res = tokio::task::spawn_blocking(move || -> Result<RawReply, String> {
         let full = crate::tools::resolve_workspace_path(&path)?;
         let meta = std::fs::metadata(&full).map_err(|e| format!("读取失败: {e}"))?;
         if !meta.is_file() {
             return Err(format!("不是文件: {path}"));
         }
-        if meta.len() > MAX_BYTES {
-            return Err(format!("文件过大（{} 字节，上限 8MB）", meta.len()));
-        }
-        let bytes = std::fs::read(&full).map_err(|e| format!("读取失败: {e}"))?;
+        let total = meta.len();
         let ext = full.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
         let ct = match ext.as_str() {
             "png" => "image/png",
@@ -235,28 +242,136 @@ pub(super) async fn read_workspace_raw(
         } else {
             None
         };
-        Ok((bytes, ct, csp))
+        // Range 解析失败/没带 = 当无 Range 处理；start 越界 = 416
+        match resolve_byte_range(range_header.as_deref(), total) {
+            ByteRange::Valid(start, end) => {
+                // 开放式区间按窗切：媒体栈拿到 206 会按需续要，不整文件进内存
+                let end = end.min(start.saturating_add(RANGE_CHUNK - 1));
+                let data = read_file_slice(&full, start, end)?;
+                Ok(RawReply::Slice { ct, csp, start, end, total, data })
+            }
+            ByteRange::Unsatisfiable => Ok(RawReply::RangeUnsatisfiable(total)),
+            ByteRange::Absent => {
+                if total > MAX_BYTES {
+                    return Err(format!("文件过大（{} 字节，上限 8MB）", total));
+                }
+                let bytes = std::fs::read(&full).map_err(|e| format!("读取失败: {e}"))?;
+                Ok(RawReply::Full { ct, csp, data: bytes })
+            }
+        }
     })
     .await;
     match res {
-        Ok(Ok((bytes, ct, csp))) => {
+        Ok(Ok(reply)) => {
             use axum::http::{HeaderMap, HeaderValue};
             let mut headers = HeaderMap::new();
-            headers.insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static(ct));
             headers.insert(axum::http::header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
             // 禁 MIME 嗅探：无扩展名/错扩展名的文件不能被浏览器当成 text/html 渲染
             headers.insert(
                 axum::http::header::X_CONTENT_TYPE_OPTIONS,
                 HeaderValue::from_static("nosniff"),
             );
-            if let Some(csp) = csp {
-                headers.insert(axum::http::header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(csp));
+            headers.insert(axum::http::header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+            let status;
+            match reply {
+                RawReply::Full { ct, csp, data } => {
+                    status = StatusCode::OK;
+                    headers.insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static(ct));
+                    if let Some(c) = csp {
+                        headers.insert(axum::http::header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(c));
+                    }
+                    Ok((status, headers, data).into_response())
+                }
+                RawReply::Slice { ct, csp, start, end, total, data } => {
+                    status = StatusCode::PARTIAL_CONTENT;
+                    headers.insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static(ct));
+                    if let Some(c) = csp {
+                        headers.insert(axum::http::header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(c));
+                    }
+                    headers.insert(
+                        axum::http::header::CONTENT_RANGE,
+                        HeaderValue::from_str(&format!("bytes {start}-{end}/{total}"))
+                            .unwrap_or(HeaderValue::from_static("bytes */*")),
+                    );
+                    Ok((status, headers, data).into_response())
+                }
+                RawReply::RangeUnsatisfiable(total) => {
+                    headers.insert(
+                        axum::http::header::CONTENT_RANGE,
+                        HeaderValue::from_str(&format!("bytes */{total}"))
+                            .unwrap_or(HeaderValue::from_static("bytes */*")),
+                    );
+                    Ok((StatusCode::RANGE_NOT_SATISFIABLE, headers, Vec::new()).into_response())
+                }
             }
-            Ok((headers, bytes).into_response())
         }
         Ok(Err(e)) => Err((StatusCode::BAD_REQUEST, Json(json!({ "error": e })))),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })))),
     }
+}
+
+/// raw 端点的三种回复形态：整文件 200 / 区间 206 / 越界 416。
+enum RawReply {
+    Full { ct: &'static str, csp: Option<&'static str>, data: Vec<u8> },
+    Slice { ct: &'static str, csp: Option<&'static str>, start: u64, end: u64, total: u64, data: Vec<u8> },
+    RangeUnsatisfiable(u64),
+}
+
+/// Range 头解析结果：可用的闭区间 / start 越界（416）/ 没带或非法（按整发处理）。
+enum ByteRange {
+    Valid(u64, u64),
+    Unsatisfiable,
+    Absent,
+}
+
+/// 解析单段 Range（`bytes=a-b` / `bytes=a-` / `bytes=-n`），按 total 折算成闭区间。
+/// 多段 Range 取第一段；解析不出来一律 Absent（当无 Range 整发，守 8MB 上限）。
+fn resolve_byte_range(v: Option<&str>, total: u64) -> ByteRange {
+    let Some(v) = v else { return ByteRange::Absent };
+    let Some(spec) = v.trim().strip_prefix("bytes=").map(|s| s.split(',').next().unwrap_or("").trim()) else {
+        return ByteRange::Absent;
+    };
+    let Some((a, b)) = spec.split_once('-') else { return ByteRange::Absent };
+    let (a, b) = (a.trim(), b.trim());
+    if a.is_empty() {
+        // 后缀式：最后 N 字节；N ≥ total = 整个文件（RFC 9110）
+        let Ok(n) = b.parse::<u64>() else { return ByteRange::Absent };
+        if n == 0 {
+            return ByteRange::Absent;
+        }
+        if total == 0 {
+            return ByteRange::Unsatisfiable;
+        }
+        match total.checked_sub(n) {
+            Some(start) => ByteRange::Valid(start, total - 1),
+            None => ByteRange::Valid(0, total - 1),
+        }
+    } else {
+        let Ok(start) = a.parse::<u64>() else { return ByteRange::Absent };
+        if start >= total {
+            return ByteRange::Unsatisfiable;
+        }
+        let end = if b.is_empty() {
+            total - 1
+        } else {
+            match b.parse::<u64>() {
+                Ok(e) => e.min(total - 1),
+                Err(_) => return ByteRange::Absent,
+            }
+        };
+        ByteRange::Valid(start, end)
+    }
+}
+
+/// 从文件第 start 字节起读到 end（含）——只把请求窗读进内存。
+fn read_file_slice(full: &std::path::Path, start: u64, end: u64) -> Result<Vec<u8>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(full).map_err(|e| format!("读取失败: {e}"))?;
+    f.seek(SeekFrom::Start(start)).map_err(|e| format!("读取失败: {e}"))?;
+    let len = (end - start + 1) as usize;
+    let mut buf = vec![0u8; len];
+    f.read_exact(&mut buf).map_err(|e| format!("读取失败: {e}"))?;
+    Ok(buf)
 }
 
 /// GET /api/workspace/doc-slides?path=xx —— pptx 结构化分页（预览面板逐页渲染用）。
@@ -806,7 +921,7 @@ mod tests {
         .ok();
         let mut params = std::collections::HashMap::new();
         params.insert("path".to_string(), ".p8-test-raw/x.svg".to_string());
-        let resp = read_workspace_raw(Query(params)).await.unwrap();
+        let resp = read_workspace_raw(Query(params), axum::http::HeaderMap::new()).await.unwrap();
         let h = resp.headers();
         let csp = h
             .get(axum::http::header::CONTENT_SECURITY_POLICY)
@@ -824,7 +939,7 @@ mod tests {
         std::fs::write(dir.join("y.png"), [0x89, 0x50, 0x4e, 0x47]).ok();
         let mut p2 = std::collections::HashMap::new();
         p2.insert("path".to_string(), ".p8-test-raw/y.png".to_string());
-        let resp2 = read_workspace_raw(Query(p2)).await.unwrap();
+        let resp2 = read_workspace_raw(Query(p2), axum::http::HeaderMap::new()).await.unwrap();
         assert!(
             resp2.headers().get(axum::http::header::CONTENT_SECURITY_POLICY).is_none(),
             "非 SVG 不加 CSP"
@@ -833,6 +948,51 @@ mod tests {
             resp2.headers().get(axum::http::header::X_CONTENT_TYPE_OPTIONS).and_then(|v| v.to_str().ok()),
             Some("nosniff")
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 2026-11-14 Range 分段：视频 seek 靠 206；开放式区间按窗切；越界 416；带 Range
+    /// 不受 8MB 上限限制（媒体栈总带 Range，大视频也能播）。
+    #[tokio::test]
+    async fn raw_supports_byte_ranges_for_media_seek() {
+        use axum::http::header;
+        let dir = crate::tools::workspace_root().join(".p8-test-raw-range");
+        std::fs::create_dir_all(&dir).ok();
+        let body: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(dir.join("v.mp4"), &body).ok();
+        let call = |rng: Option<&str>| {
+            let mut p = std::collections::HashMap::new();
+            p.insert("path".to_string(), ".p8-test-raw-range/v.mp4".to_string());
+            let mut h = axum::http::HeaderMap::new();
+            if let Some(r) = rng {
+                h.insert(header::RANGE, axum::http::HeaderValue::from_str(r).unwrap());
+            }
+            async move { read_workspace_raw(Query(p), h).await.unwrap() }
+        };
+
+        // 开放式区间：206 + Content-Range + Accept-Ranges + 正确切片
+        let resp = call(Some("bytes=100-")).await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        let cr = resp.headers().get(header::CONTENT_RANGE).unwrap().to_str().unwrap().to_string();
+        assert!(cr.starts_with("bytes 100-"), "Content-Range: {cr}");
+        assert!(resp.headers().get(header::ACCEPT_RANGES).is_some());
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body_bytes, body[100..]);
+
+        // 闭区间 + 后缀式
+        let r = call(Some("bytes=10-19")).await;
+        let b = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(b, body[10..20]);
+        let r = call(Some("bytes=-5")).await;
+        let b = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(b, body[body.len() - 5..]);
+
+        // 越界 416 + 无 Range 守 8MB 上限语义不变（小文件 200）
+        let r = call(Some("bytes=999999999-")).await;
+        assert_eq!(r.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        let r = call(None).await;
+        assert_eq!(r.status(), StatusCode::OK);
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

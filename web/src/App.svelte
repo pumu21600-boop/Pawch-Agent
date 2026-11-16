@@ -40,11 +40,27 @@
     processSummary,
     processIsLive,
     toolMeta,
+    highlightComposer,
     parseArgs,
     prettyArgs,
+    splitConvBlocks,
   } from './lib/chat.js';
   import RenameModal from './lib/RenameModal.svelte';
   import ConfirmModal from './lib/ConfirmModal.svelte';
+  import ArtifactsPane from './lib/panel/ArtifactsPane.svelte';
+  import PreviewPane from './lib/panel/PreviewPane.svelte';
+  import GitPane from './lib/panel/GitPane.svelte';
+  import WebPane from './lib/panel/WebPane.svelte';
+  import ExtPane from './lib/panel/ExtPane.svelte';
+  import TodoDock from './lib/composer/TodoDock.svelte';
+  import ApprovalDock from './lib/composer/ApprovalDock.svelte';
+  import ComposerChips from './lib/composer/ComposerChips.svelte';
+  import ComposerField from './lib/composer/ComposerField.svelte';
+  import ComposerBar from './lib/composer/ComposerBar.svelte';
+  import ChatMessages from './lib/chatview/ChatMessages.svelte';
+  import Sidebar from './lib/session/Sidebar.svelte';
+  import { connectUiEvents } from './lib/events.js';
+  import { previewKind, previewTruncated } from './lib/panel/preview.js';
   import WorkspaceModal from './lib/WorkspaceModal.svelte';
   import ModelPicker from './lib/ModelPicker.svelte';
   import MemoryTab from './lib/MemoryTab.svelte';
@@ -59,7 +75,7 @@
   import AboutTab from './lib/AboutTab.svelte';
   import TerminalPanel from './lib/TerminalPanel.svelte';
   import Select from './Select.svelte'; // git 面板范围选择器（自绘下拉：选中态可走统一口径，原生 select 弹层画不了）
-  import { fmtBytes, relTime, fmtTok, norm, configLabel, cfgMediaBadge, gitStatusLabel, normPath, relShort, contentText, webNormalizeUrl, riskLabelFor } from './lib/format.js';
+  import { fmtBytes, relTime, fmtTok, norm, configLabel, cfgMediaBadge, normPath, relShort, contentText, webNormalizeUrl, riskLabelFor } from './lib/format.js';
   import { parseCssColor, parsedToHex, rgbToHex, rgbAlpha, hexWithAlpha, gradientFirstColor, rebuildGradient, resolveCssVars, findBgSource, structuralSelector, pathOf, findByPath, makeUid, ELEMENT_ALIASES, escalateCss, microCss, parseInsetRing } from './lib/dom.js';
 
   // —— 配置（改动即自动保存即时生效）——
@@ -330,7 +346,6 @@
 
   // —— 多模态媒体附件与大图预览 ——
   let pendingAttachments = []; // 待发送附件列表 [{ name, mime, data, size }]
-  let fileInput; // 隐藏文件选择器引用
   let previewImageModal = null; // 放大预览的图片 dataUrl
   // 输入框附件预览浮层（2026-11-10）：点 chip 打开；文档类走 /api/attachments/open
   let attPreview = null;
@@ -454,16 +469,6 @@
 
   // 视频解码兜底（2026-11-11）：H.265/HEVC 这类 WebView2 缺解码器的视频，容器元数据
   // 读得动（时长显示正常）但一帧都解不出——元素渲染成空画面+底部播放条，还撑一大块空白。
-  // loadedmetadata 时 videoWidth===0 即「没有可解码画面」：降级成文件条，点击用系统播放器打开。
-  let vidNoFrame = {};
-  function vidNoFrameKey(m, a) {
-    return (m.id || '') + '|' + (a.name || '') + '|' + (a.path || '');
-  }
-  function vidMetaFail(m, a, e) {
-    const v = e && e.currentTarget;
-    if (v && v.videoWidth) return;
-    vidNoFrame = { ...vidNoFrame, [vidNoFrameKey(m, a)]: true };
-  }
 
   function handlePaste(e) {
     const files = e.clipboardData && e.clipboardData.files;
@@ -652,7 +657,15 @@
   });
 
   function closeMenusOnOutside(e) {
-    if (e.target && e.target.closest && (e.target.closest('.bar-menu') || e.target.closest('.side-menu') || e.target.closest('.row-btn') || e.target.closest('.conv-more'))) return;
+    const t = e.target;
+    if (!(t instanceof Element)) return;
+    // 目标已被点击过程拆掉 = 视为「点在外面」会误关刚开的菜单（与下方 onGlobalClick
+    // 同一个坑，2026-11-14 实锤第二次）：真实鼠标点「选择能力」→ 处理器先收加号菜单
+    // （Svelte 在监听器之间刷 DOM）→ 冒泡到这里时目标已断连、closest 够不着 .bar-menu
+    // → closeBarMenus 把刚开的 ability 菜单又关掉——表现就是「点了没反应」。
+    // 合成 .click() 不触发（整次 dispatch 在同一脚本内，flush 排在后面），所以此前探针漏网。
+    if (!t.isConnected) return;
+    if (t.closest('.bar-menu') || t.closest('.side-menu') || t.closest('.row-btn') || t.closest('.conv-more')) return;
     closeBarMenus();
     sideMenuOpen = false;
     sessMenuId = null;
@@ -668,6 +681,37 @@
     if (keep !== 'think') thinkMenuOpen = false;
     if (keep !== 'approval') approvalMenuOpen = false;
   }
+  // —— B 轮组件化：输入栏事件上行的根侧落点（原内联在 composer markup 里，逐字搬入） ——
+  function togglePlusMenu() {
+    const open = !plusMenuOpen;
+    closeBarMenus(open ? 'plus' : '');
+    plusMenuOpen = open;
+    abilityMenuOpen = false;
+  }
+  function toggleApprovalMenu() {
+    const open = !approvalMenuOpen;
+    closeBarMenus(open ? 'approval' : '');
+    approvalMenuOpen = open;
+  }
+  function toggleModelMenu() {
+    const open = !modelMenuOpen;
+    closeBarMenus(open ? 'model' : '');
+    modelMenuOpen = open;
+    if (open) menuExpandedCfg = activeConfigId;
+  }
+  function toggleThinkMenu() {
+    const open = !thinkMenuOpen;
+    closeBarMenus(open ? 'think' : '');
+    thinkMenuOpen = open;
+  }
+  // 压缩阈值输入框 change：夹取 40–85 再落盘（原内联在 ctx 卡片里）
+  function compactThresholdSaved() {
+    let v = Math.round(Number(compactPercent) || 85);
+    if (v < 40 || v > 85) v = Math.min(85, Math.max(40, v));
+    compactPercent = v;
+    autoSave({ compact_percent: v }, 0);
+  }
+
 
   // —— 工作区切换 ——
   async function applyWorkspace(path) {
@@ -784,7 +828,36 @@
   function onChatScroll() {
     if (!chatBody) return;
     chatPinned = chatBody.scrollTop + chatBody.clientHeight >= chatBody.scrollHeight - 60;
+    if (chatPinned) hideJumpBottom();
   }
+
+  // 「回到底部」按钮只在用户滑动后的几秒内出现（2026-11-14）：常驻按钮一直挡着
+  // 内容——滑动触发 → 出现 3 秒 → 自动消失，再滑再出。程序滚动（流式跟随/结构
+  // 锚定）不触发：读旧内容时流式更新不该把按钮召回来。滚轮/触摸/按住滚动条都算
+  // 滑动（capture 抢在消息内部 stopPropagation 之前）。
+  let jumpBottomVisible = false;
+  let jumpBottomTimer = null;
+  const JUMP_BOTTOM_STAY_MS = 3000;
+  function onUserSlide() {
+    // 不查 chatPinned：wheel 先于 scroll 事件到达，第一次往上滚时 chatPinned 还是
+    // 旧值 true，查了会把「第一次滑动就出按钮」吃掉（真机探针实锤）。钉底态由
+    // 模板条件 !chatPinned && jumpBottomVisible 兜住，这里只管计时。
+    jumpBottomVisible = true;
+    if (jumpBottomTimer) clearTimeout(jumpBottomTimer);
+    jumpBottomTimer = setTimeout(() => {
+      jumpBottomVisible = false;
+      jumpBottomTimer = null;
+    }, JUMP_BOTTOM_STAY_MS);
+  }
+  function hideJumpBottom() {
+    jumpBottomVisible = false;
+    if (jumpBottomTimer) {
+      clearTimeout(jumpBottomTimer);
+      jumpBottomTimer = null;
+    }
+  }
+  // 会话切换/点按钮等直接置回钉底的路径不走 scroll 事件，这里兜住收按钮
+  $: if (chatPinned) hideJumpBottom();
 
   // —— 结构更新的滚动锚定（2026-11-11）——
   // 压缩重建 / 后台重载会换掉消息数组；这里抓视口顶部可见消息的 id + 偏移，
@@ -1000,50 +1073,6 @@
   $: thinkProgress = thinkLevels && thinkLevels.length > 1 ? (thinkLevelIdx / (thinkLevels.length - 1)) * 100 : 0;
   // 最高档：橙渐变层亮起（非最高档纯品牌橙填充，ZCode 结构）
   $: thinkMax = !!(thinkLevels && thinkLevels.length > 1 && thinkLevelIdx === thinkLevels.length - 1);
-  // 粒子速度随档位升高而加快：最低档 2.5x 基准时长，最高档 1x。
-  // 2026-11-08 二次提速（「整体提高流速」）：BUBBLE_SPEED 0.75→0.5，基准时长也一并压短
-  const BUBBLE_SPEED = 0.5;
-  $: bubbleSpeedMult = 1 + 1.5 * (1 - thinkProgress / 100);
-  // 粒子参数表：固定种子错峰流动（自右向左，透明度 0→0.55→0）。
-  // 全档显示（ZCode 只在最高档有），实际时长乘 bubbleSpeedMult 随档位加速。
-  // 2026-11-08 三轮重排：12→40→140→238 颗（用户「还是太少了」「再加大密度」），
-  // 约七成是 1px 细尘与 1px 高的横丝（高速下像被气流拉长的轨迹），2px 中粒维持
-  // 主体密度，3~4.5px 大泡只做点缀。形状/相位由固定种子伪随机生成，刷新不变。
-  const EFFORT_BUBBLES = (() => {
-    let seed = 20261108;
-    const rnd = () => {
-      seed = (Math.imul(seed, 1103515245) + 12345) & 0x7fffffff;
-      return seed / 0x7fffffff;
-    };
-    const grain = (n, mk) => Array.from({ length: n }, mk);
-    // 粒子色板：色相变化交给带子底（夕烧渐变），粒子回归以白为主——
-    // 亮白在深火/琥珀上都压得住，掺少量米金和一颗「白热」冷白点缀
-    const TINTS = ['#ffffff', '#ffffff', '#ffffff', '#ffffff', '#fff8e6', '#fff3d0', '#ffdf8a', '#ffd76a', '#dff2ff'];
-    const tint = () => TINTS[Math.min(TINTS.length - 1, Math.floor(rnd() * TINTS.length))];
-    return [
-      // 细尘：1px 圆点，透明度压到最低（最远的那层，铺满整条带子）
-      ...grain(128, () => ({ top: +(1.5 + rnd() * 21).toFixed(1), w: 1, h: 1, c: tint(), op: 0.3 + rnd() * 0.35, duration: 1.3 + rnd() * 0.8, delay: -rnd() * 2.2 })),
-      // 横丝：1px 高、4~10px 长，加速时读作细流线
-      ...grain(46, () => ({ top: +(3 + rnd() * 18).toFixed(1), w: +(4 + rnd() * 6).toFixed(1), h: 1, c: tint(), op: 0.28 + rnd() * 0.3, duration: 1.15 + rnd() * 0.7, delay: -rnd() * 2 })),
-      // 中粒：2px 圆点
-      ...grain(46, () => ({ top: +(3 + rnd() * 18).toFixed(1), w: 2, h: 2, c: tint(), op: 0.38 + rnd() * 0.28, duration: 1.5 + rnd() * 0.8, delay: -rnd() * 2.4 })),
-      // 大泡：3~4.5px，少量提亮层次
-      ...grain(18, () => {
-        const s = +(3 + rnd() * 1.5).toFixed(1);
-        return { top: +(5 + rnd() * 13).toFixed(1), w: s, h: s, c: tint(), op: 0.5 + rnd() * 0.24, duration: 1.8 + rnd() * 0.7, delay: -rnd() * 2.3 };
-      }),
-    ];
-  })();
-  // 粒子数量随填充宽度缩放：最低档填充只有 14px 圆头，全量塞进去会糊成一团。
-  // 按填充占比等距抽样（不是截前 N 颗——表按粒径分组排列，截取会只剩细尘）。
-  // 注意：pct 必须走参数传，Svelte 不追踪函数体内读到的响应式变量。
-  const sampleForFill = (arr, pct) => {
-    const n = Math.max(4, Math.round(arr.length * (0.05 + 0.95 * (pct / 100))));
-    if (n >= arr.length) return arr;
-    const step = arr.length / n;
-    return Array.from({ length: n }, (_, i) => arr[Math.floor(i * step)]);
-  };
-  $: effortBubbles = sampleForFill(EFFORT_BUBBLES, thinkProgress);
   // 原生 range 拖动/点选：离散步进，input 事件即落值（菜单保持展开，ZCode 面板同款）
   function thinkRangeInput(idx) {
     const l = thinkLevels && thinkLevels[idx];
@@ -1113,17 +1142,6 @@
   // 只读 = 只读操作自动放行，写/执行逐次询问（shell 恒沙箱）
   // 自动 = 工作区与整台电脑都可动（越界写按高危先问），shell 恒沙箱
   // 完全访问 = 整台电脑可动且免审批，shell 本机直跑（需 config 总开关）
-  const APPROVAL_LABELS = { 'read-only': '只读', auto: '自动', 'full-access': '完全访问' };
-  // 审批档图标（收起态只显示图标；展开选择时才显示图标 + 名称）：
-  // 只读=闭锁，自动=盾牌勾，完全访问=开锁。
-  const APPROVAL_ICONS = {
-    'read-only':
-      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4.5" y="10.5" width="15" height="9.5" rx="2"/><path d="M8 10.5V7.6a4 4 0 0 1 8 0v2.9"/></svg>',
-    auto: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.2 19 6v5.2c0 4.4-3 7.6-7 9.1-4-1.5-7-4.7-7-9.1V6Z"/><path d="m9 11.6 2 2 4.2-4.4"/></svg>',
-    'full-access':
-      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4.5" y="10.5" width="15" height="9.5" rx="2"/><path d="M8 10.5V7.6a4 4 0 0 1 7.7-1.6"/></svg>',
-  };
-  const approvalIcon = (m) => APPROVAL_ICONS[m] || APPROVAL_ICONS.auto;
   // 审批档切换的请求序号：并发乱序时以「最后一次点击」为准，过期响应丢弃（F14）
   let approvalPickSeq = 0;
   async function pickApproval(m) {
@@ -1629,30 +1647,7 @@
   let composerHl = '';
   // 中文输入法拼写期间让输入框自己显示文字（浮层隐藏）：否则 IME 候选/下划线看不见
   let composerComposing = false;
-  const COMPOSER_REF_RE = /(^|\s)([/@][^\s]+)/g;
-  function escHtml(s) {
-    return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
-  }
-  function highlightComposer(text) {
-    const s = text || '';
-    let out = '';
-    let last = 0;
-    COMPOSER_REF_RE.lastIndex = 0;
-    let m;
-    while ((m = COMPOSER_REF_RE.exec(s))) {
-      const start = m.index + m[1].length;
-      out += escHtml(s.slice(last, start)) + `<span class="ref">${escHtml(m[2])}</span>`;
-      last = start + m[2].length;
-    }
-    out += escHtml(s.slice(last));
-    return out;
-  }
   $: composerHl = highlightComposer(input);
-  // 发出去之后也要保留颜色：用户气泡里的 /技能、@引用 用同一套
-  // token 规则与强调色重绘。正文是纯文本，highlightComposer 里已 escape-first，可用 {@html}。
-  function userMsgHtml(content) {
-    return highlightComposer(typeof content === 'string' ? content : String(content ?? ''));
-  }
   function syncComposerHl() {
     if (!composerHlEl || !composerInputEl) return;
     // 浮层宽度必须跟输入框的**内容区**走：草稿超过 max-height 后 textarea 出竖向滚动条，
@@ -1773,14 +1768,6 @@
   $: ownSkills = (skillsData || []).filter((sk) => sk.source !== 'plugin' && sk.enabled !== false);
   $: pluginSkills = (skillsData || []).filter((sk) => sk.source === 'plugin' && sk.enabled !== false);
   let pluginMenu = ''; // 展开中的插件名（/ 菜单）
-  function pluginSkillsOf(name) {
-    return pluginSkills.filter((sk) => sk.plugin === name);
-  }
-  // 插件引用键：标题去掉空白——「Word 文档」这类带空格的名字插进去会把 /引用 切断。
-  // 后端 index_prompt 用同一口径列「可用插件」，插进输入框的 /引用 在模型那儿才解得开。
-  function pluginRef(e) {
-    return (e.title || e.name || '').replace(/\s+/g, '');
-  }
 
   // —— 顶栏右侧：终端面板 + 产物/预览右侧栏 ——
   let terminalOpen = false;
@@ -1976,38 +1963,7 @@
     }
   }
   // 统一 diff 文本 → 带行号的渲染行（左右两个行号列 + 增删着色）
-  function rvParse(text) {
-    const out = [];
-    let oldNo = 0;
-    let newNo = 0;
-    for (const ln of String(text || '').split('\n')) {
-      if (/^(diff --git|index |old mode|new mode|similarity index|dissimilarity index|rename from|rename to|copy from|copy to|deleted file|new file|--- |\+\+\+ )/.test(ln)) {
-        out.push({ t: 'meta', s: ln });
-        continue;
-      }
-      const m = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(ln);
-      if (m) {
-        oldNo = Number(m[1]);
-        newNo = Number(m[3]);
-        out.push({ t: 'hunk', s: ln });
-        continue;
-      }
-      if (ln.startsWith('\\')) {
-        out.push({ t: 'meta', s: ln });
-      } else if (ln.startsWith('+')) {
-        out.push({ t: 'add', o: '', n: newNo, s: ln.slice(1) });
-        newNo += 1;
-      } else if (ln.startsWith('-')) {
-        out.push({ t: 'del', o: oldNo, n: '', s: ln.slice(1) });
-        oldNo += 1;
-      } else {
-        out.push({ t: 'ctx', o: oldNo, n: newNo, s: ln.startsWith(' ') ? ln.slice(1) : ln });
-        oldNo += 1;
-        newNo += 1;
-      }
-    }
-    return out;
-  }
+  // rvParse 已随 git 标签迁入 lib/panel/GitPane.svelte（2026-11-15 阶段 A-3）
   let rpLoading = false;
   let rpPreviewPath = ''; // 最近预览的文件（产物列表高亮用）
   let rpSelPath = ''; // 产物列表当前选中行（单击只选中不打开，双击才预览——同项目文件树）
@@ -2116,23 +2072,6 @@
   //      仍是 screencast 帧流，两条路径由后端 state.mode + 是否在 Tauri 里共同决定。
   let webTabs = []; // { id, agent, title, url, loading, suspended, visible }
   // —— 思考/工具：过程块的展开态（2026-10-30 排布重做）——
-  // 思考与工具按真实发生顺序合成「过程块」；点过程行展开。流式期间默认展开，
-  // 收尾后默认收起（跑完只留结尾语）。
-  let processOpenMap = {}; // `${msgId}:${blockIndex}` → true=展开
-  // 单段思考的展开态：流式中默认展开，思考一结束（done）默认自动折叠；
-  // 用户点过就按用户的选择记（每次思考完毕要自动折叠）。
-  let thinkOpenMap = {}; // `${msgId}:${blockIndex}:${itemIndex}` → true=展开
-  function toggleThink(key, currentlyOpen) {
-    thinkOpenMap = { ...thinkOpenMap, [key]: !currentlyOpen };
-  }
-  // 流式滚动区自动跟随（思考框 / 工具参数区同一套）：新分片贴底；
-  // 滚轮往上滚 → 暂停跟随（出「回到底部」按钮）
-  let thinkFollowMap = {}; // `${msgId}:${blockIndex}:${itemIndex}` → 是否跟随
-  let thinkBoxEls = {}; // 同上 → 思考滚动容器（bind:this）
-  let toolFollowMap = {}; // 同上 → 工具参数区是否跟随（写入类工具的参数是流式补长的）
-  let toolPreEls = {}; // 同上 → 工具参数滚动容器（bind:this）
-  // 工具详情折叠（`${msgId}:${toolIndex}` → true=展开）：默认收起，点行展开参数/结果
-  let toolFold = {};
   // —— 任务清单 dock（贴输入框上方、展开向上、与提问上下堆叠）——
   // 清单语义=当前会话最后一次 todo 调用（整表替换）。
   // 手动态规则（2026-11-13 重写，两问同修）：
@@ -2189,14 +2128,6 @@
   function dismissTodoDock() {
     todoDockDismissed = true;
   }
-  // 提问只在该用户作答时出现（pendingQuestions 的交互卡）；答完立即消失——
-  // 不进对话流、不留记录卡（「问题答完为什么还在」）。
-  function toggleProcess(key, currentlyOpen) {
-    processOpenMap = { ...processOpenMap, [key]: !currentlyOpen };
-  }
-  function toggleToolDetail(msgId, idx, currentlyOpen) {
-    toolFold = { ...toolFold, [`${msgId}:${idx}`]: !currentlyOpen };
-  }
   let nowTick = Date.now(); // 实时计时滴答（流式期间每秒更新）
   let tickTimer = null;
   $: anyStreaming = Object.values(sessionMsgs).some((arr) => arr.some((m) => m.role === 'assistant' && m.streaming));
@@ -2226,61 +2157,6 @@
   /// MutationObserver 每次新内容都把位置拽回底部，scroll 事件到达时几何上总在
   /// 底部。改为滚轮/触摸一出手立即停跟（同步，先于任何拽回），scroll 事件只按
   /// 方向判（向上=用户、向下到底=恢复），跟随拽回不误伤。
-  function followScroll(node, active = true) {
-    let following = true;
-    let live = !!active;
-    let lastTop = node.scrollTop;
-    const nearBottom = () => node.scrollHeight - node.scrollTop - node.clientHeight < 24;
-    const setFollowing = (nf) => {
-      if (nf === following) return;
-      following = nf;
-      node.dispatchEvent(new CustomEvent('followchange', { detail: { following: nf } }));
-    };
-    const stick = () => {
-      node.scrollTop = node.scrollHeight;
-      lastTop = node.scrollTop;
-    };
-    const onScroll = () => {
-      const t = node.scrollTop;
-      if (t < lastTop - 1) setFollowing(false); // 上移=用户意图（跟随只会向下拽）
-      else if (nearBottom()) setFollowing(true); // 滚回底部恢复跟随
-      lastTop = t;
-    };
-    const onWheel = (e) => {
-      if (e.deltaY < 0) setFollowing(false);
-    };
-    const onTouchStart = () => setFollowing(false);
-    const mo = new MutationObserver(() => {
-      if (live && following) stick();
-    });
-    node.addEventListener('scroll', onScroll, { passive: true });
-    node.addEventListener('wheel', onWheel, { passive: true });
-    node.addEventListener('touchstart', onTouchStart, { passive: true });
-    mo.observe(node, { childList: true, characterData: true, subtree: true });
-    if (live) stick();
-    return {
-      update(next) {
-        const nl = !!next;
-        if (nl && !live) {
-          // 重新进入流式（新一轮思考）：恢复跟随并贴底
-          following = true;
-          setFollowing(true);
-          stick();
-        }
-        live = nl;
-      },
-      destroy() {
-        node.removeEventListener('scroll', onScroll);
-        node.removeEventListener('wheel', onWheel);
-        node.removeEventListener('touchstart', onTouchStart);
-        mo.disconnect();
-      },
-    };
-  }
-  /// 回到底部（思考框 / 工具参数区共用）：滚到底后 scroll 事件会自行恢复跟随
-  function jumpScroll(el) {
-    if (el) el.scrollTop = el.scrollHeight;
-  }
   /// 复制到剪贴板：优先异步 Clipboard API，拒绝/不可用时退回 execCommand
   /// （无头/权限被拒时前者会失败，不能让「复制」变摆设）
   async function copyText(text) {
@@ -2331,34 +2207,6 @@
   // 工具结果里的截图：browser 截图会把 `![页面截图](/api/workspace/raw?path=...)`
   // 写在结果最前面。**只在收尾展示**（多步任务中途的截图是模型自查用的，静默让
   // 模型自己看；气泡里摊出整轮的每一张只会重复刷屏——真机 2026-11-07「两张一样的图」）：
-  // 调用方在收尾态取最后一张摊开，中途一律不摊；要看中间的走工具行点主语开侧栏预览。
-  // 只认工作区图片，别的链接不放。
-  function shotsFromParts(parts) {
-    const out = [];
-    for (const p of parts || []) {
-      if (p.type !== 'tool' || !p.preview || !p.preview.includes('/api/workspace/')) continue;
-      const m = /!\[[^\]]*\]\((\/api\/workspace\/[^)\s]+)\)/.exec(p.preview);
-      if (m && !out.includes(m[1])) out.push(m[1]);
-    }
-    return out;
-  }
-  // 工具行可点的主语 → 侧栏预览路径（ZCode 式：行上只有文件名，点一下侧边栏看
-  // 内容/图，平时不摊截图）。文件工具从参数拿完整路径（半截 JSON 参数点了没用，
-  // 只认解析成功的）；截图从结果动作文本里拿 screenshots/*.png（结果到了才可点）。
-  function toolPreviewPath(it) {
-    const o = parseArgs(it.args);
-    if (o) {
-      for (const k of ['path', 'file_path', 'file', 'filename']) {
-        const v = o[k];
-        if (typeof v === 'string' && v.trim()) return v.trim();
-      }
-    }
-    if (it.preview) {
-      const m = String(it.preview).match(/screenshots\/[^\s"')]+\.png/);
-      if (m) return m[0];
-    }
-    return null;
-  }
   let webActiveId = '';
   let webAddress = '';
   let webBusy = false;
@@ -2382,14 +2230,14 @@
       body: JSON.stringify(body),
     }).catch(() => {});
   }
-  function webToggleMenu(e) {
+  // A-4 组件化后签名：⋯ 按钮元素由 WebPane 经 menutoggle 事件上行（原收 DOM 事件对象）
+  function webToggleMenu(btn) {
     if (!webNative) {
       webMenuOpen = !webMenuOpen; // 无头：HTML 下拉本地切换
       return;
     }
     // 壳模式：面板矩形 + ⋯ 按钮矩形（都是窗口坐标）交给后端
     const p = document.querySelector('.right-panel');
-    const btn = e && e.currentTarget;
     if (!p || !btn) return;
     const pr = p.getBoundingClientRect();
     const br = btn.getBoundingClientRect();
@@ -2431,16 +2279,33 @@
   let shellModalLive = false; // true = 弹窗态：webview 已移出屏幕，面板走帧流
   let shellSuppressSent = false;
   function shellModalOn() {
-    if (!webNative || !webActive || rpTab !== 'web') return;
-    shellModalLive = true;
-    shellSuppressSent = true;
-    webViewportKey = ''; // 冻结常规矩形上报（期间 webSyncViewport 直接 return）
-    webApi('/api/browser/shell-suppress', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ on: true }),
-    }).catch(() => {});
+    if (!webNative || !webActive || rpTab !== 'web' || shellModalLive) return;
+    // 先把帧照片挂出来、等它加载完再挪 webview：反过来的话原生窗口先消失、
+    // 照片还在请求里——弹窗半透明底罩下面会先空一块再出画面（用户看到就是
+    // 「开窗口时内置浏览器闪一下」，2026-11-16）。照片在 webview 底下加载，
+    // 挪开后露出的是已经画好的那一帧，全程无缝。
+    shellModalLive = true; // 只切帧流；suppress 等照片就绪再发
     webShotT += 1; // 立即拉一帧，不等 600ms 轮询
+    let sent = false;
+    const apply = () => {
+      if (sent) return;
+      sent = true;
+      if (!shellModalLive) return; // 等待期间弹窗又关了：别再挪
+      shellSuppressSent = true;
+      webViewportKey = ''; // 冻结常规矩形上报（期间 webSyncViewport 直接 return）
+      webApi('/api/browser/shell-suppress', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ on: true }),
+      }).catch(() => {});
+    };
+    tick().then(() => {
+      const img = webBodyEl && webBodyEl.querySelector('img.web-shot');
+      if (!img || img.complete) return apply();
+      img.addEventListener('load', apply, { once: true });
+      img.addEventListener('error', apply, { once: true });
+      setTimeout(apply, 200); // 照片慢/挂了也不能把弹窗让位卡死
+    });
   }
   async function shellModalOff() {
     if (!shellSuppressSent && !shellModalLive) return;
@@ -2925,6 +2790,14 @@
     webBusy = false;
   }
 
+  // 页签点击（A-4 起由 WebPane 的 select 事件上行；原内联在 web-pane markup 里）
+  function selectWebTab(t) {
+    webActiveId = t.id;
+    if (!webBusy) webAddress = t.url === 'about:blank' ? '' : t.url || '';
+    webShotT += 1;
+    webActivate(t.id);
+  }
+
   async function webGo() {
     const url = webNormalizeUrl(webAddress);
     if (!url || webBusy) return;
@@ -2972,13 +2845,15 @@
     webBusy = false;
   }
 
-  async function webShotClick(ev) {
+  // A-4 组件化后签名：截图 img 的元素与点击坐标由 WebPane 经 shotclick 事件上行
+  // （原收 DOM 事件对象读 currentTarget/clientX；preventDefault 留在组件侧）
+  async function webShotClick(d) {
     if (!webActive || webBusy) return;
-    const rect = ev.currentTarget.getBoundingClientRect();
-    const nw = ev.currentTarget.naturalWidth || 1280;
-    const nh = ev.currentTarget.naturalHeight || 900;
-    const x = Math.round(((ev.clientX - rect.left) * nw) / rect.width);
-    const y = Math.round(((ev.clientY - rect.top) * nh) / rect.height);
+    const rect = d.el.getBoundingClientRect();
+    const nw = d.el.naturalWidth || 1280;
+    const nh = d.el.naturalHeight || 900;
+    const x = Math.round(((d.x - rect.left) * nw) / rect.width);
+    const y = Math.round(((d.y - rect.top) * nh) / rect.height);
     webBusy = true;
     try {
       await webApi('/api/browser/click', {
@@ -2994,11 +2869,11 @@
 
   // 滚轮合并：连续滚动只按 120ms 批量发一次（deltaY 累加），滚动不独占 busy，
   // 截图在批次结束后刷新——一次一来回会把快速滚动卡成幻灯片。
+  // A-4 组件化后签名：deltaY 由 WebPane 经 shotwheel 事件上行（preventDefault 在组件侧）
   let webScrollPending = 0;
   let webScrollTimer = null;
-  function webShotWheel(ev) {
-    ev.preventDefault();
-    const dy = Math.max(-800, Math.min(800, ev.deltaY || 0));
+  function webShotWheel(d) {
+    const dy = Math.max(-800, Math.min(800, d.deltaY || 0));
     if (!dy || !webActive) return;
     webScrollPending += dy;
     if (webScrollTimer) return;
@@ -3238,36 +3113,7 @@
   }
   // —— 文件预览标签：文本可编辑保存；文档类（docx/xlsx/pptx/pdf）只能预览不能编辑，
   // xlsx/pptx/pdf 连预览组件也不留、内容直出——
-  const RP_IMG_EXT = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico', 'avif']);
-  const RP_PDF_EXT = new Set(['pdf']);
-  const RP_MEDIA_EXT = new Set(['mp4', 'm4v', 'webm', 'mov', 'mp3', 'wav', 'ogg', 'm4a', 'flac']);
-  // 文档容器：docx→mammoth 排版、xlsx→SheetJS 表格、pptx→分页文本（后端结构化）；
-  // ppt(旧版)/odf 走后端文本抽取
-  const RP_DOCX_EXT = new Set(['docx']);
-  const RP_XLSX_EXT = new Set(['xlsx']);
-  const RP_PPTX_EXT = new Set(['pptx']);
-  const RP_DOC_EXT = new Set(['ppt', 'odt', 'ods', 'odp']);
-  function extOf(path) {
-    const i = String(path).lastIndexOf('.');
-    return i > 0 ? String(path).slice(i + 1).toLowerCase() : '';
-  }
-  // 预览形态：image / pdf / media / docx / xlsx / pptx / doc / text
-  function previewKind(path) {
-    const e = extOf(path);
-    if (RP_IMG_EXT.has(e)) return 'image';
-    if (RP_PDF_EXT.has(e)) return 'pdf';
-    if (RP_MEDIA_EXT.has(e)) return 'media';
-    if (RP_DOCX_EXT.has(e)) return 'docx';
-    if (RP_XLSX_EXT.has(e)) return 'xlsx';
-    if (RP_PPTX_EXT.has(e)) return 'pptx';
-    if (RP_DOC_EXT.has(e)) return 'doc';
-    return 'text';
-  }
-  // 后端 200KB 头尾压缩标记（context::OMITTED_MARK）：压缩过的内容拿去保存会把中间
-  // 省略掉的部分整段写没——这类文件不给编辑，宁可不让改也不许写坏文件
-  function previewTruncated(text) {
-    return String(text || '').includes('……[中间省略');
-  }
+  // 预览形态判定（extOf/previewKind/previewTruncated）已迁 lib/panel/preview.js（2026-11-14 阶段 A-2）
   function rpSet(path, patch) {
     rpPreviewCache = { ...rpPreviewCache, [path]: { ...(rpPreviewCache[path] || {}), ...patch } };
   }
@@ -4700,8 +4546,10 @@
     let effectiveMsg = '';
     if (!resume) {
       // 引用对话块只在发送侧拼（模型拿全文），用户气泡保持「我打的那句 + 引用 chip」
+      // 纯附件无文字：模型侧补一句中性引导（2026-11-14 起发送键允许纯附件——
+      // 原文案「媒体文件」在发文档/表格时误导模型，气泡上只显示附件 chip）
       const fullMsg = (text || '') + convBlocks(convs);
-      effectiveMsg = fullMsg.trim() || (atts.length > 0 ? '请查看分析附带的媒体文件' : '');
+      effectiveMsg = fullMsg.trim() || (atts.length > 0 ? '请查看分析附件' : '');
       if (!effectiveMsg) return true;
       // 发送时收起所有输入区菜单
       plusMenuOpen = false;
@@ -5350,12 +5198,6 @@
   }
 
   // —— 消息操作（回滚/编辑/删除/多选）——
-  function fmtTs(ts) {
-    if (!ts) return '';
-    const d = new Date(ts);
-    const p = (n) => String(n).padStart(2, '0');
-    return `${p(d.getHours())}:${p(d.getMinutes())}`;
-  }
   function fmtMs(ms) {
     if (ms == null) return '—';
     return ms >= 1000 ? (ms / 1000).toFixed(1) + ' 秒' : ms + ' ms';
@@ -5417,12 +5259,6 @@
   //    就把本地 running 行接回去；文件里已有完成标记则让位（以文件为真源）。
   // 压缩标记的滚动跟随交给 afterUpdate 的统一规则：钉底就跟随、没钉底不动。
   // （旧的 compactScrollHold 单帧压制已经删除——它对没钉底的人本来就不起作用，
-  //  对钉底的人只会造成「这一帧不跟、下一帧再补」的两段式上弹。）
-  // 压缩失败态（刷新后从文件重建的标记行没有 state，靠文案识别；2026-11-10）
-  function compactFailed(m) {
-    return !!m && m.kind === 'compact_marker'
-      && (m.state === 'failed' || (typeof m.content === 'string' && m.content.includes('压缩失败')));
-  }
   // 失败后手动重试：清服务端的「暂停自动压缩」标记，下轮收尾重新走触发判定。
   async function retryCompact(m) {
     const sid = currentSessionId;
@@ -5589,7 +5425,8 @@
   }
 
   function beginEdit(m) {
-    editingMsg = { id: m.id, text: m.content, attachments: m.attachments || [] };
+    // 引用 chip 跟着这条走：编辑框里只有原话，重发时再把引用块拼回去
+    editingMsg = { id: m.id, text: m.content, attachments: m.attachments || [], convs: m.convs || [] };
   }
 
   /// 消息上的附件 → 可发送的附件对象（编辑重发用）：本轮消息自带 data；
@@ -5625,8 +5462,9 @@
     const wasPinned = chatPinned;
     // 点保存这一刻的视口就是标准：编辑框收起、截断、重发全过程都用它
     if (!wasPinned) beginScrollFreeze(key);
-    // 编辑重发不能把附件丢掉（2026-11-10）：原消息上的附件随这条一起重发
+    // 编辑重发不能把附件/引用对话丢掉（2026-11-10 / 2026-11-16）：跟着这条一起重发
     const atts = await attachmentsForSend(editingMsg?.attachments || target?.attachments || []);
+    const convs = (editingMsg?.convs || target?.convs || []).slice();
     editingMsg = null;
     if (!text || !target) {
       scrollFreeze = null;
@@ -5652,7 +5490,7 @@
         scrollFreeze = null;
       }
       // 编辑后的文本走正常发送路（时间戳/流式/落盘全在既有链路上）
-      await deliver(key, text, atts, {});
+      await deliver(key, text, atts, { convs });
     } catch (e) {
       scrollFreeze = null;
       scrollSpacerPx = 0;
@@ -6171,50 +6009,12 @@
   let sidebarView = localStorage.getItem('sidebarView') === 'list' ? 'list' : 'workspace'; // 按工作区 | 单列表
   let expandedFlags = { __ungrouped__: true, ...(JSON.parse(localStorage.getItem('projExpanded') || '{}') || {}) }; // path → 展开？
   let showAllFlags = {}; // path → 展开全部会话（默认每项目先显 5 条）
-  let searchOpen = false;
   let searchQuery = '';
   let manageMode = false;
   let checkedIds = [];
   let sidebarCollapsed = false;
-  let sidebarW = Number(localStorage.getItem('sidebarW')) || 280; // 初始宽度刚好放下品牌名（右缘拖拽可调，240–720）
   let resizing = false;
 
-  // 侧栏右缘拖拽调宽：按住手柄移动鼠标，松手持久化（240–720）。
-  // 指针事件 + setPointerCapture：捕获后所有 pointermove/pointerup/pointercancel
-  // 都路由到手柄元素——光标挪到 iframe 上、窗口外、别的元素上都不会丢事件。
-  // 早两版用 window 级 mousemove/mouseup 监听，真机（Tauri WebView2）实测两类
-  // 症状：拖到某处像被卡住要来回蹭、松手后侧栏还跟着没按住的鼠标跑（mouseup 丢了）。
-  // 宽度在手柄里**直接**应用：Chromium 对 mousemove/pointermove 按帧合并（规范动作），
-  // 125Hz+ 鼠标也是一帧一次写入；不做 rAF 中转——rAF 在壳里可能被节流，中转一下
-  // 反而表现成「侧栏冻住不跟手」（同一批真机反馈）。
-  function startResize(e) {
-    if (e.button !== 0) return; // 只认左键（触摸/笔的 button 也是 0，一并支持）
-    e.preventDefault();
-    resizing = true;
-    const handle = e.currentTarget;
-    try {
-      handle.setPointerCapture(e.pointerId);
-    } catch (err) {
-      /* 捕获失败（极端环境）下退回 DOM 冒泡也能拖，不阻断 */
-    }
-    document.body.style.cursor = 'col-resize';
-    document.body.style.userSelect = 'none';
-    const move = (ev) => {
-      sidebarW = Math.min(720, Math.max(240, Math.round(ev.clientX)));
-    };
-    const up = () => {
-      resizing = false;
-      document.body.style.cursor = '';
-      document.body.style.userSelect = '';
-      localStorage.setItem('sidebarW', String(sidebarW));
-      handle.removeEventListener('pointermove', move);
-      handle.removeEventListener('pointerup', up);
-      handle.removeEventListener('pointercancel', up);
-    };
-    handle.addEventListener('pointermove', move);
-    handle.addEventListener('pointerup', up);
-    handle.addEventListener('pointercancel', up);
-  }
   // 终端面板高度（上缘拖拽可调，120–560，持久化）
   let termH = Number(localStorage.getItem('termH')) || 260;
   let termResizing = false;
@@ -6371,11 +6171,10 @@
 
   async function switchProject(path) {
     if (normPath(path).toLowerCase() === normPath(workspace).toLowerCase()) return;
-    if (Object.keys(streams).length > 0) {
-      // 切项目会重置所有会话缓冲。同上：拒绝可以，但要让人看见原因
-      await confirmAsk('有会话正在运行，等它跑完再切换项目。', true);
-      return;
-    }
+    // 不再有「有会话在跑就拦」的门禁（2026-11-14 用户：跑着为什么不让切）：那道闸是
+    // 09-29 按「切项目会重置所有会话缓冲」加的，11-05 applyWorkspace 重做后理由
+    // 已不成立——切工作区只是换视图，在跑的流/缓冲/排队/账本原样保留（'@new' 除外，
+    // 它属于旧工作区，切走即弃）。闸留着反而把 11-05 的能力整个挡死。
     await applyWorkspace(path);
   }
 
@@ -6390,10 +6189,6 @@
 
 
   // —— 工具栏四键：搜索 / 管理 / 视图 / 添加项目 ——
-  function toggleSearch() {
-    searchOpen = !searchOpen;
-    if (!searchOpen) searchQuery = '';
-  }
 
   function enterManage() {
     sideMenuOpen = false;
@@ -6670,7 +6465,20 @@
       if (m.role === 'user') {
         // steered=引导消息（2026-10-22）：渲染成「已引导」轻量行，不占气泡位
         // attachments：刷新后气泡上的附件预览靠它还原（2026-11-10）
-        out.push({ id: stableId(m), role: 'user', content: contentText(m.content), attachments: m.attachments || undefined, steered: !!m.steered, interrupted: !!m.interrupted, ts: m.ts, cp: m.cp });
+        // 引用对话块：文件里存的是拼好的全文（模型要），气泡只显示原话 + chip
+        //（2026-11-16：分叉/重开会话时整段被引用对话铺进消息流）
+        const split = splitConvBlocks(contentText(m.content));
+        out.push({
+          id: stableId(m),
+          role: 'user',
+          content: split.text,
+          attachments: m.attachments || undefined,
+          convs: m.convs && m.convs.length ? m.convs : split.convs.length ? split.convs : undefined,
+          steered: !!m.steered,
+          interrupted: !!m.interrupted,
+          ts: m.ts,
+          cp: m.cp,
+        });
       } else if (m.role === 'assistant') {
         const asst = {
           id: stableId(m),
@@ -7576,13 +7384,11 @@
     // 插件制作器：在指定工作区新建对话并把提示词预填进输入框（不代发——用户自己审自己回车）。
     // 机制全是现成管道的拼装：切工作区走 applyWorkspace（与「在项目内新建会话」同路，
     // 没切成就停下，否则会话会落到别的项目里），建会话走 startNewSession，预填就是
-    // 给 bind:value={input} 赋值。有会话在跑时拒绝：切项目会断流，那轮就白跑了。
+    // 给 bind:value={input} 赋值。不拦「有会话在跑」：11-05 起 applyWorkspace 保留
+    // 在跑的流（切工作区只是换视图），旧理由「切项目会断流」已不成立（2026-11-14 拆闸）。
     'session.create': {
       bridge: true, perm: 'session.create', title: '在指定工作区新建对话并预填输入框',
       async run({ reply, params }) {
-        if (Object.keys(streams).length > 0) {
-          return reply(false, '有会话正在运行，等它跑完再试');
-        }
         const ws = String(params.workspace || '').trim();
         if (ws && normPath(ws).toLowerCase() !== normPath(workspace).toLowerCase()) {
           await applyWorkspace(ws);
@@ -8133,22 +7939,17 @@
   }
   $: reportUiState(sidebarCollapsed, rightPanelOpen, rpTabs, terminalOpen, settingsOpen, themeMode);
 
-  try {
-    const uiEventsSrc = new EventSource('/api/ui/events');
-    // 连上/重连即重拉一次设置与插件清单（2026-10-05）：服务重启（换二进制/崩溃恢复）
-    // 后事件流会断线自动重连，但断连期间推的事件全丢了——页面会一直显示重启前的旧态，
-    // 用户以为「又没刷新」。onopen 在首次连接也会触发，多一次 GET 无害。
-    uiEventsSrc.onopen = () => { loadExt(); loadSettings(); loadSubagentHistory(); };
-    uiEventsSrc.onmessage = async (ev) => {
-      let m;
-      try { m = JSON.parse(ev.data); } catch { return; }
+  // 全局事件流（/api/ui/events）：连接生命周期在 lib/events.js，这里只给回调。
+  connectUiEvents({
+    onOpen: () => { loadExt(); loadSettings(); loadSubagentHistory(); },
+    onEvent: async (m) => {
       // 查表执行（UI_OPS 通用入口）：新界面事件只在前端注册表加一行，后端 fire_event
       // 白名单/本处都不再为它写分支。未登记的 kind 静默忽略（老服务推的/别的来源）；
       // 桥条目（bridge: true）只归 postMessage 分发，SSE 侧够不着。
       const op = UI_OPS[m.kind];
       if (op && !op.bridge) await op.run(m);
-    };
-  } catch {}
+    },
+  });
 
   // 已启用的扩展（停用的不加载、不给按钮）
   $: enabledExts = extList.filter((e) => e.enabled !== false && e.ok);
@@ -8199,7 +8000,6 @@
     rpStripBar = { track, w, x };
   }
   afterUpdate(rpStripSync); // 标签增删/面板拖宽都会触发组件更新，顺带重算；拖动中由 on:scroll 补
-  afterUpdate(webStripSync); // 网页页签同款：增删/拖宽重算滑杆
   let rpStripDrag = null; // { x0, s0 } 按下时指针 x 与 scrollLeft
   function rpStripDown(e) {
     const el = rpStripEl;
@@ -8218,40 +8018,6 @@
   }
   function rpStripUp() {
     rpStripDrag = null;
-  }
-  // 网页页签滑杆（「和右侧边栏那一条一样」）：同 rp-strip 模式，
-  // 压在 .web-tabbar 下边框线上，页签多到溢出时出现，可点可拖。
-  let webStripEl = null;
-  let webStripBar = null; // { track, w, x } px；null = 没溢出
-  function webStripSync() {
-    const el = webStripEl;
-    if (!el || el.scrollWidth <= el.clientWidth + 1) {
-      if (webStripBar) webStripBar = null;
-      return;
-    }
-    const track = el.clientWidth;
-    const w = Math.max(24, Math.round((track * track) / el.scrollWidth));
-    const x = Math.round(((track - w) * el.scrollLeft) / (el.scrollWidth - track));
-    webStripBar = { track, w, x };
-  }
-  let webStripDrag = null; // { x0, s0 }
-  function webStripDown(e) {
-    const el = webStripEl;
-    if (!el || !webStripBar) return;
-    const r = el.getBoundingClientRect();
-    const ratio = Math.min(1, Math.max(0, (e.clientX - r.left - webStripBar.w / 2) / (webStripBar.track - webStripBar.w)));
-    el.scrollLeft = ratio * (el.scrollWidth - webStripBar.track);
-    webStripDrag = { x0: e.clientX, s0: el.scrollLeft };
-    e.currentTarget.setPointerCapture(e.pointerId);
-  }
-  function webStripMove(e) {
-    const el = webStripEl;
-    if (!el || !webStripDrag || !webStripBar) return;
-    const span = Math.max(1, webStripBar.track - webStripBar.w);
-    el.scrollLeft = webStripDrag.s0 + ((e.clientX - webStripDrag.x0) * (el.scrollWidth - el.clientWidth)) / span;
-  }
-  function webStripUp() {
-    webStripDrag = null;
   }
   // 面板打开时待投递的插槽事件（iframe 还没 load 完就先排队）
   let extPendingMsgs = [];
@@ -8820,207 +8586,47 @@
     <!-- 拖文件进窗口时的投放提示：pointer-events:none，绝不挡住 drop 自身 -->
     <div class="drop-veil" aria-hidden="true">松开即可添加附件</div>
   {/if}
-  <aside class="sidebar" class:collapsed={sidebarCollapsed} class:resizing={resizing} style="width:{sidebarW}px">
-    <div class="side-head">
-      <div class="brand-row">
-        <span class="brand-mark" aria-hidden="true"><img src="/pawch-icon.svg" alt="" /></span>
-        <span class="brand-name">Pawch Agent</span>
-        <button class="icon-btn" class:on={true} title="收起侧栏" on:click={() => (sidebarCollapsed = true)}>
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4.5" width="18" height="15" rx="3.2"/><line x1="9.8" y1="4.5" x2="9.8" y2="19.5"/></svg>
-        </button>
-        <!-- 重新加载界面（铁律 1 配套，2026-10-31）：前端换新构建后点一下丢旧代码。
-             带时间戳强制拉最新入口（assets 带 hash，不受缓存影响）。 -->
-        <button class="icon-btn" title="重新加载界面（前端更新后点这个）" on:click={() => (location.href = location.pathname + '?r=' + Date.now())}>
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 1 0-2.3 6"/><path d="M20 5v6h-6"/></svg>
-        </button>
-      </div>
-
-      <button class="new-chat" on:click={startNewSession}>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8" stroke-linecap="round"/></svg>
-        新对话
-      </button>
-
-      <div class="section-row bar-menu">
-        <span class="section-label">工作区</span>
-        <span class="section-tools">
-          <button class="icon-btn" class:on={searchOpen} title="搜索会话" on:click={toggleSearch}>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.3" y2="16.3"/></svg>
-          </button>
-          <button class="icon-btn" class:on={sideMenuOpen || manageMode} title="视图与会话管理" on:click={() => (sideMenuOpen = !sideMenuOpen)}>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><line x1="4" y1="7.5" x2="20" y2="7.5"/><circle cx="9.5" cy="7.5" r="2.2"/><line x1="4" y1="16.5" x2="20" y2="16.5"/><circle cx="14.5" cy="16.5" r="2.2"/></svg>
-          </button>
-          <button class="icon-btn" title="添加项目" on:click={addProject}>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11.2v5.8a2 2 0 0 1-2 2H5.5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h3.2l1.8 2H18a2 2 0 0 1 2 2v.2"/><line x1="17" y1="2.5" x2="17" y2="8"/><line x1="14.2" y1="5.2" x2="19.8" y2="5.2"/></svg>
-          </button>
-        </span>
-        {#if sideMenuOpen}
-          <div class="side-menu view-menu">
-            <button on:click={() => pickView('workspace')}>
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M20 19.5a1.8 1.8 0 0 0 1.8-1.8V8.3a1.8 1.8 0 0 0-1.8-1.8h-7.4a1.8 1.8 0 0 1-1.5-.8l-.8-1.2a1.8 1.8 0 0 0-1.5-.8H4a1.8 1.8 0 0 0-1.8 1.8v12.2A1.8 1.8 0 0 0 4 19.5Z"/></svg>
-              <span>按工作区分组</span>
-              {#if sidebarView === 'workspace'}<svg class="sel-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>{/if}
-            </button>
-            <button on:click={() => pickView('list')}>
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><line x1="4" y1="6.5" x2="20" y2="6.5"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="17.5" x2="20" y2="17.5"/></svg>
-              <span>单列表</span>
-              {#if sidebarView === 'list'}<svg class="sel-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>{/if}
-            </button>
-            <div class="menu-sep"></div>
-            <button on:click={enterManage}>
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="4" width="7" height="7" rx="1.5"/><path d="m5.2 7.6 1.4 1.4 2.4-2.6"/><rect x="13.5" y="4" width="7" height="7" rx="1.5"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.5"/></svg>
-              <span>会话管理</span>
-            </button>
-          </div>
-        {/if}
-      </div>
-
-      {#if searchOpen}
-        <input class="side-search" bind:value={searchQuery} placeholder="搜索会话" />
-      {/if}
-
-      {#if manageMode}
-        <div class="manage-bar">
-          <span class="m-count">已选 {checkedIds.length} / {manageTotal}</span>
-          <button class="m-btn" on:click={() => (checkedIds = manageVisibleIds())}>全选</button>
-          <button class="m-btn danger" disabled={!checkedIds.length} on:click={batchDelete}>删除所选</button>
-          <button class="m-btn primary" on:click={exitManage}>完成</button>
-        </div>
-      {/if}
-    </div>
-
-    <div class="side-scroll">
-      {#each displayRows as row}
-        {#if row.type === 'proj'}
-          <div
-            class="proj"
-            class:expanded={!!searchQ || !!expandedFlags[row.path]}
-            class:active={row.active}
-            role="button"
-            tabindex="0"
-            title={row.path === '__ungrouped__' ? '无工作区记录的历史会话' : row.path === '__legacy__' ? '以前同名文件夹留下的旧会话（文件夹删掉重建后归到这里）' : `${row.path}（点行切换项目，点左侧图标展开/收起列表）`}
-            on:click={() => ((row.path === '__ungrouped__' || row.path === '__legacy__' || row.active) ? toggleProjectRow(row.path) : switchProject(row.path))}
-            on:keydown={(e) => e.key === 'Enter' && ((row.path === '__ungrouped__' || row.path === '__legacy__' || row.active) ? toggleProjectRow(row.path) : switchProject(row.path))}
-          >
-            <!-- 展开/收起：独立按钮，任何项目都能点开看会话（点行本身仍是切换项目） -->
-            <button
-              class="proj-toggle"
-              title={!!searchQ || !!expandedFlags[row.path] ? '收起会话列表' : '展开会话列表'}
-              on:click|stopPropagation={() => toggleProjectRow(row.path)}
-            >
-              {#if !!searchQ || !!expandedFlags[row.path]}
-                <svg viewBox="0 0 24 24"><path d="M6.5 9.2 12 14.7l5.5-5.5z" fill="currentColor"/></svg>
-              {:else}
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M20 19.5a1.8 1.8 0 0 0 1.8-1.8V8.3a1.8 1.8 0 0 0-1.8-1.8h-7.4a1.8 1.8 0 0 1-1.5-.8l-.8-1.2a1.8 1.8 0 0 0-1.5-.8H4a1.8 1.8 0 0 0-1.8 1.8v12.2A1.8 1.8 0 0 0 4 19.5Z"/></svg>
-              {/if}
-            </button>
-            <span class="proj-name">{row.name}{row.count ? '' : ''}</span>
-            {#if row.running}<span class="conv-spin" title="这个项目里有会话正在跑" aria-label="有会话正在运行"></span>{/if}
-            {#if row.active}<span class="proj-cur" title="当前项目"></span>{/if}
-            {#if row.path === '__legacy__'}
-              <span class="proj-side">
-                <button class="row-btn" title="清空这些历史会话" on:click|stopPropagation={clearLegacySessions}>
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6.5h18"/><path d="M8 6.5V4.8A1.3 1.3 0 0 1 9.3 3.5h5.4A1.3 1.3 0 0 1 16 4.8v1.7"/><path d="M5.5 6.5 6.4 19a2 2 0 0 0 2 1.9h7.2a2 2 0 0 0 2-1.9l.9-12.5"/></svg>
-                </button>
-              </span>
-            {:else if row.path !== '__ungrouped__'}
-              <span class="proj-side">
-                <button class="row-btn" class:on={projMenuPath === row.path} title="项目操作" on:click|stopPropagation={() => (projMenuPath = projMenuPath === row.path ? null : row.path)}>
-                  <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5.5" cy="12" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="18.5" cy="12" r="1.5"/></svg>
-                </button>
-                <button class="row-btn" title="在项目内新建会话" on:click|stopPropagation={() => newSessionInProject(row.path, row.active)}>
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
-                </button>
-              </span>
-            {/if}
-            {#if projMenuPath === row.path}
-              <div class="side-menu proj-menu">
-                <button on:click|stopPropagation={() => { projMenuPath = null; renameModal = { kind: 'project', target: row.path, value: row.name }; }}>
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M16.8 3.7a2.1 2.1 0 0 1 3 3L7.3 19.2 3 20.3l1.1-4.3Z"/><path d="M13.5 20h7"/></svg>
-                  重命名项目
-                </button>
-                {#if row.active}
-                  <!-- 多文件夹项目（2026-11-04）：只有当前项目能改文件夹（端点按当前工作区生效） -->
-                  <button on:click|stopPropagation={() => { projMenuPath = null; foldersMsg = ''; foldersModal = true; }}>
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M3.5 7.2c0-1 .8-1.7 1.7-1.7h4l1.9 2.2h8.2c1 0 1.7.8 1.7 1.7v8.4c0 1-.8 1.7-1.7 1.7H5.2c-1 0-1.7-.8-1.7-1.7Z"/><path d="M3.5 10.5h17"/></svg>
-                    项目文件夹
-                  </button>
-                {/if}
-                <button on:click|stopPropagation={() => removeProject(row.path, row.name)}>
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6.5h18"/><path d="M8 6.5V4.8A1.3 1.3 0 0 1 9.3 3.5h5.4A1.3 1.3 0 0 1 16 4.8v1.7"/><path d="M5.5 6.5 6.4 19a2 2 0 0 0 2 1.9h7.2a2 2 0 0 0 2-1.9l.9-12.5"/></svg>
-                  删除项目
-                </button>
-              </div>
-            {/if}
-          </div>
-        {:else if row.type === 'conv'}
-          {@const s = row.s}
-          <div
-            class="conv"
-            class:active={s.id === currentSessionId}
-            role="button"
-            tabindex="0"
-            on:click={() => (manageMode ? toggleChecked(s.id) : loadSession(s.id))}
-            on:keydown={(e) => e.key === 'Enter' && (manageMode ? toggleChecked(s.id) : loadSession(s.id))}
-          >
-            {#if manageMode}
-              <span class="conv-check" class:on={checkedIds.includes(s.id)}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg></span>
-            {/if}
-            {#if runningIds.has(s.id)}
-              <!-- 运行中：不管本页有没有这条会话的流（切走的/别的窗口起的）都转圈 -->
-              <span class="conv-spin" title="正在运行" aria-label="正在运行"></span>
-            {/if}
-            <span class="conv-title" title={s.title}>{s.title}</span>
-            {#if !manageMode && s.pinned}
-              <!-- 置顶标记：标准图钉，放标题右侧（放最左会把标题整体挤开） -->
-              <svg class="conv-pin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-label="已置顶"><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/></svg>
-            {/if}
-            {#if !manageMode}
-              <button class="conv-more" title="会话操作" on:click|stopPropagation={() => (sessMenuId = sessMenuId === s.id ? null : s.id)}>
-                <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5.5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="18.5" cy="12" r="1.6"/></svg>
-              </button>
-            {/if}
-            <span class="conv-time">{relShort(s.updated_at)}</span>
-            {#if sessMenuId === s.id}
-              <div class="side-menu sess-menu">
-                <button on:click|stopPropagation={() => togglePin(s)}>
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/></svg>
-                  {s.pinned ? '取消置顶' : '置顶'}
-                </button>
-                <button on:click|stopPropagation={() => { sessMenuId = null; renameModal = { kind: 'session', target: s.id, value: s.title, orig: s.title }; }}>
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M16.8 3.7a2.1 2.1 0 0 1 3 3L7.3 19.2 3 20.3l1.1-4.3Z"/><path d="M13.5 20h7"/></svg>
-                  重命名
-                </button>
-                <button on:click|stopPropagation={() => deleteSessionRow(s)}>
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
-                  删除会话
-                </button>
-              </div>
-            {/if}
-          </div>
-        {:else if row.type === 'more'}
-          <button class="expand-more" on:click={() => (showAllFlags = { ...showAllFlags, [row.path]: !row.all })}>
-            {row.all ? '收起会话' : `展开其余 ${row.rest} 个会话`}
-          </button>
-        {:else}
-          <div class="side-empty">{searchQ ? '没有匹配的会话' : '暂无会话，点上方「新对话」开始'}</div>
-        {/if}
-      {/each}
-    </div>
-
-    <div class="side-foot">
-      {#if features.galaxy}
-      <button class="foot-btn galaxy-btn" on:click={() => (galaxyOpen = true)} title="记忆库：以星云看每一次会话，支持语义搜索">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/><ellipse cx="12" cy="12" rx="9.2" ry="3.6" transform="rotate(-24 12 12)"/><circle cx="19.4" cy="8.6" r="1.1" fill="currentColor" stroke="none"/><circle cx="5.2" cy="15.2" r="0.9" fill="currentColor" stroke="none"/></svg>
-        记忆库
-      </button>
-      {/if}
-      <button class="foot-btn galaxy-btn" on:click={() => (settingsOpen = true)}>
-        <svg class="settings-gear" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09A1.7 1.7 0 0 0 9 19.4a1.7 1.7 0 0 0-1.88.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.34-1.88l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 9 4.6h.09A1.7 1.7 0 0 0 10 3.05V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.88-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 19.4 9v.09a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1.01z"/></svg>
-        设置
-      </button>
-    </div>
-    <div class="resize-handle" on:pointerdown={startResize}></div>
-  </aside>
+  <Sidebar
+    collapsed={sidebarCollapsed}
+    bind:resizing
+    bind:searchQuery
+    sidebarView={sidebarView}
+    expandedFlags={expandedFlags}
+    bind:showAllFlags
+    bind:sideMenuOpen
+    bind:sessMenuId
+    bind:projMenuPath
+    bind:manageMode
+    bind:checkedIds
+    {displayRows}
+    {searchQ}
+    {manageTotal}
+    {runningIds}
+    {currentSessionId}
+    galaxy={features.galaxy}
+    on:newchat={startNewSession}
+    on:collapse={() => (sidebarCollapsed = true)}
+    on:toggle-project={(e) => toggleProjectRow(e.detail)}
+    on:pick-view={(e) => pickView(e.detail)}
+    on:enter-manage={enterManage}
+    on:exit-manage={exitManage}
+    on:toggle-check={(e) => toggleChecked(e.detail)}
+    on:select-all={() => (checkedIds = manageVisibleIds())}
+    on:batch-delete={batchDelete}
+    on:switch-project={(e) => switchProject(e.detail)}
+    on:new-session-in-project={(e) => newSessionInProject(e.detail.path, e.detail.active)}
+    on:add-project={addProject}
+    on:rename-project={(e) => (renameModal = { kind: 'project', target: e.detail.path, value: e.detail.name })}
+    on:open-folders={() => { foldersMsg = ''; foldersModal = true; }}
+    on:remove-project={(e) => removeProject(e.detail.path, e.detail.name)}
+    on:clear-legacy={clearLegacySessions}
+    on:open-session={(e) => loadSession(e.detail)}
+    on:toggle-pin={(e) => togglePin(e.detail)}
+    on:rename-session={(e) => (renameModal = { kind: 'session', target: e.detail.id, value: e.detail.title, orig: e.detail.title })}
+    on:delete-session={(e) => deleteSessionRow(e.detail)}
+    on:open-galaxy={() => (galaxyOpen = true)}
+    on:open-settings={() => (settingsOpen = true)}
+  />
 
   <main class="chat" class:side-collapsed={sidebarCollapsed}>
     {#if sidebarCollapsed}
@@ -9101,403 +8707,42 @@
     {/if}
 
     <div class="chat-main">
-      <div class="chat-body" bind:this={chatBody} on:scroll={onChatScroll}>
-      {#if startupError}
-        <!-- 启动失败必须可见：服务未就绪时不许只留一个空对话（2026-10-27 实测） -->
-        <div class="msg error-row startup-error">
-          <div class="error-bubble">{startupError}</div>
-          <button class="btn ghost" on:click={() => location.replace('/?t=' + Date.now())}>重试</button>
-        </div>
-      {/if}
-      {#if messages.length === 0}
-        <div class="empty-hint"><div class="empty-title">开始新的对话</div><div class="empty-sub">输入消息后按 Enter 发送，支持粘贴截图与拖拽文件</div></div>
-      {/if}
-      {#each messageChunks as c (c.key)}
-        <!-- 块级 content-visibility（单条 .msg 的规则已挪到 .cv-chunk） -->
-        <div class="cv-chunk" style:contain-intrinsic-size={`auto ${c.n * 140}px`}>
-          {#each c.msgs as m (m.id)}
-        {#if m.role === 'user'}
-          {#if m.steered}
-            <!-- 引导消息：静默轻量行（引导不打断、不占对话气泡位） -->
-            <div class="steer-line" title="引导消息：不打断当时的对话，静默并入了那一轮">
-              <span class="steer-line-badge">已引导</span>
-              <span class="steer-line-text">{m.content}</span>
-            </div>
-          {:else}
-          <div class="msg user" data-mid={m.id} class:selecting={msgSelectMode} on:click={() => selectRow(m)}>
-            {#if msgSelectMode && !m.queued}
-              <span class="msg-check" title="选中这条消息">
-                <input type="checkbox" checked={msgSelected.includes(m.id)} tabindex="-1" />
-              </span>
-            {/if}
-            <div class="msg-stack">
-            {#if editingMsg && editingMsg.id === m.id}
-              <!-- 编辑态：原位变输入框；保存=回滚到这条之前+以新文本重发（先停输出） -->
-              <div class="bubble user-bubble edit-box">
-                <textarea class="edit-area" bind:value={editingMsg.text} rows="3"></textarea>
-                {#if editingMsg.attachments && editingMsg.attachments.length > 0}
-                  <div class="edit-att-hint">附件 {editingMsg.attachments.length} 个会随这条一起重发</div>
-                {/if}
-                <div class="edit-actions">
-                  <button class="btn primary" on:click={saveEdit} on:mousedown|preventDefault>保存并重发</button>
-                  <button class="btn ghost" on:click={() => (editingMsg = null)}>取消</button>
-                  <span class="edit-hint">保存会先停止正在跑的输出</span>
-                </div>
-              </div>
-            {:else}
-              <div class="bubble user-bubble">
-              {#if m.attachments && m.attachments.length > 0}
-                <div class="msg-attachments">
-                  {#each m.attachments as a}
-                    <!-- 本轮消息带 data（data URL，即时显示）；刷新/重开会话后只剩元数据，
-                         走 /api/workspace/raw 从 .attachments/ 读回（2026-11-10 修「刷新丢附件」） -->
-                    {@const src = a.data || (a.path ? `/api/workspace/raw?path=${encodeURIComponent(a.path)}` : '')}
-                    {#if a.mime && a.mime.startsWith('image/')}
-                      <img
-                        class="msg-att-img"
-                        {src}
-                        alt={a.name}
-                        title="点击查看原图"
-                        on:click={() => (previewImageModal = src)}
-                      />
-                    {:else if a.mime && a.mime.startsWith('video/')}
-                      {#if vidNoFrame[vidNoFrameKey(m, a)]}
-                        <!-- 解不出画面（多为 H.265，本机 WebView2 缺解码器）：降级成文件条，
-                             点击用系统默认播放器打开——预览不了不等于用不了 -->
-                        <button
-                          class="msg-att-file msg-att-file-act"
-                          title="该视频的编码本机无法预览画面（多为 H.265/HEVC），点击用系统播放器打开"
-                          on:click|stopPropagation={() => openAttachmentExternal(a)}
-                        ><svg class="att-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m8 12.5 6.5-6.5a2.8 2.8 0 0 1 4 4L9 19.5a4.5 4.5 0 0 1-6.4-6.4l8.5-8.5"/></svg> {a.name}</button>
-                      {:else}
-                        <!-- preload=metadata + playsinline：帧信息尽早加载、内联播放（2026-11-10）。
-                             src 带 #t=0.1：强制解码并显示首帧——有些环境（WebView2+手机录屏 mp4）
-                             元数据读得到却不出首帧，渲染成空画面+底部播放条（2026-11-11）。
-                             data URL 不能带 fragment，只对 http src 追加。 -->
-                        <video
-                          class="msg-att-video"
-                          controls
-                          preload="metadata"
-                          playsinline
-                          src={src.startsWith('data:') ? src : src + '#t=0.1'}
-                          on:loadedmetadata={(e) => vidMetaFail(m, a, e)}
-                          on:error={() => (vidNoFrame = { ...vidNoFrame, [vidNoFrameKey(m, a)]: true })}
-                        >
-                          <track kind="captions" />
-                        </video>
-                      {/if}
-                    {:else if a.mime && a.mime.startsWith('audio/')}
-                      <audio class="msg-att-audio" controls {src}></audio>
-                    {:else}
-                      <div class="msg-att-file"><svg class="att-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m8 12.5 6.5-6.5a2.8 2.8 0 0 1 4 4L9 19.5a4.5 4.5 0 0 1-6.4-6.4l8.5-8.5"/></svg> {a.name}</div>
-                    {/if}
-                  {/each}
-                </div>
-              {/if}
-              {#if m.content}
-                <!-- /技能 与 @引用 发出去后仍带强调色（与输入框浮层同一套 token 与配色） -->
-                <div class="user-text">{@html userMsgHtml(m.content)}</div>
-              {/if}
-              {#if m.convs && m.convs.length}
-                <!-- 引用对话只在气泡上挂 chip（正文发送时已整块拼给模型，不上屏刷屏） -->
-                <div class="msg-convs">
-                  {#each m.convs as cv}
-                    <span class="conv-tag" title={`已把对话「${cv.title}」作为上下文发给模型`}>对话 · {cv.title}</span>
-                  {/each}
-                </div>
-              {/if}
-              {#if m.queued}
-                <div class="queued-row">
-                  <span class="queued-badge">排队中 · 这一轮结束后自动发送</span>
-                  <button class="queued-send" on:click={() => sendNow(m.id, 'interrupt')} title="停止当前这一轮，这条消息作为新一轮重新开始">立即发送</button>
-                  <button class="queued-send" on:click={() => sendNow(m.id, 'steer')} title="不打断：跑完当前这步就并入本轮。静默生效，不占对话气泡">引导</button>
-                </div>
-              {:else if m.steered}
-                <div class="queued-row"><span class="queued-badge steered">已引导当前回答</span></div>
-              {/if}
-            </div>
-            {#if !msgSelectMode && !m.queued}
-              <!-- 操作条在消息下方：时间贴行边、功能贴另一边；图标+tooltip，不占正文 -->
-              <div class="msg-meta user-meta">
-                {#if m.ts}<span class="msg-ts">{fmtTs(m.ts)}</span>{/if}
-                <span class="msg-acts" on:click|stopPropagation>
-                  <button class="msg-act" title="回滚：文件恢复到这条消息之前，并删掉这条和它之后的所有消息" aria-label="回滚" on:click|stopPropagation={() => rollbackMsg(m)}>
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/></svg>
-                  </button>
-                  <button class="msg-act" title="编辑并重发（会先停止正在跑的输出）" aria-label="编辑" on:click|stopPropagation={() => beginEdit(m)}>
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
-                  </button>
-                  <button class="msg-act" title="从这条消息分叉：复制到这条消息为止的对话到新会话，原对话不动" aria-label="分叉" on:click|stopPropagation={() => forkMsg(m)}>
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M5 6.5h11"/><circle cx="18.3" cy="6.5" r="1.7"/><path d="M5 6.5c5.5 0 3.5 11 9.5 11"/><circle cx="18.3" cy="17.5" r="1.7"/></svg>
-                  </button>
-                  <button class="msg-act" title="删除这条消息（同一问答的另一半保留；不可恢复）" aria-label="删除" on:click|stopPropagation={() => deleteMsg(m)}>
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
-                  </button>
-                  <button class="msg-act" title="多选消息：批量删除或生成上下文摘录" aria-label="多选" on:click|stopPropagation={enterSelect}>
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><path d="M14 6.5h7"/><path d="M14 17.5h7"/></svg>
-                  </button>
-                </span>
-              </div>
-            {/if}
-            {/if}
-            </div>
-          </div>
-          {/if}
-        {:else if m.role === 'assistant'}
-          {@const shots = shotsFromParts(messageParts(m))}
-          <div class="msg assistant" data-mid={m.id} class:selecting={msgSelectMode} on:click={() => selectRow(m)}>
-            {#if msgSelectMode && !m.streaming}
-              <span class="msg-check" title="选中这条回复">
-                <input type="checkbox" checked={msgSelected.includes(m.id)} tabindex="-1" />
-              </span>
-            {/if}
-            <div class="msg-stack">
-            <div class="bubble asst-bubble">
-              {#if m.streaming && m.workStartedAt}
-                <div class="turn-bar live">
-                  <span class="live-dot"></span>
-                  <span>正在工作</span>
-                  <span class="turn-time">{fmtDurCn(nowTick - m.workStartedAt)}</span>
-                </div>
-              {:else if m.workMs && !completedHasProcess(messageParts(m))}
-                <!-- 纯问答轮（无思考/无工具）：与过程块同一行样式，只是没有过程可展开 -->
-                <div class="process-head static">
-                  <svg class="process-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5 13.7 9l5.5 1.7-5.5 1.7L12 18l-1.7-5.6L4.8 10.7 10.3 9 12 3.5Z"/><path d="m19 15.5.7 2.2 2.3.8-2.3.8-.7 2.2"/></svg>
-                  <span class="process-title">{processSummary([], m.workMs)}</span>
-                </div>
-              {/if}
-              {#if m.approval && m.approval.decided !== null && !m.approval.inFlow}
-                <!-- 没挂上工具卡的兜底记录（旧会话/工具段缺失）；正常路径记录在工具卡下 -->
-                <div class="approval-box legacy">
-                  <div class="approval-head">
-                    <span class="approval-title"
-                      ><span class="approval-kicker">审批</span><b>{m.approval.tool}</b>
-                      <span class="approval-risk risk-{m.approval.risk}"
-                        >{m.approval.riskLabel || riskLabelFor(m.approval.risk)}</span
-                      ></span
-                    >
-                  </div>
-                  <div class="approval-state">{m.approval.decided ? '已允许' : '已拒绝'}</div>
-                </div>
-              {/if}
-              <!-- 过程（思考 + 工具）与正文按真实发生顺序渲染：连续的过程合成一个可展开块，
-                   正文把前后过程隔开。多步任务就是「过程 → 说明 → 过程 → 最终回答」。
-                   流式期间过程默认展开；收尾后默认收起，只留总结与结尾语。 -->
-              {#each buildMessageBlocks(messageParts(m), m.streaming) as b, bi}
-                {@const pk = `${m.id}:${bi}`}
-                {@const open = processOpenMap[pk] !== undefined ? processOpenMap[pk] : !!m.streaming}
-                {#if b.kind === 'steer'}
-                  <!-- 流式中的引导：真实位置隔断（完成态跟随过程折叠成摘要徽标） -->
-                  <div class="steer-line" title="引导消息：不打断当时的对话，静默并入了那一轮">
-                    <span class="steer-line-badge">已引导</span>
-                    <span class="steer-line-text">{b.text}</span>
-                  </div>
-                {:else if b.kind === 'process'}
-                  <div class="process" class:live={m.streaming}>
-                    <button
-                      class="process-head"
-                      on:click={() => toggleProcess(pk, open)}
-                      title={open ? '收起过程' : '展开思考与工具调用'}
-                    >
-                      <svg class="process-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5 13.7 9l5.5 1.7-5.5 1.7L12 18l-1.7-5.6L4.8 10.7 10.3 9 12 3.5Z"/><path d="m19 15.5.7 2.2 2.3.8-2.3.8-.7 2.2"/></svg>
-                      <span class="process-title">{processSummary(b.items, !m.streaming && bi === 0 ? m.workMs : 0)}</span>
-                      {#if processIsLive(b.items)}<span class="process-live"><span class="live-dot"></span></span>{/if}
-                      <svg class="process-caret" class:open={open} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
-                    </button>
-                    {#if open}
-                      <div class="process-body">
-                        {#each b.items as it, ii}
-                          {@const ik = `${pk}:${ii}`}
-                          {#if it.type === 'steer'}
-                            <!-- 展开后引导行出现在真实位置（折叠时只看摘要徽标） -->
-                            <div class="steer-line" title="引导消息：不打断当时的对话，静默并入了那一轮">
-                              <span class="steer-line-badge">已引导</span>
-                              <span class="steer-line-text">{it.text}</span>
-                            </div>
-                          {:else if it.type === 'thinking'}
-                            {@const tOpen = thinkOpenMap[ik] !== undefined ? thinkOpenMap[ik] : !it.done}
-                            <div class="think-item">
-                              <button
-                                class="think-label"
-                                on:click={() => toggleThink(ik, tOpen)}
-                                title={tOpen ? '收起这段思考' : '展开这段思考'}
-                              >
-                                <span>{it.ms ? `思考 ${fmtDurCn(it.ms)}` : '思考'}</span>
-                                {#if m.streaming && !it.done}<span class="think-live">进行中</span>{/if}
-                                <svg class="think-caret" class:open={tOpen} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
-                              </button>
-                              {#if tOpen}
-                                <div
-                                  class="think-text"
-                                  class:streaming={m.streaming && !it.done}
-                                  use:followScroll={m.streaming && !it.done}
-                                  bind:this={thinkBoxEls[ik]}
-                                  on:followchange={(e) => (thinkFollowMap = { ...thinkFollowMap, [ik]: e.detail.following })}
-                                >{it.text}</div>
-                                {#if thinkFollowMap[ik] === false}
-                                  <button class="think-jump" title="回到底部（继续跟随）" on:click={() => jumpScroll(thinkBoxEls[ik])}>
-                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v13"/><path d="m6 12 6 6 6-6"/></svg>
-                                  </button>
-                                {/if}
-                              {/if}
-                            </div>
-                          {:else if it.type === 'tool'}
-                            {@const tm = toolMeta(it.name, it.args)}
-                            <!-- 直接读 toolFold（Svelte 只对模板里直接引用的变量建依赖；
-                                 包进函数读不到变更——2026-10-26 真机实测过同款坑） -->
-                            {@const tOpen = toolFold[`${m.id}:${it.toolIndex}`] === true}
-                            {@const previewPath = toolPreviewPath(it)}
-                            <div class="tool-item">
-                              <button
-                                class="tool-row"
-                                on:click={() => toggleToolDetail(m.id, it.toolIndex, tOpen)}
-                                title={tOpen ? '收起详情' : '展开参数与结果'}
-                              >
-                                <span class="tool-ico" class:running={it.status === 'running'}>{@html tm.iconSvg}</span>
-                                <span class="tool-name">{tm.label}</span>
-                                {#if tm.subject}
-                                  {#if previewPath}
-                                    <!-- ZCode 式主语：文件名可点，侧栏开预览（截图/文件平时不摊内容） -->
-                                    <span
-                                      class="tool-subject linkable"
-                                      role="button"
-                                      tabindex="-1"
-                                      title="在侧栏预览：{previewPath}"
-                                      on:click|stopPropagation={() => openPreviewTab(previewPath)}
-                                    >{tm.subject}</span>
-                                  {:else}
-                                    <span class="tool-subject" title={tm.subject}>{tm.subject}</span>
-                                  {/if}
-                                {/if}
-                                <span class="tool-status {it.status}">
-                                  {#if it.status === 'running'}<span class="tool-spin"></span>
-                                  {:else if it.status === 'ok'}<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>
-                                  {:else}<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg>
-                                  {/if}
-                                </span>
-                                <svg class="tool-caret" class:open={tOpen} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg>
-                              </button>
-                              {#if it.approval && it.approval.decided !== null}
-                                <!-- 审批记录：就在它发生的那个工具卡下面（2026-11-03） -->
-                                <div class="tool-approval">
-                                  <span class="approval-risk risk-{it.approval.risk}"
-                                    >{it.approval.riskLabel || riskLabelFor(it.approval.risk)}</span
-                                  >
-                                  <span class="ta-state">{it.approval.decided ? '已允许' : '已拒绝'}</span>
-                                  {#if it.approval.reason}
-                                    <span class="ta-reason" title={it.approval.reason}>{it.approval.reason}</span>
-                                  {/if}
-                                </div>
-                              {/if}
-                              {#if tOpen}
-                                <div class="tool-detail">
-                                  {#if it.args}
-                                    <div class="tool-sec">
-                                      <div class="tool-sec-label">参数</div>
-                                      <!-- 参数是流式补长的（模型边吐边涨，写入类工具最长），
-                                           和思考框同一套跟随：默认贴底，上滑固定 -->
-                                      <pre
-                                        class="tool-pre"
-                                        use:followScroll={m.streaming && it.status === 'running'}
-                                        bind:this={toolPreEls[ik]}
-                                        on:followchange={(e) =>
-                                          (toolFollowMap = { ...toolFollowMap, [ik]: e.detail.following })}
-                                      >{@html highlightText(prettyArgs(it.args), 'json')}</pre>
-                                      {#if m.streaming && it.status === 'running' && toolFollowMap[ik] === false}
-                                        <button class="tool-jump" title="回到底部（继续跟随）" on:click={() => jumpScroll(toolPreEls[ik])}>
-                                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v13"/><path d="m6 12 6 6 6-6"/></svg>
-                                        </button>
-                                      {/if}
-                                    </div>
-                                  {/if}
-                                  {#if it.preview}
-                                    <div class="tool-sec">
-                                      <div class="tool-sec-label">结果</div>
-                                      <pre class="tool-pre">{@html highlightText(it.preview, 'output')}</pre>
-                                    </div>
-                                  {/if}
-                                  {#if !it.preview && it.status === 'running'}<div class="tool-wait">执行中…</div>{/if}
-                                </div>
-                              {/if}
-                            </div>
-                          {:else if it.type === 'content'}
-                            <!-- 完成态折叠进来的中途说明：保留原文与 markdown 结构，颜色压暗 -->
-                            <div class="content process-note" on:click={onContentClick}>{@html md(it.text)}</div>
-                          {/if}
-                        {/each}
-                      </div>
-                    {/if}
-                  </div>
-                {:else if b.text}
-                  <!-- doc-cite：agent 回复里 /api/workspace/... 的文件引用，点击落到右侧预览标签 -->
-                  <div class="content" on:click={onContentClick}>{@html md(b.text)}</div>
-                {/if}
-              {/each}
-              {#if !m.streaming && shots.length}
-                <!-- browser 截图只在收尾摊开（最后一张=收尾验证图）；中途截图静默给
-                     模型自查，想看走工具行点主语开侧栏预览（2026-11-07 口径：
-                     「静默让模型自己看，最后收尾才展示，别两张一样的图刷屏」）。
-                     点在图上开大图，复用 md-img 的点击预览 -->
-                <div class="msg-shots">
-                  {#each [shots[shots.length - 1]] as src}
-                    <div class="tool-shot" on:click={onContentClick}>
-                      <img class="md-img" {src} alt="页面截图" loading="lazy" data-md-img="1" />
-                    </div>
-                  {/each}
-                </div>
-              {/if}
-              {#if m.streaming && !messageParts(m).length}
-                <div class="typing"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></div>
-              {/if}
-            </div>
-            {#if m.ts || (m.stats && !m.streaming)}
-            <div class="msg-meta">
-              {#if m.ts}<span class="msg-ts">{fmtTs(m.ts)}</span>{/if}
-              {#if m.stats && !m.streaming}
-                <!-- 信息卡入口：首 token 延迟/输出耗时/渠道/模型/tokens/缓存命中。
-                     放回答下方右下角 -->
-                <span class="msg-acts" on:click|stopPropagation>
-                  <button class="msg-act" title="这条回复的详细信息" aria-label="回答详情" on:click|stopPropagation={() => (statsModal = m)}>
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><path d="M12 8h.01"/></svg>
-                  </button>
-                </span>
-              {/if}
-            </div>
-            {/if}
-            </div>
-          </div>
-        {:else if m.role === 'system' && m.kind === 'compact_marker'}
-          <!-- 静默压缩标记行（2026-11-07）：「正在压缩→压缩后」同位更新，全程唯一可见痕迹；
-               失败态带原因 +「重试」按钮（2026-11-10） -->
-          <div class="compact-divider" data-mid={m.id} class:running={m.state === 'running'} class:failed={compactFailed(m)}>
-            {m.content}{#if compactFailed(m)}<button class="compact-retry" on:click|stopPropagation={() => retryCompact(m)}>重试</button>{/if}
-          </div>
-        {:else if m.role === 'error'}
-          <!-- 报错行：与重启后落盘恢复的 [错误] 系统消息同款灰字（
-               实时红气泡和重启后灰字两副面孔太突兀，统一成后者）。
-               落盘侧已带 [错误] 前缀（server 落 [错误] {e}），实时侧这里补齐前缀 -->
-          <div class="msg system" data-mid={m.id}><div class="sys-text">[错误] {m.content}</div></div>
-        {:else if m.role === 'cp'}
-          <!-- 检查点消息只给改动条提供基线（dockCp），不渲染 -->
-        {:else}
-          <div class="msg system" data-mid={m.id}><div class="sys-text">{m.content ?? ''}</div></div>
-        {/if}
-        {/each}
-        </div>
-      {/each}
-      {#if tailCompactMarker}
-        <!-- 压缩标记作为最后一条：移出分块单独渲染，零高度浮在底部留白区（见样式注释） -->
-        <div class="compact-divider tail" data-mid={tailCompactMarker.id} class:running={tailCompactMarker.state === 'running'} class:failed={compactFailed(tailCompactMarker)}>
-          {tailCompactMarker.content}{#if compactFailed(tailCompactMarker)}<button class="compact-retry" on:click|stopPropagation={() => retryCompact(tailCompactMarker)}>重试</button>{/if}
-        </div>
-      {/if}
-      {#if scrollSpacerPx > 0}
-        <!-- 编辑/回滚后的临时底部留白：保住 scrollTop 不被浏览器钳位；内容长出来自动收掉 -->
-        <div class="scroll-spacer" style:height={`${scrollSpacerPx}px`}></div>
-      {/if}
+      <div class="chat-body" bind:this={chatBody} on:scroll={onChatScroll}
+           on:wheel|capture={onUserSlide} on:touchstart|capture={onUserSlide} on:mousedown|capture={onUserSlide}>
+      <!-- 2026-11-15 阶段 C：聊天区消息渲染抽成 lib/chatview/ChatMessages.svelte（启动失败行/
+           空态引导/气泡/过程块/思考回放/工具卡/压缩标记/附件视频降级/多选/编辑态）。滚动壳
+           （chat-body）与「回到底部」留根——钉底/估位/滚动锚定是根上的滚动状态机；折叠开合/
+           跟随态/滚动容器 els/视频降级是组件私有随之走。动作事件上行；editingMsg 走共享对象。
+           聊天样式本轮留在根上以 :global 命中组件内容（类名全 app 唯一不碰撞），后续再机械下沉。 -->
+      <ChatMessages
+        messageChunks={messageChunks}
+        messages={messages}
+        startupError={startupError}
+        msgSelectMode={msgSelectMode}
+        msgSelected={msgSelected}
+        editingMsg={editingMsg}
+        nowTick={nowTick}
+        tailCompactMarker={tailCompactMarker}
+        scrollSpacerPx={scrollSpacerPx}
+        on:selectrow={(e) => selectRow(e.detail)}
+        on:saveedit={saveEdit}
+        on:editcancel={() => (editingMsg = null)}
+        on:rollback={(e) => rollbackMsg(e.detail)}
+        on:beginedit={(e) => beginEdit(e.detail)}
+        on:fork={(e) => forkMsg(e.detail)}
+        on:delete={(e) => deleteMsg(e.detail)}
+        on:enterselect={enterSelect}
+        on:sendnow={(e) => sendNow(e.detail.id, e.detail.mode)}
+        on:retrycompact={(e) => retryCompact(e.detail)}
+        on:contentclick={(e) => onContentClick(e.detail)}
+        on:imgpreview={(e) => (previewImageModal = e.detail)}
+        on:attexternal={(e) => openAttachmentExternal(e.detail)}
+        on:openpreview={(e) => openPreviewTab(e.detail)}
+        on:stats={(e) => (statsModal = e.detail)}
+      />
     </div>
 
-    {#if !chatPinned}
+    {#if !chatPinned && jumpBottomVisible}
       <button class="jump-bottom" on:click={scrollToBottom} title="回到底部">回到底部</button>
     {/if}
 
@@ -9549,519 +8794,108 @@
         </div>
       {/if}
       <div class="composer">
-        {#if todoDockVisible}
-          <!-- 任务清单 dock：贴输入框上方、展开向上长；
-               与审批/提问上下堆叠——清单在最上，阻塞交互的提问/审批贴输入框 -->
-          <div class="todo-dock">
-            <div class="todo-dock-row">
-              <button
-                class="todo-head"
-                on:click={toggleTodoDock}
-                title={todoDockOpen ? '收起任务清单' : '展开任务清单'}
-              >
-                <svg class="todo-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6h11M9 12h11M9 18h11"/><path d="m3.5 5.5 1.5 1.5 3-3"/><path d="m3.5 11.5 1.5 1.5 3-3"/><circle cx="5" cy="18" r="1.1" fill="currentColor" stroke="none"/></svg>
-                <span class="todo-title">任务清单</span>
-                {#if !todoDockOpen}<span class="todo-cur" title={todoCur.content}>{todoCur.content}</span>{/if}
-                <span class="todo-count">{todoDoneN}/{currentTodo.todos.length}</span>
-                <svg class="todo-caret" class:open={todoDockOpen} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
-              </button>
-              <button class="todo-x" on:click={dismissTodoDock} title="收起任务清单（出现新的任务清单前不再冒出）" aria-label="收起任务清单">×</button>
-            </div>
-            {#if todoDockOpen}
-              <div class="todo-body">
-                {#each currentTodo.todos as t, ti}
-                  <div class="todo-item {t.status}">
-                    <span class="todo-mark">
-                      {#if t.status === 'completed'}<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="m8.5 12.5 2.5 2.5 4.5-5"/></svg>
-                      {:else if t.status === 'in_progress'}<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h13"/><path d="m13 7 5 5-5 5"/></svg>
-                      {:else}<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/></svg>{/if}
-                    </span>
-                    <span class="todo-text">{ti + 1}. {t.content}</span>
-                  </div>
-                {/each}
-              </div>
-            {/if}
-          </div>
-        {/if}
-        {#if pendingApprovals.length > 0}
-          <!-- 执行询问贴在输入框上方，不钉在对话顶部；
-               决定后记录回到时间线的工具卡 -->
-          <div class="approval-dock">
-            {#each pendingApprovals as pa}
-              <div class="approval-box">
-                <div class="approval-head">
-                  <span class="approval-title"
-                    ><span class="approval-kicker">审批请求</span><b>{pa.tool}</b>
-                    <span class="approval-risk risk-{pa.risk}"
-                      >{pa.riskLabel || riskLabelFor(pa.risk)}</span
-                    ></span
-                  >
-                  {#if pa.reason}<span class="approval-reason">{pa.reason}</span>{/if}
-                  <span class="tool-args" title={pa.args}>{pa.args}</span>
-                </div>
-                <div class="approval-actions">
-                  <button class="btn" on:click={() => decideApproval(pa.id, true)}>允许</button>
-                  <button class="btn ghost" on:click={() => decideApproval(pa.id, true, true)}
-                    >同类不再问</button
-                  >
-                  <button class="btn ghost" on:click={() => decideApproval(pa.id, false)}>拒绝</button>
-                  <span class="approval-hint">等你的决定，120 秒不选自动拒绝</span>
-                </div>
-              </div>
-            {/each}
-          </div>
-        {/if}
-        {#if pendingQuestions.length > 0}
-          <!-- 阻塞式提问（ask 工具）：与审批同一个槽位、同一主题；提问是方案决策不是权限闸 -->
-          <div class="approval-dock">
-            {#each pendingQuestions as q (q.id)}
-              {@const ui = askUi[q.id] || { picked: [], other: '' }}
-              <div class="approval-box ask-box">
-                <div class="approval-head">
-                  <span class="approval-title"
-                    ><span class="approval-kicker">{q.header || '提问'}</span
-                    >{#if q.multiSelect}<span class="ask-multi-tag">可多选</span>{/if}</span
-                  >
-                  <b class="ask-question">{q.question}</b>
-                </div>
-                <div class="ask-options">
-                  {#each q.options as o}
-                    <button
-                      class="ask-opt"
-                      class:sel={ui.picked.includes(o.label)}
-                      on:click={() => pickAskOption(q, o.label)}
-                      title={o.description}
-                    >
-                      <span class="ask-opt-label">{o.label}</span>
-                      {#if o.description}<span class="ask-opt-desc">{o.description}</span>{/if}
-                    </button>
-                  {/each}
-                </div>
-                <div class="ask-other">
-                  <input
-                    class="ask-other-in"
-                    placeholder="其他（自由输入）"
-                    value={ui.other}
-                    on:input={(e) => setAskUi(q.id, { other: e.target.value })}
-                    on:keydown={(e) => { if (e.isComposing) return; if (e.key === 'Enter') submitAskOther(q); }}
-                  />
-                  {#if q.multiSelect}
-                    <button class="btn" disabled={!ui.picked.length} on:click={() => answerAsk(q, { selected: [...ui.picked] })}>确认所选</button>
-                  {/if}
-                  <button class="btn" disabled={!ui.other.trim()} on:click={() => submitAskOther(q)}>提交</button>
-                  <button class="btn ghost" on:click={() => answerAsk(q, { dismissed: true })}>跳过</button>
-                </div>
-                <span class="approval-hint">回答前这一轮会挂起等你；跳过 = 让它自己拿主意</span>
-              </div>
-            {/each}
-          </div>
-        {/if}
-        {#if pendingAttachments.length > 0}
-          <div class="composer-attachments">
-            {#each pendingAttachments as att, idx}
-              <div
-                class="att-chip"
-                title={`${att.name} (${fmtBytes(att.size)}) · 点击预览`}
-                role="button"
-                tabindex="0"
-                on:click={() => openAttPreview(att)}
-                on:keydown={(e) => {
-                  if (e.key === 'Enter' || e.key === ' ') {
-                    e.preventDefault();
-                    openAttPreview(att);
-                  }
-                }}
-              >
-                {#if att.mime.startsWith('image/')}
-                  <img class="att-thumb" src={att.data} alt={att.name} />
-                {:else if att.mime.startsWith('video/')}
-                  <svg class="att-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="5.5" width="18" height="13" rx="2.5"/><path d="M3 9.5h18M7.5 5.5v4M16.5 5.5v4"/></svg>
-                {:else if att.mime.startsWith('audio/')}
-                  <svg class="att-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="7.5" cy="17.5" r="2.5"/><circle cx="17.5" cy="15.5" r="2.5"/><path d="M10 17.5V6l10-2.5V15.5"/></svg>
-                {:else}
-                  <svg class="att-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m8 12.5 6.5-6.5a2.8 2.8 0 0 1 4 4L9 19.5a4.5 4.5 0 0 1-6.4-6.4l8.5-8.5"/></svg>
-                {/if}
-                <span class="att-name">{att.name}</span>
-                <span class="att-size">{fmtBytes(att.size)}</span>
-                <button class="att-del" on:click|stopPropagation={() => removeAttachment(idx)} title="移除" aria-label="移除"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
-              </div>
-            {/each}
-          </div>
-        {/if}
-        {#if pendingConvs.length > 0}
-          <div class="composer-attachments">
-            {#each pendingConvs as cv}
-              <div class="att-chip conv-chip" title={`引用对话：${cv.title}（发送时拼进消息正文${cv.omitted ? '，只保留最近部分' : ''}）`}>
-                <svg class="att-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 8.9 8.9 0 0 1-3.8-.8L3 21l1.9-4.6a8.4 8.4 0 1 1 16.1-4.9"/><path d="M8.5 10.5h7M8.5 14h4.5"/></svg>
-                <span class="att-name">{cv.title}</span>
-                <button class="att-del" on:click={() => removePendingConv(cv.id)} title="移除" aria-label="移除"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
-              </div>
-            {/each}
-          </div>
-        {/if}
-        {#if (guided[curKey()] || []).length > 0}
-          <!-- 已引导标记（2026-10-22）：静默提示,不占对话气泡位;本轮结束自动消失 -->
-          <div class="guided-row">
-            {#each guided[curKey()] as g, gi}
-              <span class="guided-chip" title={`不打断当前操作,跑完这步就并入:${g.text}`}>
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4Z"/></svg>
-                已引导 · {g.text.length > 40 ? g.text.slice(0, 40) + '…' : g.text}
-                <button
-                  class="guided-x"
-                  title="移除这条提示"
-                  aria-label="移除这条提示"
-                  on:click={() => dismissGuided(curKey(), gi)}
-                ><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
-              </span>
-            {/each}
-          </div>
-        {/if}
-        <!-- 引用高亮：textarea 没法给部分文字上色，叠一层
-             同字号同排版的浮层，只把 /能力、@文件 这些引用画成强调色；其余字符透明，
-             纯为对齐换行。textarea 的文字照旧显示（浮层在上，视觉上正好盖住同款字形），
-             这样浮层即使有亚像素偏差也只是轻微描边，不会出现"字没了"。 -->
-        <div class="composer-field" class:composing={composerComposing}>
-          <div class="composer-hl" aria-hidden="true" bind:this={composerHlEl}>{@html composerHl}</div>
-          <textarea
-            class="composer-input"
-            rows="1"
-            bind:this={composerInputEl}
-            bind:value={input}
-            placeholder={streaming ? '可发送消息以进行对话引导或打断' : ''}
-            on:keydown={handleKey}
-            on:input={autoRows}
-            on:scroll={syncComposerHl}
-            on:compositionstart={() => (composerComposing = true)}
-            on:compositionend={() => (composerComposing = false)}
-            on:paste={handlePaste}
-          ></textarea>
-        </div>
-        <div class="composer-bar">
-          <div class="composer-left">
-            <div class="bar-menu">
-              <button
-                class="icon-btn"
-                title="添加上下文 / 选择能力"
-                on:click={() => {
-                  const open = !plusMenuOpen;
-                  closeBarMenus(open ? 'plus' : '');
-                  plusMenuOpen = open;
-                  abilityMenuOpen = false;
-                }}
-              ><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></button>
-              {#if plusMenuOpen}
-                <div class="bar-dropdown">
-                  <button class="bar-item" on:click={openCtxPicker}>
-                    <span class="menu-sym">@</span> 添加上下文
-                  </button>
-                  <button class="bar-item" on:click={openAbilityMenu}>
-                    <span class="menu-sym">/</span> 选择能力
-                  </button>
-                </div>
-              {/if}
-              {#if abilityMenuOpen}
-                <!-- ①三类平铺，插件全列、不许展开；
-                     ②引用前缀统一用「/」（技能/MCP/插件都 /，不再用 $） -->
-                <div class="bar-dropdown">
-                  <div class="bar-group">技能</div>
-                  {#if ownSkills.length}
-                    {#each ownSkills as sk (sk.name)}
-                      <button class="bar-item" on:click={() => { abilityMenuOpen = false; insertAtCursor(`/${sk.name} `); }}>
-                        <span class="menu-sym">/</span> {sk.name}
-                      </button>
-                    {/each}
-                  {:else if skillsLoading}
-                    <div class="bar-empty">技能清单加载中…</div>
-                  {/if}
-                  <div class="bar-group">MCP</div>
-                  <!-- MCP 只列服务本体，工具不逐条刷屏——
-                       插服务级引用，模型按本体名找到并用它下面的工具 -->
-                  {#each mcpServers as srv}
-                    {#if srv.online !== false && srv.tools && srv.tools.length}
-                      <button class="bar-item" on:click={() => { abilityMenuOpen = false; insertAtCursor(`/mcp__${srv.name} `); }} title={srv.transport + ` · ${srv.tools.length} 个工具`}>
-                        <span class="menu-sym">/</span> {srv.name}<span class="menu-sub">{srv.tools.length} 工具</span>
-                      </button>
-                    {/if}
-                  {/each}
-                  {#each wasmPlugins as w}
-                    {#each w.tools || [] as t}
-                      <button class="bar-item" on:click={() => { abilityMenuOpen = false; insertAtCursor(`/wasm__${w.stem}__${t.name} `); }}>
-                        <span class="menu-sym">/</span> {t.name}
-                      </button>
-                    {/each}
-                  {/each}
-                  {#if !mcpServers.some((s) => s.online !== false && s.tools && s.tools.length) && !wasmPlugins.some((w) => (w.tools || []).length) && mcpLoading}
-                    <div class="bar-empty">MCP 工具加载中…</div>
-                  {/if}
-                  <div class="bar-group">插件</div>
-                  <!-- 全部插件平铺（不展开）：点哪个都往输入框插一个 /引用——带技能的插件
-                       插它第一个技能名（模型按技能索引认得），纯面板插件插插件标题（模型按
-                       系统提示的「可用插件」索引认得）。面板不从这里开：右侧栏「+」菜单才是
-                       面板的家（同一能力只在一个管理面出现）。列表口径 = enabledExts（启用且
-                       清单合法），与应用插件目录一一对应，不筛子集 -->
-                  {#each enabledExts as e (e.name)}
-                    {@const sk = pluginSkillsOf(e.name)}
-                    {@const ref = sk.length ? sk[0].name : pluginRef(e)}
-                    <button
-                      class="bar-item"
-                      title={sk.length ? `${e.title || e.name}：插入技能引用 /${ref}` : `${e.title || e.name}：插入插件引用 /${ref}`}
-                      on:click={() => {
-                        abilityMenuOpen = false;
-                        insertAtCursor(`/${ref} `);
-                      }}
-                    >
-                      <span class="menu-sym menu-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">{@html menuExtIcon(e.name)}</svg></span>
-                      {e.title || e.name}
-                    </button>
-                  {/each}
-                </div>
-              {/if}
-            </div>
-            <input
-              type="file"
-              bind:this={fileInput}
-              multiple
-              accept="image/*,video/*,audio/*,.docx,.xlsx,.pptx,.pdf,.doc,.xls,.ppt,.csv,.rtf,.odt,.ods,.odp"
-              style="display:none"
-              on:change={onFileSelect}
-            />
-            <button
-              class="icon-btn"
-              title="添加附件（图片/视频/音频/Office 文档）"
-              on:click={() => fileInput && fileInput.click()}
-            >
-              <svg class="att-ico-lg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m8 12.5 6.5-6.5a2.8 2.8 0 0 1 4 4L9 19.5a4.5 4.5 0 0 1-6.4-6.4l8.5-8.5"/></svg>
-            </button>
-            <div class="bar-menu">
-              <button
-                class="pill approval-pill"
-                class:danger={approvalEffective === 'full-access'}
-                on:click={() => {
-                  const open = !approvalMenuOpen;
-                  closeBarMenus(open ? 'approval' : '');
-                  approvalMenuOpen = open;
-                }}
-                title="审批档位（按会话记忆，运行中切换下一步即生效）：只读=写/执行逐次问 · 自动=可动工作区与电脑高危先问 · 完全访问=全免审本机直跑"
-                aria-label={`审批档位：${APPROVAL_LABELS[approvalEffective] || approvalEffective}`}
-              >
-                <span class="approval-ico" aria-hidden="true">{@html approvalIcon(approvalEffective)}</span>
-              </button>
-              {#if approvalMenuOpen}
-                <div class="bar-dropdown">
-                  {#each Object.entries(APPROVAL_LABELS) as [val, label]}
-                    <button class="bar-item approval-item" class:active={val === approvalEffective} on:click={() => pickApproval(val)}>
-                      <span class="approval-opt">
-                        <span class="approval-ico" aria-hidden="true">{@html approvalIcon(val)}</span>
-                        <span>{label}</span>
-                      </span>
-                    </button>
-                  {/each}
-                </div>
-              {/if}
-            </div>
-          </div>
-          <div class="composer-right">
-            {#if ctxUsage.window > 0}
-              <div class="ctx-wrap">
-                <svg class="ctx-ring" viewBox="0 0 30 30" width="20" height="20" title="上下文占用（下一次请求的预估）">
-                  <circle class="ctx-track" cx="15" cy="15" r="12.5" />
-                  <circle
-                    class="ctx-arc"
-                    cx="15"
-                    cy="15"
-                    r="12.5"
-                    stroke={ctxColor}
-                    stroke-dasharray={`${(ctxCirc * ctxArcPct) / 100} ${ctxCirc}`}
-                    transform="rotate(-90 15 15)"
-                  />
-                </svg>
-                <div class="ctx-card">
-                  <div class="ctx-card-head">
-                    <b>上下文容量</b>
-                    <span>{fmtTok(ctxUsage.projected)}/{fmtTok(ctxUsage.window)}（{ctxPctText}）</span>
-                  </div>
-                  <div class="ctx-bar"><div class="ctx-bar-fill" style:width={`${ctxPct}%`} style:background={ctxColor}></div></div>
-                  {#each ctxRows as row}
-                    <div class="ctx-row">
-                      <span class="ctx-dot" style:background={row.color}></span>
-                      <span class="ctx-label">{row.label}</span>
-                      <span class="ctx-val">{row.pct}</span>
-                    </div>
-                  {/each}
-                  <div class="ctx-row cache-row">
-                    <span class="ctx-label">平均缓存命中率</span>
-                    <span class="ctx-val">{apiTotals.prompt ? ((apiTotals.cached / apiTotals.prompt) * 100).toFixed(1) + '%' : '—'}</span>
-                  </div>
-                  <div class="ctx-row cache-row compact-threshold-row">
-                    <span class="ctx-label">上下文压缩阈值</span>
-                    <span class="ctx-val threshold-val">
-                      <input
-                        class="compact-threshold-input"
-                        type="number"
-                        min="40"
-                        max="85"
-                        data-field="compactPercent"
-                        bind:value={compactPercent}
-                        title="上下文占到窗口这条线时，本轮结束后静默压缩；40–85，默认 85"
-                        on:change={() => {
-                          let v = Math.round(Number(compactPercent) || 85);
-                          if (v < 40 || v > 85) v = Math.min(85, Math.max(40, v));
-                          compactPercent = v;
-                          autoSave({ compact_percent: v }, 0);
-                        }}
-                      /><span class="pct-suffix">%</span>
-                    </span>
-                  </div>
-                  <!-- 口径说清：分子是「下一次请求」的预估（渠道实报锚点 + 之后的上下文增减，
-                       裁剪会让它当场回落）；构成行是估算值按圆环百分比分摊（加总 = 圆环） -->
-                </div>
-              </div>
-            {:else}
-              <!-- 常驻空环：会话还没用过（无预算数据）时也显示空轨道环 -->
-              <div class="ctx-wrap" title="上下文占用（发送消息后显示详情）">
-                <svg class="ctx-ring" viewBox="0 0 30 30" width="20" height="20">
-                  <circle class="ctx-track" cx="15" cy="15" r="12.5" />
-                </svg>
-              </div>
-            {/if}
-            <div class="bar-menu">
-              <button
-                class="pill model-pill"
-                on:click={() => {
-                  const open = !modelMenuOpen;
-                  closeBarMenus(open ? 'model' : '');
-                  modelMenuOpen = open;
-                  if (open) menuExpandedCfg = activeConfigId;
-                }}
-                title="切换模型（按配置分组）"
-              >
-                {model || '未选模型'}
-                <svg class="caret-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
-              </button>
-              {#if modelMenuOpen}
-                <div class="bar-dropdown right">
-                  {#each configs as cfg}
-                    <button
-                      class="bar-item group-head"
-                      class:active={cfg.id === activeConfigId}
-                      on:click={() => (menuExpandedCfg = menuExpandedCfg === cfg.id ? '' : cfg.id)}
-                    >
-                      <span>{configLabel(cfg)}{cfg.id === activeConfigId ? ' · 当前' : ''}{cfgMediaBadge(cfg)}</span>
-                      <svg class="caret-ico" class:open={menuExpandedCfg === cfg.id} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg>
-                    </button>
-                    {#if menuExpandedCfg === cfg.id}
-                      {#if !(cfg.models || []).length}
-                        <div class="menu-empty">（该配置还没有模型，去设置里获取）</div>
-                      {/if}
-                      {#each cfg.models || [] as m}
-                        <button
-                          class="bar-item sub"
-                          class:active={cfg.id === activeConfigId && m === model}
-                          on:click={() => pickCrossModel(cfg, m)}
-                        >
-                          {m}
-                        </button>
-                      {/each}
-                    {/if}
-                  {/each}
-                  <div class="menu-sep"></div>
-                  <button class="bar-item" on:click={() => { modelMenuOpen = false; settingsOpen = true; }}>
-                    管理模型…
-                  </button>
-                </div>
-              {/if}
-            </div>
-            <div class="bar-menu">
-              <button
-                class="pill think-pill"
-                class:active={thinkingOn}
-                on:click={() => {
-                  const open = !thinkMenuOpen;
-                  closeBarMenus(open ? 'think' : '');
-                  thinkMenuOpen = open;
-                }}
-                title={thinkHint}
-              >
-                <span class="pill-label">思考:</span> {pillThinkLabel}
-                <svg class="caret-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
-              </button>
-              {#if thinkMenuOpen}
-                <div class="bar-dropdown right think-panel">
-                  <!-- 三态分段（关/默认/开）：关/默认即收尾；「开」保持菜单展开——
-                       档位滑杆只在开的时候出现（2026-11-01 改 ZCode 思考强度样式） -->
-                  <div class="think-states">
-                    <button class="think-state" class:active={thinking === 'off'} on:click={() => pickThinking('off')}>关</button>
-                    <button class="think-state" class:active={thinking === ''} on:click={() => pickThinking('')}>默认</button>
-                    <button class="think-state" class:active={thinkingOn} on:click={pickThinkOn}>开</button>
-                  </div>
-                  {#if thinkingOn && thinkLevels && thinkLevels.length > 1}
-                    <!-- 档位滑杆：结构/动效自 ZCode ComposerModelMenu 复刻，配色走主色橙
-                         （「颜色跟随主色调」）。粒子全档流动、
-                         速度随档位升高加快（{#key} 换档重排，负延迟保持错峰不空场）；
-                         填充延伸到圆钮圆心；最高档亮橙渐变层（非最高档纯橙填充） -->
-                    <div class="think-strength">
-                      <div class="ts-head">
-                        <span class="ts-label">思考强度</span>
-                        <span class="ts-value">{thinkLevels[thinkLevelIdx].label}</span>
-                        <span class="ts-kbd">Ctrl+T</span>
-                      </div>
-                      <div class="ts-slider">
-                        <div class="ts-vis" aria-hidden="true">
-                          <div class="ts-track">
-                            <!-- 描边放底层：填充选中区域会完全盖住它（ZCode 同款结构） -->
-                            <div class="ts-ring"></div>
-                            <div
-                              class="ts-fill"
-                              class:max={thinkMax}
-                              style:width={`calc(14px + (100% - 28px) * ${thinkProgress / 100})`}
-                            >
-                              {#key thinkLevelIdx}
-                                <div class="ts-bubbles">
-                                  {#each effortBubbles as b}
-                                    <span
-                                      class="ts-bubble"
-                                      style:top={`${b.top}px`}
-                                      style:animation-duration={`${(b.duration * BUBBLE_SPEED * bubbleSpeedMult).toFixed(2)}s`}
-                                      style:animation-delay={`${b.delay.toFixed(2)}s`}
-                                    >
-                                      <span
-                                        class="ts-bubble-dot"
-                                        style:width={`${b.w}px`}
-                                        style:height={`${b.h}px`}
-                                        style:opacity={b.op}
-                                        style:color={b.c}
-                                      ></span>
-                                    </span>
-                                  {/each}
-                                </div>
-                                <!-- 掉落火花 2026-11-08 试装后按用户要求撤掉（效果见提交 3f1f1f5） -->
-                              {/key}
-                            </div>
-                          </div>
-                          <div class="ts-thumb" style:left={`calc((100% - 28px) * ${thinkProgress / 100})`}></div>
-                        </div>
-                        <input
-                          class="ts-range"
-                          type="range"
-                          min="0"
-                          max={thinkLevels.length - 1}
-                          step="1"
-                          value={thinkLevelIdx}
-                          aria-label="思考强度"
-                          on:input={(e) => thinkRangeInput(+e.target.value)}
-                        />
-                      </div>
-                    </div>
-                  {/if}
-                </div>
-              {/if}
-            </div>
-            {#if streaming}
-              <button class="send-btn stop" on:click={stop} title="停止" aria-label="停止"><svg viewBox="0 0 24 24" fill="currentColor"><rect x="7" y="7" width="10" height="10" rx="2"/></svg></button>
-            {/if}
-            <button class="send-btn" on:click={send} disabled={!input.trim()} title={streaming ? '发送（进入队列，这一轮结束后自动发出）' : '发送（Enter）'} aria-label="发送"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg></button>
-          </div>
-        </div>
+        <!-- 2026-11-15 阶段 B：输入栏抽成 lib/composer/ 五组件（todo dock / 审批+提问 dock /
+             附件+引用对话+已引导 chips / 高亮输入区 / 左右工具条）。状态簇全留根——菜单互斥
+             （closeBarMenus + 全局点外收起）、发送流、审批流、模型/思考切换、上下文派生都在根上；
+             动作事件上行，input/composing/inputEl/hlEl/compactPercent 走 bind 双向 -->
+        <TodoDock
+          todoDockVisible={todoDockVisible}
+          todoDockOpen={todoDockOpen}
+          currentTodo={currentTodo}
+          todoCur={todoCur}
+          todoDoneN={todoDoneN}
+          on:toggle={toggleTodoDock}
+          on:dismiss={dismissTodoDock}
+        />
+        <ApprovalDock
+          pendingApprovals={pendingApprovals}
+          pendingQuestions={pendingQuestions}
+          askUi={askUi}
+          on:decide={(e) => decideApproval(e.detail.id, e.detail.allow, e.detail.always)}
+          on:pickopt={(e) => pickAskOption(e.detail.q, e.detail.label)}
+          on:setui={(e) => setAskUi(e.detail.id, e.detail.patch)}
+          on:submitother={(e) => submitAskOther(e.detail)}
+          on:answer={(e) => answerAsk(e.detail.q, e.detail.payload)}
+        />
+        <ComposerChips
+          pendingAttachments={pendingAttachments}
+          pendingConvs={pendingConvs}
+          guidedList={guided[curKey()] || []}
+          on:preview={(e) => openAttPreview(e.detail)}
+          on:rmatt={(e) => removeAttachment(e.detail)}
+          on:rmconv={(e) => removePendingConv(e.detail)}
+          on:rmguided={(e) => dismissGuided(curKey(), e.detail)}
+        />
+        <ComposerField
+          bind:input={input}
+          hl={composerHl}
+          streaming={streaming}
+          bind:composing={composerComposing}
+          bind:inputEl={composerInputEl}
+          bind:hlEl={composerHlEl}
+          on:key={(e) => handleKey(e.detail)}
+          on:inputev={(e) => autoRows(e.detail)}
+          on:scrollev={syncComposerHl}
+          on:paste={(e) => handlePaste(e.detail)}
+        />
+        <ComposerBar
+          streaming={streaming}
+          input={input}
+          pendingAttachments={pendingAttachments}
+          pendingConvs={pendingConvs}
+          plusMenuOpen={plusMenuOpen}
+          abilityMenuOpen={abilityMenuOpen}
+          ownSkills={ownSkills}
+          skillsLoading={skillsLoading}
+          mcpServers={mcpServers}
+          mcpLoading={mcpLoading}
+          wasmPlugins={wasmPlugins}
+          enabledExts={enabledExts}
+          pluginSkills={pluginSkills}
+          menuExtIcon={menuExtIcon}
+          approvalEffective={approvalEffective}
+          approvalMenuOpen={approvalMenuOpen}
+          ctxUsage={ctxUsage}
+          ctxColor={ctxColor}
+          ctxCirc={ctxCirc}
+          ctxArcPct={ctxArcPct}
+          ctxPctText={ctxPctText}
+          ctxPct={ctxPct}
+          ctxRows={ctxRows}
+          apiTotals={apiTotals}
+          bind:compactPercent={compactPercent}
+          modelMenuOpen={modelMenuOpen}
+          menuExpandedCfg={menuExpandedCfg}
+          configs={configs}
+          activeConfigId={activeConfigId}
+          model={model}
+          thinkMenuOpen={thinkMenuOpen}
+          thinkingOn={thinkingOn}
+          thinking={thinking}
+          thinkHint={thinkHint}
+          pillThinkLabel={pillThinkLabel}
+          thinkLevels={thinkLevels}
+          thinkLevelIdx={thinkLevelIdx}
+          thinkMax={thinkMax}
+          thinkProgress={thinkProgress}
+          on:toggleplus={togglePlusMenu}
+          on:toggleapproval={toggleApprovalMenu}
+          on:togglemodel={toggleModelMenu}
+          on:togglethink={toggleThinkMenu}
+          on:ctxpicker={openCtxPicker}
+          on:openability={openAbilityMenu}
+          on:insertref={(e) => { abilityMenuOpen = false; insertAtCursor(e.detail); }}
+          on:files={(e) => onFileSelect(e.detail)}
+          on:pickapproval={(e) => pickApproval(e.detail)}
+          on:compactsaved={compactThresholdSaved}
+          on:expandcfg={(e) => (menuExpandedCfg = menuExpandedCfg === e.detail ? '' : e.detail)}
+          on:pickmodel={(e) => pickCrossModel(e.detail.cfg, e.detail.m)}
+          on:manage={() => { modelMenuOpen = false; settingsOpen = true; }}
+          on:pickthink={(e) => (e.detail === 'on' ? pickThinkOn() : pickThinking(e.detail))}
+          on:thinkrange={(e) => thinkRangeInput(e.detail)}
+          on:send={send}
+          on:stop={stop}
+        />
       </div>
     </footer>
     </div>
@@ -10224,424 +9058,98 @@
           {#each rpVisibleTabs as t (t.key)}
             <div class="rp-pane" class:hidden={t.key !== rpTab}>
               {#if t.kind === 'artifacts'}
-                {#if rpLoading}
-                  <div class="trace-empty">加载中…</div>
-                {:else if !rpFiles.length}
-                  <div class="rp-empty">{rpArtifactsNote || '本会话还没有产物。agent 改到过的工作区文件会列在这里。'}</div>
-                {:else}
-                  {#if rpBackfilled}
-                    <div class="rp-note">旧会话：按检查点回溯，可能不全</div>
-                  {/if}
-                  {#each rpFiles as f (f.path)}
-                    <!-- 单击只选中、双击才预览、右键出菜单（2026-11-12 用户：和项目文件树同款交互） -->
-                    <button
-                      class="rp-file"
-                      class:sel={f.path === rpSelPath}
-                      title={f.path}
-                      on:click={() => (rpSelPath = f.path)}
-                      on:dblclick={() => openPreviewTab(f.path)}
-                      on:contextmenu={(e) => {
-                        // 拦下冒泡：根上的微调右键（onMicroContext）不能再抢这个事件
-                        e.preventDefault();
-                        e.stopPropagation();
-                        rpSelPath = f.path;
-                        openArtMenu(e, f.path);
-                      }}
-                    >
-                      {f.path}
-                    </button>
-                  {/each}
-                {/if}
-              {:else if t.kind === 'git'}
-                <!-- git 面板（提交跟审查合成一个标签，聊天区底部
-                     那根常驻条撤掉）。自上而下：状态行（分支/HEAD/领先落后）→ 范围选择器
-                     （本任务改动 = 影子仓库检查点 / 未提交改动 = 工作区相对 HEAD）→ 提交盒
-                     （未提交档：清单行前的勾选即暂存）→ 文件行点开就地看 diff -->
-                <div class="git-pane">
-                  {#if gitMissing}
-                    <!-- 缺 git 明说：撤销/检查点/改动/提交/审查 diff 都用不了 -->
-                    <div class="git-missing-note">没检测到 git：撤销、检查点、改动清单、提交、审查 diff 都用不了。{GIT_INSTALL_HINT}。</div>
-                  {:else if gitInfo && !gitInfo.is_repo}
-                    <!-- 只说事实不列功能清单（2026-11-12 用户：后面那串去掉） -->
-                    <div class="git-missing-note">当前工作区不是 git 仓库</div>
-                  {:else if gitInfo && gitInfo.is_repo}
-                    <div class="git-status">
-                      <span class="git-ref" title={gitInfo.upstream ? `上游：${gitInfo.upstream}` : '未设置上游分支'}>
-                        <svg class="git-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6.5" cy="6" r="2.5"/><circle cx="6.5" cy="18" r="2.5"/><circle cx="17.5" cy="12" r="2.5"/><path d="M6.5 8.5v7M9 6h3.5a3 3 0 0 1 3 3v1"/></svg>
-                        <b>{gitInfo.branch}</b>{#if gitInfo.head}<span class="git-head">@{gitInfo.head}</span>{/if}
-                      </span>
-                      {#if gitInfo.ahead || gitInfo.behind}
-                        <span class="git-ab" title="相对上游的领先/落后提交数">{#if gitInfo.ahead}↑{gitInfo.ahead}{/if}{#if gitInfo.behind}↓{gitInfo.behind}{/if}</span>
-                      {/if}
-                    </div>
-                  {/if}
-                  <!-- svelte-ignore a11y-label-has-associated-control -->
-                  <div class="rv-head">
-                    <!-- 自绘下拉（2026-11-12）：原生 select 的弹出层是系统画的，
-                         选中项灰底高亮改不了——换 Select 组件走统一选中口径 -->
-                    <div class="rv-src">
-                      <Select
-                        bind:value={rvSource}
-                        options={[
-                          { value: 'task', label: '本任务改动' },
-                          { value: 'work', label: '未提交改动' },
-                        ]}
-                        title="切换范围"
-                        on:change={() => {
-                          rvFiles = [];
-                          rvOpen = {};
-                          rvDiff = {};
-                          loadReview();
-                        }}
-                      />
-                    </div>
-                    {#if rvFiles.length}
-                      <span class="rv-totals">
-                        <b>{rvFiles.length}</b> 个文件<span class="rv-tsep">·</span><span class="review-add">+{rvFiles.reduce((s, f) => s + (f.adds || 0), 0)}</span><span class="rv-tsep">·</span><span class="review-del">-{rvFiles.reduce((s, f) => s + (f.dels || 0), 0)}</span>
-                      </span>
-                    {/if}
-                    <span class="flex-sp"></span>
-                    {#if dockCp && rvSource === 'task' && rvBaseline === dockCp.id}
-                      <button class="rv-btn" title="回滚到本任务起点（删除其后新建的已跟踪文件）" on:click={() => undoCheckpoint(dockCp)}>撤销</button>
-                    {/if}
-                    <button class="rv-btn" class:spin={rvLoading} title="重新读取（清单 + 分支状态）" on:click={() => { loadReview(); refreshGit(); }}>
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12a7 7 0 1 1-2.05-4.95" /><path d="M19 3.5V7h-3.5" /></svg>
-                    </button>
-                  </div>
-                  {#if rvSource === 'work' && gitInfo && gitInfo.is_repo && !gitMissing && rvFiles.length}
-                    <!-- 提交盒：跟清单同档出现（未提交改动 = 暂存区），勾选即「这次提交带上它」 -->
-                    <div class="commit-box">
-                      <textarea
-                        class="agents-editor commit-msg"
-                        rows="2"
-                        spellcheck="false"
-                        placeholder="提交信息（一句话说清这次改了什么）"
-                        bind:value={commitMsg}
-                      ></textarea>
-                      <div class="commit-bar">
-                        <button class="commit-go" disabled={commitBusy} on:click={doCommit}>
-                          {commitBusy ? '提交中…' : `提交 ${commitSelN} 个文件`}
-                        </button>
-                        <span class="commit-hint">只做本地 commit，不推送；未跟踪文件默认不勾</span>
-                      </div>
-                      {#if commitErr}<div class="commit-err">{commitErr}</div>{/if}
-                    </div>
-                  {/if}
-                  {#if rvLoading && !rvFiles.length}
-                    <div class="trace-empty">加载中…</div>
-                  {:else if rvError && !rvFiles.length}
-                    <div class="rp-empty">{rvError}</div>
-                  {:else if !rvFiles.length}
-                    <div class="rv-empty">
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9" /><path d="M8.5 12h7" /></svg>
-                      <div class="rv-empty-t">{rvSource === 'work' ? '没有未提交的改动' : '本任务还没有改动'}</div>
-                      <div class="rv-empty-d">{rvSource === 'work' ? 'agent 或你自己改动文件后，这里会列出来（相对 HEAD）。' : 'agent 修改/创建文件后，这里会列出改动清单（相对本次任务起点）。'}</div>
-                    </div>
-                  {:else}
-                    <div class="rv-list">
-                      {#each rvFiles as f (f.path)}
-                        {@const name = f.path.split('/').pop()}
-                        {@const dir = f.path.split('/').slice(0, -1).join('/')}
-                        {@const dc = rvDiff[f.path] || {}}
-                        <div class="rv-row" class:open={!!rvOpen[f.path]}>
-                          {#if rvSource === 'work'}
-                            <input
-                              class="rv-check"
-                              type="checkbox"
-                              checked={!!commitSel[f.path]}
-                              title={`提交这个文件（${gitStatusLabel(f.status)}）`}
-                              on:change={() => toggleCommitFile(f.path)}
-                            />
-                          {/if}
-                          <button
-                            class="rv-file"
-                            class:added={f.status === 'A' || f.status === '?'}
-                            class:deleted={f.status === 'D'}
-                            title={`${f.path}\n${gitStatusLabel(f.status)}\n右键：预览 / 复制路径`}
-                            on:click={() => toggleRv(f)}
-                            on:contextmenu={(e) => {
-                              e.preventDefault();
-                              rvMenu = { x: e.clientX, y: e.clientY, path: f.path };
-                            }}
-                          >
-                            <svg class="rv-fico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3.5h6.5L18 8v12.5H7z" /><path d="M13.5 3.5V8H18" /></svg>
-                            <span class="rv-fname">{name}</span>
-                            {#if dir}<span class="rv-fdir">{dir}/</span>{/if}
-                            {#if f.status !== '?'}
-                              <span class="rv-stat"><span class="review-add">+{f.adds}</span><span class="review-del">-{f.dels}</span></span>
-                            {/if}
-                            <svg class="rv-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6" /></svg>
-                          </button>
-                          {#if rvOpen[f.path]}
-                            <div class="rv-diffwrap">
-                              {#if dc.loading}
-                                <div class="rv-diffnote">加载中…</div>
-                              {:else if dc.error}
-                                <div class="rv-diffnote">读取失败: {dc.error}</div>
-                              {:else if !dc.text}
-                                <div class="rv-diffnote">没有可显示的 diff（该文件是未跟踪新增或无文本改动）。</div>
-                              {:else}
-                                <pre class="rv-diff">{#each rvParse(dc.text) as l, i (i)}<span class="rv-dl rv-dl-{l.t}">{#if l.t === 'add' || l.t === 'del' || l.t === 'ctx'}<span class="rv-dno">{l.o}</span><span class="rv-dno">{l.n}</span>{/if}<span class="rv-dtx">{l.s}</span></span>{/each}</pre>
-                              {/if}
-                            </div>
-                          {/if}
-                        </div>
-                      {/each}
-                    </div>
-                  {/if}
-                </div>
-              {:else if t.kind === 'file'}
-                <div class="rp-preview-head">
-                  <span class="rp-preview-path" title={t.path}>{t.path}</span>
-                  <span class="flex-sp"></span>
-                  {#if (rpPreviewCache[t.path] || {}).savedAt}
-                    <span class="rp-saved">已保存 {(rpPreviewCache[t.path] || {}).savedAt}</span>
-                  {/if}
-                  {#if (rpPreviewCache[t.path] || {}).editing}
-                    <button
-                      class="rp-btn"
-                      title="保存（写回工作区文件）"
-                      disabled={(rpPreviewCache[t.path] || {}).saving}
-                      on:click={() => savePreview(t.path)}
-                    >
-                      {(rpPreviewCache[t.path] || {}).saving ? '保存中…' : '保存'}
-                    </button>
-                    <button class="rp-btn" title="取消编辑（丢弃改动）" on:click={() => cancelEditPreview(t.path)}>取消</button>
-                  {:else if previewKind(t.path) === 'text' && (rpPreviewCache[t.path] || {}).content && !previewTruncated((rpPreviewCache[t.path] || {}).content)}
-                    <button class="rp-btn" title="编辑内容" on:click={() => startEditPreview(t.path)}>编辑</button>
-                  {/if}
-                  <button class="rp-refresh" title="重新读取" on:click={() => loadPreview(t.path, true)}>↻</button>
-                </div>
-                {#if (rpPreviewCache[t.path] || {}).editing}
-                  {#if (rpPreviewCache[t.path] || {}).editNote}
-                    <div class="rp-edit-note">{(rpPreviewCache[t.path] || {}).editNote}</div>
-                  {/if}
-                  <textarea
-                    class="rp-edit"
-                    spellcheck="false"
-                    value={(rpPreviewCache[t.path] || {}).draft || ''}
-                    on:input={(e) => rpSet(t.path, { draft: e.currentTarget.value })}
-                  ></textarea>
-                {:else if previewKind(t.path) === 'image'}
-                  <div class="rp-image-wrap">
-                    <img class="rp-image" src={`/api/workspace/raw?path=${encodeURIComponent(t.path)}`} alt={t.path} />
-                  </div>
-                {:else if previewKind(t.path) === 'pdf'}
-                  <!-- PDF 内嵌（WebView 自带查看器；#toolbar=0 藏掉查看器工具条，纯预览） -->
-                  <iframe class="rp-pdf" title={t.path} src={`/api/workspace/raw?path=${encodeURIComponent(t.path)}#toolbar=0`}></iframe>
-                {:else if previewKind(t.path) === 'docx'}
-                  <!-- docx：mammoth 排版直出，纯预览（工具条也去，无缩放/打印） -->
-                  {#if (rpPreviewCache[t.path] || {}).loading}
-                    <pre class="rp-preview">渲染中…</pre>
-                  {:else if (rpPreviewCache[t.path] || {}).error}
-                    <pre class="rp-preview">{`渲染失败: ${(rpPreviewCache[t.path] || {}).error}`}</pre>
-                  {:else}
-                    <iframe
-                      class="rp-pdf rp-doc-paper"
-                      title={t.path}
-                      sandbox=""
-                      srcdoc={`<!doctype html><html><head><meta charset="utf-8"><style>body{font-family:'Segoe UI','Microsoft YaHei',sans-serif;padding:28px;margin:0;line-height:1.75;color:#24292f;background:#fff}img{max-width:100%}table{border-collapse:collapse;width:100%}td,th{border:1px solid #999;padding:6px 10px}h1,h2,h3{line-height:1.4}blockquote{border-left:3px solid #999;margin:0;padding-left:12px;color:#666}pre{background:#f3f4f6;padding:10px;border-radius:6px}</style></head><body>${((rpPreviewCache[t.path] || {}).content || '').replace(/<script/gi, '&lt;script')}</body></html>`}
-                    ></iframe>
-                  {/if}
-                {:else if previewKind(t.path) === 'xlsx'}
-                  <!-- xlsx：SheetJS 表格直出，纯预览（组件全去，无工具条/缩放/表名标注） -->
-                  {#if (rpPreviewCache[t.path] || {}).loading}
-                    <pre class="rp-preview">渲染中…</pre>
-                  {:else if (rpPreviewCache[t.path] || {}).error}
-                    <pre class="rp-preview">{`渲染失败: ${(rpPreviewCache[t.path] || {}).error}`}</pre>
-                  {:else}
-                    <div class="rp-xlsx">
-                      {#each (() => { try { return JSON.parse((rpPreviewCache[t.path] || {}).content || '[]'); } catch { return []; } })() as sh}
-                        <div class="rp-xlsx-sheet">
-                          {#if sh.name}<div class="rp-xlsx-name">{sh.name}</div>{/if}
-                          <div class="rp-xlsx-body">
-                            <table>
-                              {#each sh.rows as row}<tr>{#each row as cell}<td>{cell}</td>{/each}</tr>{/each}
-                            </table>
-                          </div>
-                        </div>
-                      {/each}
-                    </div>
-                  {/if}
-                {:else if previewKind(t.path) === 'pptx'}
-                  <!-- pptx：后端分页文本直出，纯预览（组件全去，无工具条/缩放/页码） -->
-                  {#if (rpPreviewCache[t.path] || {}).loading}
-                    <pre class="rp-preview">渲染中…</pre>
-                  {:else if (rpPreviewCache[t.path] || {}).error}
-                    <pre class="rp-preview">{`渲染失败: ${(rpPreviewCache[t.path] || {}).error}`}</pre>
-                  {:else}
-                    <div class="rp-pptx">
-                      {#each (() => { try { return JSON.parse((rpPreviewCache[t.path] || {}).content || '[]'); } catch { return []; } })() as sl}
-                        <div class="rp-slide"><pre class="rp-slide-text">{sl.text || '（空白页）'}</pre></div>
-                      {/each}
-                    </div>
-                  {/if}
-                {:else if previewKind(t.path) === 'media'}
-                  <div class="rp-media-wrap">
-                    {#if ['mp4', 'm4v', 'webm', 'mov'].includes(extOf(t.path))}
-                      <video class="rp-media" controls autoplay={false} src={`/api/workspace/raw?path=${encodeURIComponent(t.path)}`}>
-                        <track kind="captions" />
-                      </video>
-                    {:else}
-                      <audio class="rp-media rp-audio" controls src={`/api/workspace/raw?path=${encodeURIComponent(t.path)}`}></audio>
-                    {/if}
-                  </div>
-                {:else if (rpPreviewCache[t.path] || {}).loading}
-                  <pre class="rp-preview">读取中…</pre>
-                {:else if (rpPreviewCache[t.path] || {}).error}
-                  <pre class="rp-preview">{`读取失败: ${(rpPreviewCache[t.path] || {}).error}`}</pre>
-                {:else}
-                  {#if previewKind(t.path) === 'doc'}
-                    <div class="rp-note">文档类预览：这里是抽取出来的文本（排版与图表不在其中），不提供编辑</div>
-                  {:else if previewTruncated((rpPreviewCache[t.path] || {}).content)}
-                    <div class="rp-note">文件较大，预览是头尾压缩过的（中间省略）——为避免把省略部分写没，不提供编辑</div>
-                  {/if}
-                  <pre class="rp-preview">{((rpPreviewCache[t.path] || {}).content) || '（空文件）'}</pre>
-                {/if}
-              {:else if t.kind === 'ext'}
-                <div class="web-wrap">
-                  {#if enabledExts.find((e) => e.name === t.name)}
-                    <iframe
-                      class="ext-frame"
-                      title={rpExtTitle(t.name)}
-                      sandbox="allow-scripts"
-                      bind:this={dockPaneFrames[t.name]}
-                      src={`/plugins/${encodeURIComponent(t.name)}/${enabledExts.find((e) => e.name === t.name).entry || 'index.html'}`}
-                      on:load={() => onExtFrameLoad(t.name)}
-                    ></iframe>
-                  {:else}
-                    <div class="rp-empty">{extList.length || extMsg ? '插件未加载或已停用' : '加载中…'}</div>
-                  {/if}
-                </div>
-              {:else}
-          <div class="web-wrap">
-            {#if webTabs.length}
-              <div class="web-tabbar">
-                <div class="web-tabs" bind:this={webStripEl} on:scroll={webStripSync}>
-                {#each webTabs as t (t.id)}
-                  <button
-                    class="web-tab"
-                    class:active={t.id === webActiveId}
-                    title={t.url || 'about:blank'}
-                    on:click={() => { webActiveId = t.id; if (!webBusy) webAddress = t.url === 'about:blank' ? '' : t.url || ''; webShotT += 1; webActivate(t.id); }}
-                  >
-                    <span class="web-tab-title">{t.title || (t.url === 'about:blank' ? '空白页' : t.url) || '空白页'}</span>
-                    {#if t.agent}<span class="web-tab-agent" title="agent 浏览器工具的工作页">agent</span>{/if}
-                    <span
-                      class="web-tab-x"
-                      title="关闭标签页"
-                      role="button"
-                      tabindex="-1"
-                      on:click|stopPropagation={() => webCloseTab(t.id)}
-                    >×</span>
-                  </button>
-                {/each}
-                </div>
-                {#if webStripBar}
-                  <!-- 溢出滑杆：压在 .web-tabbar 下边框线上，同右侧标签页那条 -->
-                  <i
-                    class="web-strip-track"
-                    style="width:{webStripBar.track}px"
-                    on:pointerdown={webStripDown}
-                    on:pointermove={webStripMove}
-                    on:pointerup={webStripUp}
-                    on:pointercancel={webStripUp}
-                  >
-                    <i class="web-strip-thumb" style="width:{webStripBar.w}px; transform:translateX({webStripBar.x}px)"></i>
-                  </i>
-                {/if}
-              </div>
-            {/if}
-            <div class="web-toolbar">
-              <button class="web-nav" title="后退" disabled={!webActive || webBusy} on:click={() => webAction('back')}>
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m14.5 6-6 6 6 6"/></svg>
-              </button>
-              <button class="web-nav" title="前进" disabled={!webActive || webBusy} on:click={() => webAction('forward')}>
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9.5 6 6 6-6 6"/></svg>
-              </button>
-              <button class="web-nav" title="刷新" disabled={!webActive || webBusy} on:click={() => webAction('reload')}>
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12a7 7 0 1 1-2.05-4.95"/><path d="M19 3.5V7h-3.5"/></svg>
-              </button>
-              <input
-                class="web-address"
-                placeholder="输入网址后回车"
-                bind:value={webAddress}
-                disabled={webBusy}
-                spellcheck="false"
-                on:keydown={(e) => {
-                  if (e.isComposing || e.keyCode === 229) return;
-                  if (e.key === 'Enter') { e.preventDefault(); webGo(); }
-                }}
-              />
-              {#if webNative && webActive && webActive.loading}
-                <span class="web-native-loading" title="页面加载中">●</span>
-              {/if}
-              <button class="web-add" title="新建标签页" on:click={webNewTab}>+</button>
-              <button class="web-nav" title="更多" on:click={(e) => webToggleMenu(e)}>
-                <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>
-              </button>
-              {#if webMenuOpen && !webNative}
-                <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
-                <div class="web-menu-backdrop" on:click={webCloseMenu}></div>
-                <div class="web-menu">
-                  <button on:click={() => webMenuAction('open-external')}>
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6"/><path d="M20 4 11 13"/><path d="M19 14v5a2 2 0 0 1-2 2H6a2 2 0 0 1 2-2h5"/></svg>
-                    在默认浏览器中打开
-                  </button>
-                  <!-- 无头模式没有「开发者工具」项：面板里是截图流，没有可挂真 DevTools 的
-                       实体（服务端 /api/browser/devtools 对无头模式返回 opened:false 并引导
-                       「在默认浏览器中打开后按 F12」）。壳模式的「⋯」菜单是壳里浮层
-                       （web/public/menu.html），「开发者工具」项在那边——child webview
-                       才有真 DevTools 可开。 -->
-                </div>
-              {/if}
-            </div>
-            {#if webError}
-              <div class="web-error">{webError}</div>
-            {/if}
-            {#if webDialog}
-              <!-- 页面 JS 弹窗（alert/confirm/prompt）：无头页面的原生弹窗在这处理，不卡死页面 -->
-              <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
-              <div class="web-dialog" on:click|stopPropagation>
-                <span class="web-dialog-msg">页面弹窗〔{webDialog.kind}〕{webDialog.message || '（无内容）'}</span>
-                <span class="flex-sp"></span>
-                <button class="btn ghost" on:click={() => webDialogAction(true)}>确定</button>
-                <button class="btn ghost" on:click={() => webDialogAction(false)}>取消</button>
-              </div>
-            {/if}
-            <div
-              class="web-body"
-              class:has-shot={webShowShot && (!webNative || shellModalLive)}
-              bind:this={webBodyEl}
-              bind:clientWidth={webBodyW}
-              bind:clientHeight={webBodyH}
-            >
-              {#if !webShowShot}
-                <div class="web-empty">
-                  <svg class="web-globe" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.6 2.3 3.9 5.1 3.9 8.5s-1.3 6.2-3.9 8.5c-2.6-2.3-3.9-5.1-3.9-8.5s1.3-6.2 3.9-8.5Z"/></svg>
-                  <div class="web-empty-title">网页</div>
-                  <div class="web-empty-sub">粘贴或输入 URL 以打开网页。</div>
-                </div>
-              {:else if webNative && !shellModalLive}
-                <!-- 壳窗口里的 child webview 就浮在这块区域上（原生 HWND 盖在 Svelte 之上），
-                     这里只留占位——点击/滚动/输入全部走真实网页，不再坐标回传。
-                     弹窗打开时 webview 移出屏幕保活、走下面的帧流分支（画面实时垫在弹窗下） -->
-                <div class="web-native" aria-hidden="true"></div>
-              {:else}
-                {#if webBusy || (webActive && webActive.loading)}<div class="web-loading">加载中…</div>{/if}
-                <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
-                <img
-                  class="web-shot"
-                  class:busy={webBusy}
-                  src={`/api/browser/frame?id=${encodeURIComponent(webActive.id)}&t=${webShotT}&native=0`}
-                  alt="页面画面"
-                  draggable="false"
-                  on:click={webShotClick}
-                  on:wheel={webShotWheel}
+                <!-- 2026-11-14 阶段 A 第一片：产物标签抽成组件（数据留根、事件上行） -->
+                <ArtifactsPane
+                  loading={rpLoading}
+                  files={rpFiles}
+                  note={rpArtifactsNote}
+                  backfilled={rpBackfilled}
+                  selPath={rpSelPath}
+                  on:select={(e) => (rpSelPath = e.detail)}
+                  on:preview={(e) => openPreviewTab(e.detail)}
+                  on:artmenu={(e) => openArtMenu(e.detail.e, e.detail.path)}
                 />
-              {/if}
-            </div>
-          </div>
+              {:else if t.kind === 'git'}
+                <!-- 2026-11-15 阶段 A-3：git 标签抽成组件（rv* 簇/gitInfo/dockCp 留根——SSE
+                     钩子与提交流程都在根上，动作事件上行，rvSource/commitMsg 走 bind 双向） -->
+                <GitPane
+                  bind:source={rvSource}
+                  files={rvFiles}
+                  open={rvOpen}
+                  diff={rvDiff}
+                  baseline={rvBaseline}
+                  loading={rvLoading}
+                  error={rvError}
+                  dockCp={dockCp}
+                  gitInfo={gitInfo}
+                  gitMissing={gitMissing}
+                  bind:commitMsg={commitMsg}
+                  commitBusy={commitBusy}
+                  commitSel={commitSel}
+                  commitSelN={commitSelN}
+                  commitErr={commitErr}
+                  on:rangechanged={() => { rvFiles = []; rvOpen = {}; rvDiff = {}; loadReview(); }}
+                  on:refresh={() => { loadReview(); refreshGit(); }}
+                  on:undo={() => undoCheckpoint(dockCp)}
+                  on:commit={doCommit}
+                  on:togglefile={(e) => toggleCommitFile(e.detail)}
+                  on:togglerow={(e) => toggleRv(e.detail)}
+                  on:menu={(e) => (rvMenu = e.detail)}
+                />
+              {:else if t.kind === 'file'}
+                <!-- 2026-11-14 阶段 A-2：文件预览抽成组件（rpPreviewCache 留根，动作事件上行） -->
+                <PreviewPane
+                  path={t.path}
+                  entry={rpPreviewCache[t.path] || {}}
+                  on:save={(e) => savePreview(e.detail)}
+                  on:canceledit={(e) => cancelEditPreview(e.detail)}
+                  on:startedit={(e) => startEditPreview(e.detail)}
+                  on:refresh={(e) => loadPreview(e.detail, true)}
+                  on:draft={(e) => rpSet(t.path, { draft: e.detail })}
+                />
+              {:else if t.kind === 'ext'}
+                <!-- 2026-11-15 阶段 A-4：插件 dock 标签抽成组件（插件桥留根；iframe 元素
+                     经 bind:frame 上行登记进 dockPaneFrames，load 上行走 onExtFrameLoad） -->
+                <ExtPane
+                  title={rpExtTitle(t.name)}
+                  ready={!!enabledExts.find((e) => e.name === t.name)}
+                  src={`/plugins/${encodeURIComponent(t.name)}/${(enabledExts.find((e) => e.name === t.name) || {}).entry || 'index.html'}`}
+                  placeholder={extList.length || extMsg ? '插件未加载或已停用' : '加载中…'}
+                  bind:frame={dockPaneFrames[t.name]}
+                  on:load={() => onExtFrameLoad(t.name)}
+                />
+              {:else if t.kind === 'web'}
+                <!-- 2026-11-15 阶段 A-4：网页标签抽成组件（壳桥状态簇/视口同步/弹窗让位全留根，
+                     markup+样式+页签滑杆随组件走；动作事件上行，address/bodyEl/bodyW/bodyH 双向） -->
+                <WebPane
+                  tabs={webTabs}
+                  activeId={webActiveId}
+                  active={webActive}
+                  bind:address={webAddress}
+                  busy={webBusy}
+                  error={webError}
+                  dialog={webDialog}
+                  native={webNative}
+                  modalLive={shellModalLive}
+                  showShot={webShowShot}
+                  shotT={webShotT}
+                  menuOpen={webMenuOpen}
+                  rpWidth={rpWidth}
+                  bind:bodyEl={webBodyEl}
+                  bind:bodyW={webBodyW}
+                  bind:bodyH={webBodyH}
+                  on:select={(e) => selectWebTab(e.detail)}
+                  on:closetab={(e) => webCloseTab(e.detail)}
+                  on:newtab={webNewTab}
+                  on:go={webGo}
+                  on:action={(e) => webAction(e.detail)}
+                  on:menutoggle={(e) => webToggleMenu(e.detail)}
+                  on:menuclose={webCloseMenu}
+                  on:menuaction={(e) => webMenuAction(e.detail)}
+                  on:dialog={(e) => webDialogAction(e.detail)}
+                  on:shotclick={(e) => webShotClick(e.detail)}
+                  on:shotwheel={(e) => webShotWheel(e.detail)}
+                />
               {/if}
             </div>
           {/each}
@@ -11208,27 +9716,23 @@
   :global(body.has-wallpaper) {
     background: transparent;
   }
-  :global(body.has-wallpaper) .sidebar {
-    background: color-mix(in srgb, var(--g0) 60%, transparent);
-    border-right-color: color-mix(in srgb, var(--g4) 30%, transparent);
-  }
   :global(body.has-wallpaper) .chat-head {
     background: color-mix(in srgb, var(--g1) 62%, transparent);
     border-bottom-color: color-mix(in srgb, var(--g4) 30%, transparent);
   }
   /* 消息流内的深色面全部转半透明：88% 实色在壁纸上就是一块黑，用户 CSS 想盖也因为
      规则分散（.process/.cp-bar/...）而显得"去不掉"，这里统一收口 */
-  :global(body.has-wallpaper) .asst-bubble {
+  :global(body.has-wallpaper) :global(.asst-bubble) {
     background: color-mix(in srgb, var(--g1) 72%, transparent);
     border-color: color-mix(in srgb, var(--g2) 50%, transparent);
   }
   :global(body.has-wallpaper) .composer {
     background: color-mix(in srgb, var(--g2) 72%, transparent);
   }
-  :global(body.has-wallpaper) .process,
-  :global(body.has-wallpaper) .tool-detail,
-  :global(body.has-wallpaper) .approval-box,
-  :global(body.has-wallpaper) .ctx-card {
+  :global(body.has-wallpaper) :global(.process),
+  :global(body.has-wallpaper) :global(.tool-detail),
+  :global(body.has-wallpaper) :global(.approval-box),
+  :global(body.has-wallpaper) :global(.ctx-card) {
     background: color-mix(in srgb, var(--g1) 66%, transparent);
     border-color: color-mix(in srgb, var(--g3) 50%, transparent);
   }
@@ -11237,538 +9741,13 @@
     background: color-mix(in srgb, var(--g0) 60%, transparent);
     border-left-color: color-mix(in srgb, var(--g4) 30%, transparent);
   }
-  :global(body.has-wallpaper) .rp-preview {
+  :global(body.has-wallpaper) :global(.rp-preview) {
     background: color-mix(in srgb, var(--g1) 66%, transparent);
     border-color: color-mix(in srgb, var(--g3) 50%, transparent);
-  }
-  .sidebar {
-    width: 280px;
-    box-sizing: border-box; /*  修复：宽=sidebarW 语义对齐（渲染宽不再多出 padding+border 25px，拖拽手柄贴手指） */
-    flex: none;
-    /* 2026-11-11 全局透明+描边：面板玻璃化（壁纸透出，文字仍有底） */
-    background: var(--glass-panel);
-    border-right: 1px solid var(--g3);
-    display: flex;
-    flex-direction: column;
-    padding: 14px 12px 10px;
-    position: relative;
-  }
-  .sidebar.resizing {
-    border-right-color: var(--g3);
-  }
-  .resize-handle {
-    position: absolute;
-    top: 0;
-    bottom: 0;
-    right: -3px;
-    width: 6px;
-    cursor: col-resize;
-    z-index: 20;
-    /* 指针拖拽：禁掉触摸的滚动/缩放手势，pointermove 才会连续到手柄 */
-    touch-action: none;
-  }
-  .resize-handle:hover {
-    background: var(--veil);
-  }
-  .sidebar.collapsed {
-    display: none;
   }
   /* 侧栏收起时展开按钮浮在左上角，标题要让位，否则两者叠在一起 */
   .chat.side-collapsed .chat-head {
     padding-left: 60px;
-  }
-  .side-head {
-    flex: none;
-  }
-  .brand-row {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 2px 4px 14px;
-  }
-  .brand-mark {
-    width: 30px;
-    height: 30px;
-    border-radius: 8px;
-    /* 2026-11-01：图标换成无背景线稿，不再压阴影（透明底上阴影是一圈方框） */
-    overflow: hidden;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    flex: none;
-  }
-  .brand-mark img {
-    width: 100%;
-    height: 100%;
-    display: block;
-  }
-  .brand-name {
-    flex: 1;
-    font-size: 16px;
-    font-weight: 650;
-    color: var(--g7);
-    letter-spacing: 0.2px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .icon-btn {
-    width: 34px;
-    height: 34px;
-    border-radius: 9px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: transparent;
-    border: none;
-    color: var(--g6);
-    cursor: pointer;
-    flex: none;
-  }
-  .icon-btn:hover {
-    background: var(--g2);
-    color: var(--g7);
-  }
-  .icon-btn.on {
-    /* 开关型图标钮（侧栏收起钮/搜索/管理等）选中=橙色高亮无底色（2026-11-12 统一口径） */
-    background: var(--sel-bg);
-    color: var(--sel-fg);
-  }
-  .icon-btn:disabled {
-    opacity: 0.45;
-    cursor: default;
-  }
-  .icon-btn svg {
-    width: 20px;
-    height: 20px;
-  }
-  .new-chat {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 8px;
-    width: 100%;
-    height: 40px;
-    border-radius: 10px;
-    border: 1.5px solid var(--g3);
-    background: transparent;
-    color: var(--g7);
-    font-size: 13.5px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: background 0.15s ease, border-color 0.15s ease;
-  }
-  .new-chat:hover {
-    background: transparent;
-    border-color: var(--g5);
-  }
-  .new-chat:disabled {
-    opacity: 0.5;
-    cursor: default;
-  }
-  .new-chat svg {
-    width: 19px;
-    height: 19px;
-  }
-  .section-row {
-    position: relative;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 14px 4px 6px;
-  }
-  .section-label {
-    color: var(--g5);
-    font-size: 14px;
-    padding-left: 4px;
-  }
-  .section-tools {
-    display: flex;
-    gap: 3px;
-  }
-  .section-tools .icon-btn {
-    width: 30px;
-    height: 30px;
-    border-radius: 8px;
-    color: var(--g5);
-  }
-  .section-tools .icon-btn:hover {
-    color: var(--g7);
-  }
-  .section-tools .icon-btn.on {
-    /* 工作区行三钮（搜索/管理）：开=橙色高亮无底色（2026-11-12 用户拍板） */
-    color: var(--sel-fg);
-  }
-  /* 侧栏这排钮（搜索/管理/添加项目）与顶部两钮（收起侧栏/重新加载）：输入栏那份同名
-     .icon-btn 的边框和 hover 背景会渗过来——排内统一钉死：
-     ① 常态/悬停一律不描边（用户两次圈选）；
-     ② 选中态按全局口径铺 --sel-bg（高亮模式=透明，底色模式=浅底）；
-     ③ 悬停不许刷掉选中底——第二份 .icon-btn:hover 的 transparent 比 .icon-btn.on 更靠后，
-        不在排内用更高特异性压住，鼠标停在选中钮上底色就没了（2026-11-12 底色模式实测） */
-  .section-tools .icon-btn,
-  .section-tools .icon-btn:hover,
-  .side-head .icon-btn,
-  .side-head .icon-btn:hover {
-    border: none;
-  }
-  .section-tools .icon-btn.on,
-  .section-tools .icon-btn.on:hover,
-  .side-head .icon-btn.on,
-  .side-head .icon-btn.on:hover {
-    border: none;
-    background: var(--sel-bg);
-    color: var(--sel-fg);
-  }
-  .section-tools .icon-btn svg {
-    width: 18px;
-    height: 18px;
-  }
-  .side-search {
-    margin: 2px 2px 8px;
-    width: calc(100% - 4px);
-    box-sizing: border-box;
-    background: transparent;
-    border: 1.5px solid var(--g3);
-    border-radius: 10px;
-    color: var(--g7);
-    font-size: 14px;
-    padding: 9px 12px;
-    outline: none;
-  }
-  .side-search:focus {
-    border-color: var(--g6);
-  }
-  .manage-bar {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 4px 2px 10px;
-    flex-wrap: wrap;
-  }
-  .m-count {
-    color: var(--g5);
-    font-size: 13px;
-    margin-right: auto;
-    padding-left: 4px;
-  }
-  .m-btn {
-    background: var(--g1);
-    border: 1px solid var(--g2);
-    color: var(--g6);
-    font-size: 13px;
-    border-radius: 8px;
-    padding: 5px 10px;
-    cursor: pointer;
-  }
-  .m-btn:hover:not(:disabled) {
-    background: var(--g2);
-  }
-  .m-btn:disabled {
-    opacity: 0.45;
-    cursor: default;
-  }
-  .m-btn.danger {
-    color: var(--err, #e5697a);
-    border-color: color-mix(in srgb, var(--err, #e5697a) 38%, transparent);
-  }
-  .m-btn.danger:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--err, #e5697a) 12%, transparent);
-  }
-  .m-btn.primary {
-    background: transparent;
-    border-color: var(--g3);
-    color: var(--g7);
-    font-weight: 620;
-  }
-  .side-scroll {
-    flex: 1;
-    overflow-y: auto;
-    margin: 0 -4px;
-    padding: 0 4px;
-  }
-  .proj {
-    position: relative;
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    height: 48px;
-    padding: 0 10px;
-    border-radius: 12px;
-    cursor: pointer;
-    color: var(--g7);
-    font-size: 15.5px;
-    /* 2026-11-12 用户拍板：项目/会话条目一律不加底色描边（hover/展开/选中都是），
-       高亮只走文字（选中项橙色加粗，见 .proj.active/.conv.active） */
-  }
-  .proj > svg {
-    width: 19px;
-    height: 19px;
-    color: var(--g6);
-    flex: none;
-  }
-  /* 展开/收起的独立热区（在项目行内部，点它不切项目） */
-  .proj-toggle {
-    width: 22px;
-    height: 22px;
-    margin: 0 -3px 0 -2px;
-    padding: 0;
-    border: none;
-    background: transparent;
-    color: var(--g6);
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    cursor: pointer;
-    flex: none;
-    border-radius: 6px;
-  }
-  .proj-toggle:hover {
-    /* 只提亮不铺底（2026-11-12 用户：收起展开瞬间条目/文件夹闪背景色）——
-       钮在光标下随行重排忽有忽无，有底色就表现为闪烁 */
-    color: var(--g7);
-  }
-  .proj-toggle svg {
-    width: 19px;
-    height: 19px;
-  }
-  .proj-name {
-    flex: 1;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .proj.active {
-    /* 选中口径统一（2026-11-12）：默认文字高亮；底色模式下铺 --sel-bg */
-    background: var(--sel-bg);
-  }
-  .proj.active .proj-name {
-    /* 项目名同会话条目一样走橙色高亮（2026-11-12 用户：所有选中态统一，不再「橙只留会话」） */
-    color: var(--sel-fg);
-    font-weight: 600;
-  }
-  /* 当前项目的小圆点标记 */
-  .proj-cur {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--g5);
-    flex: none;
-    margin-left: 2px;
-  }
-  .proj-side {
-    display: none;
-    align-items: center;
-    gap: 4px;
-  }
-  .proj:hover .proj-side,
-  .proj.expanded .proj-side {
-    display: flex;
-  }
-  .row-btn {
-    width: 28px;
-    height: 28px;
-    border-radius: 8px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: transparent;
-    border: none;
-    color: var(--g6);
-    cursor: pointer;
-    flex: none;
-  }
-  .row-btn:hover {
-    background: var(--g2);
-    color: var(--g7);
-  }
-  .row-btn.on {
-    /* 底色模式要跟着铺底（2026-11-12）；高亮模式 --sel-bg 是透明 */
-    background: var(--sel-bg);
-    color: var(--sel-fg);
-  }
-  .row-btn svg {
-    width: 17px;
-    height: 17px;
-  }
-  .conv {
-    position: relative;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    height: 42px;
-    padding: 0 10px 0 38px;
-    border-radius: 10px;
-    cursor: pointer;
-    color: var(--g6);
-    font-size: 14.5px;
-    transition: background 0.15s ease, color 0.15s ease;
-  }
-  .conv.active {
-    /* 选中口径统一：橙字加粗无底色；底色模式下铺 --sel-bg（同 .proj.active） */
-    color: var(--sel-fg);
-    background: var(--sel-bg);
-    font-weight: 600;
-  }
-  /* 运行中：会话行/项目行前的小转圈（本页的流即时，服务端在跑的靠 3 秒轮询补） */
-  .conv-spin {
-    flex: none;
-    width: 11px;
-    height: 11px;
-    border-radius: 50%;
-    border: 1.5px solid var(--g4);
-    border-top-color: var(--g7);
-    animation: conv-spin 0.8s linear infinite;
-  }
-  @keyframes conv-spin {
-    to {
-      transform: rotate(360deg);
-    }
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .conv-spin {
-      animation-duration: 2s;
-    }
-  }
-  .conv-pin {
-    width: 15px;
-    height: 15px;
-    color: var(--g5);
-    flex: none;
-  }
-  .conv-check {
-    position: relative;
-    width: 16px;
-    height: 16px;
-    border: 1.5px solid var(--g4);
-    border-radius: 4.5px;
-    flex: none;
-  }
-  .conv-check svg {
-    position: absolute;
-    inset: 1px;
-    width: calc(100% - 2px);
-    height: calc(100% - 2px);
-    color: var(--g1);
-    opacity: 0;
-  }
-  .conv-check.on {
-    background: var(--g7);
-    border-color: var(--g7);
-  }
-  .conv-check.on svg {
-    opacity: 1;
-  }
-  .conv-title {
-    flex: 1;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .conv-more {
-    display: none;
-    width: 26px;
-    height: 26px;
-    border-radius: 7px;
-    align-items: center;
-    justify-content: center;
-    background: transparent;
-    border: none;
-    color: var(--g6);
-    cursor: pointer;
-    flex: none;
-  }
-  .conv-more:hover {
-    background: var(--g2);
-    color: var(--g7);
-  }
-  .conv-more svg {
-    width: 16px;
-    height: 16px;
-  }
-  .conv:hover .conv-more {
-    display: flex;
-  }
-  .conv:hover .conv-time {
-    display: none;
-  }
-  .conv-time {
-    font-size: 12.5px;
-    color: var(--g5);
-    flex: none;
-  }
-  .expand-more {
-    display: block;
-    width: 100%;
-    text-align: left;
-    background: none;
-    border: none;
-    color: var(--g5);
-    font-size: 14px;
-    padding: 10px 10px 10px 38px;
-    cursor: pointer;
-    border-radius: 10px;
-  }
-  .expand-more:hover {
-    color: var(--g6);
-    background: var(--veil);
-  }
-  .side-empty {
-    color: var(--g4);
-    font-size: 14px;
-    padding: 18px 12px;
-  }
-  .side-menu {
-    position: absolute;
-    z-index: 40;
-    min-width: 172px;
-    background: var(--glass-float);
-    border: 1px solid var(--g3);
-    border-radius: 14px;
-    padding: 6px;
-    box-shadow: 0 12px 32px var(--overlay);
-  }
-  .sess-menu,
-  .proj-menu {
-    top: calc(100% + 4px);
-    right: 6px;
-  }
-  .view-menu {
-    top: calc(100% + 2px);
-    right: 0;
-  }
-  .menu-sep {
-    height: 1px;
-    margin: 5px 8px;
-    background: var(--g2);
-  }
-  .side-menu button {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    width: 100%;
-    background: none;
-    border: none;
-    color: var(--g7);
-    font-size: 14px;
-    padding: 10px 12px;
-    border-radius: 9px;
-    cursor: pointer;
-    text-align: left;
-    white-space: nowrap;
-  }
-  .side-menu button:hover {
-    /* 菜单底子已是 g2 系玻璃：hover 要深/浅一档（g3）才看得见 */
-    background: var(--g3);
-  }
-  .side-menu button svg {
-    width: 17px;
-    height: 17px;
-    color: var(--g6);
-    flex: none;
-  }
-  .side-menu .sel-check {
-    margin-left: auto;
-    color: var(--g7);
   }
   .sidebar-restore {
     position: absolute;
@@ -11793,42 +9772,6 @@
   .sidebar-restore svg {
     width: 20px;
     height: 20px;
-  }
-  .side-foot {
-    flex: none;
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
-    padding-top: 8px;
-  }
-  .foot-btn {
-    flex: 1;
-    background: transparent;
-    border: 1px solid var(--g2);
-    color: var(--g5);
-    font-size: 13px;
-    border-radius: 10px;
-    padding: 8px 0;
-    cursor: pointer;
-  }
-  .foot-btn:hover {
-    color: var(--g6);
-    background: var(--g1);
-  }
-  .galaxy-btn {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: 6px;
-  }
-  .galaxy-btn svg {
-    width: 15px;
-    height: 15px;
-  }
-  /* 齿轮线框比记忆库的球体显大，缩半档对齐视觉大小 */
-  .galaxy-btn .settings-gear {
-    width: 13px;
-    height: 13px;
   }
   .chat {
     flex: 1;
@@ -11863,7 +9806,7 @@
     border-radius: 16px;
     border: 1px solid var(--g3);
     background: var(--g1);
-    color: var(--tint-blue-fg);
+    color: var(--tint-orange-fg);
     font-size: 12px;
     cursor: pointer;
     box-shadow: 0 4px 12px var(--overlay);
@@ -11871,100 +9814,12 @@
   .jump-bottom:hover {
     border-color: var(--g4);
   }
-  .ctx-wrap {
-    position: relative;
-    display: flex;
-    align-items: center;
-    /* 圆环和百分数之间留 6px（2026-11-01 真机实测「圆环和数字撞位」——原先贴死） */
-    gap: 6px;
-    flex-shrink: 0;
-  }
-  .ctx-ring {
-    display: block;
-    cursor: default;
-  }
-  .ctx-card {
-    display: none;
-    position: absolute;
-    bottom: calc(100% + 12px);
-    right: -8px;
-    width: 300px;
-    background: var(--glass-float);
-    border: 1px solid var(--g3);
-    border-radius: 10px;
-    padding: 12px 14px;
-    box-shadow: 0 8px 24px var(--overlay);
-    z-index: 20;
-    font-size: 13px;
-  }
-  /* 悬停桥：卡片与环之间的间隙保持 hover 不断 */
-  .ctx-card::after {
-    content: '';
-    position: absolute;
-    top: 100%;
-    right: 0;
-    width: 60%;
-    height: 12px;
-  }
-  .ctx-wrap:hover .ctx-card {
-    display: block;
-  }
-  .ctx-card-head {
-    display: flex;
-    justify-content: space-between;
-    align-items: baseline;
-    margin-bottom: 10px;
-    /* 标题用正文色（2026-11-07 浅色实锤：原先整卡 tint-blue，浅色下全部文字染成亮蓝） */
-    color: var(--g7);
-  }
-  .ctx-card-head span {
-    color: var(--g6);
-    font-size: 12px;
-  }
-  .ctx-bar {
-    height: 8px;
-    border-radius: 4px;
-    background: var(--g2);
-    overflow: hidden;
-    margin-bottom: 12px;
-  }
-  /* 填充色随圆环 ctxColor（style:background 绑定）：常态与圆环同灰，压力高转警示色 */
-  .ctx-bar-fill {
-    height: 100%;
-    border-radius: 4px;
-    transition: width 0.3s;
-  }
-  .ctx-row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 4px 0;
-    color: var(--g7);
-  }
-  .ctx-dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    flex-shrink: 0;
-  }
-  .ctx-label {
-    flex: 1;
-  }
-  .ctx-val {
-    color: var(--g6);
-    font-variant-numeric: tabular-nums;
-  }
   .ctx-card-foot {
     margin-top: 10px;
     padding-top: 8px;
     border-top: 1px solid var(--g2);
     color: var(--g5);
     font-size: 11px;
-  }
-  .cache-row {
-    margin-top: 8px;
-    padding-top: 8px;
-    border-top: 1px solid var(--g2);
   }
   .chat-head {
     display: flex;
@@ -12157,293 +10012,6 @@
     /* 透明：插件把 body 背景改成全透明时，让外层面板的底色/壁纸透上来，
        而不是被 iframe 元素自己那层实色挡住 */
     background: transparent;
-  }
-  /* 网页面板（内置浏览器：截图渲染 + 坐标回传，与 agent 工具共享实例） */
-  .web-wrap {
-    flex: 1;
-    min-height: 0;
-    display: flex;
-    flex-direction: column;
-  }
-  .web-error {
-    color: var(--tint-red-fg, #ff6b6b);
-    font-size: 12px;
-    padding: 4px 2px 0;
-  }
-  .web-dialog {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin: 4px 0;
-    padding: 6px 8px;
-    border: 1px solid var(--g3);
-    border-radius: 6px;
-    background: var(--g1);
-    font-size: 12px;
-  }
-  .web-dialog-msg {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    max-width: 60%;
-  }
-  .web-tabbar {
-    position: relative; /* 溢出滑杆的锚点（压在下边框线上） */
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    padding: 6px 8px;
-    border-bottom: 1px solid var(--g3);
-  }
-  .web-tabs {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    overflow-x: auto;
-    flex: 1;
-    min-width: 0;
-    scrollbar-width: none; /* 原生滚动条藏掉，溢出用自绘滑杆（同 rp-tabstrip） */
-  }
-  .web-tabs::-webkit-scrollbar {
-    display: none;
-  }
-  .web-strip-track {
-    position: absolute;
-    left: 8px;
-    bottom: -3px;
-    height: 7px;
-    z-index: 2;
-    cursor: pointer;
-  }
-  .web-strip-thumb {
-    display: block;
-    height: 2px;
-    margin-top: 2.5px;
-    border-radius: 1px;
-    background: var(--g4);
-  }
-  .web-strip-track:hover .web-strip-thumb {
-    background: var(--g6);
-  }
-  .web-tab {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    max-width: 150px;
-    padding: 3px 6px;
-    border: 1px solid var(--g3);
-    border-radius: 7px;
-    background: var(--g1);
-    color: var(--g6);
-    font-size: 12px;
-    cursor: pointer;
-    white-space: nowrap;
-    flex: none;
-  }
-  .web-tab.active {
-    /* 网页页签激活：统一选中口径（橙字无底色；底色模式铺 --sel-bg） */
-    background: var(--sel-bg);
-    color: var(--sel-fg);
-  }
-  .web-tab-title {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    max-width: 96px;
-  }
-  .web-tab-agent {
-    font-size: 10px;
-    color: var(--tint-blue-fg, #6aa9ff);
-    border: 1px solid currentColor;
-    border-radius: 4px;
-    padding: 0 3px;
-    flex: none;
-  }
-  .web-tab-x {
-    opacity: 0.55;
-    padding: 0 2px;
-  }
-  .web-tab-x:hover {
-    opacity: 1;
-  }
-  .web-add {
-    flex: none;
-    width: 22px;
-    height: 22px;
-    border: 1px solid var(--g3);
-    border-radius: 7px;
-    background: var(--g1);
-    color: var(--g6);
-    font-size: 15px;
-    line-height: 1;
-    cursor: pointer;
-  }
-  .web-add:hover {
-    color: var(--g7);
-  }
-  .web-menu-backdrop {
-    position: fixed;
-    inset: 0;
-    z-index: 30;
-  }
-  .web-menu {
-    position: absolute;
-    top: calc(100% + 2px);
-    right: 8px;
-    z-index: 31;
-    background: var(--glass-float);
-    border: 1px solid var(--g3);
-    border-radius: 9px;
-    padding: 4px;
-    min-width: 180px;
-    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
-  }
-  /* 「⋯」菜单（仅无头模式：HTML 下拉盖在截图上，z-index 正常）。
-     shell 模式不用这个浮层——菜单是壳里一个透明置顶的 webview（见 webToggleMenu：
-     浮在网页之上、网页不动），因为 child webview 是 HWND，HTML 永远盖不过它。 */
-  .web-menu button {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    width: 100%;
-    padding: 7px 10px;
-    border: none;
-    background: transparent;
-    color: var(--g7);
-    font-size: 12.5px;
-    border-radius: 6px;
-    cursor: pointer;
-    text-align: left;
-  }
-  .web-menu button:hover {
-    background: var(--g3);
-  }
-  .web-menu svg {
-    width: 14px;
-    height: 14px;
-    flex: none;
-    color: var(--g6);
-  }
-  .web-toolbar {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    padding: 6px 8px;
-    border-bottom: 1px solid var(--g3);
-    position: relative;
-  }
-  .web-nav {
-    flex: none;
-    width: 26px;
-    height: 26px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    border: none;
-    background: transparent;
-    color: var(--g6);
-    border-radius: 7px;
-    cursor: pointer;
-  }
-  .web-nav:hover:not(:disabled) {
-    background: var(--g2);
-    color: var(--g7);
-  }
-  .web-nav:disabled {
-    opacity: 0.4;
-    cursor: default;
-  }
-  .web-nav svg {
-    width: 15px;
-    height: 15px;
-  }
-  .web-address {
-    flex: 1;
-    min-width: 0;
-    padding: 5px 10px;
-    border: 1px solid var(--g3);
-    border-radius: 8px;
-    background: var(--g1);
-    color: var(--g7);
-    font-size: 12.5px;
-    outline: none;
-  }
-  .web-address:focus {
-    border-color: var(--g5);
-  }
-  .web-body {
-    flex: 1;
-    min-height: 0;
-    position: relative;
-    overflow: auto;
-    background: var(--g1);
-    display: flex;
-    align-items: flex-start;
-    justify-content: center;
-  }
-  /* 帧流模式不能让滚动条参与布局：图高 = 宽 × 帧高宽比，1px 溢出就会长出滚动条，
-     宽度随即少 15px、页面整体缩一圈（2026-11-06 实测「打开弹窗网页往里缩一点」）。 */
-  .web-body.has-shot {
-    overflow: hidden;
-  }
-  .web-empty {
-    margin: auto;
-    text-align: center;
-    color: var(--g5);
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 6px;
-    padding: 40px 10px;
-  }
-  .web-globe {
-    width: 52px;
-    height: 52px;
-    opacity: 0.5;
-  }
-  .web-empty-title {
-    font-size: 14px;
-    color: var(--g6);
-  }
-  .web-empty-sub {
-    font-size: 12px;
-  }
-  .web-shot {
-    width: 100%;
-    height: auto;
-    display: block;
-    cursor: pointer;
-    user-select: none;
-  }
-  /* 壳里 child webview 的占位区（原生 HWND 盖在这块上面，这里只是撑出尺寸） */
-  .web-native {
-    position: absolute;
-    inset: 0;
-    cursor: default;
-  }
-  .web-native-loading {
-    color: var(--g-accent, #6cf);
-    font-size: 9px;
-    line-height: 1;
-    animation: web-pulse 1s ease-in-out infinite;
-  }
-  @keyframes web-pulse {
-    0%, 100% { opacity: 0.25; }
-    50% { opacity: 1; }
-  }
-  .web-shot.busy {
-    opacity: 0.6;
-  }
-  .web-loading {
-    position: absolute;
-    top: 8px;
-    right: 10px;
-    font-size: 11px;
-    color: var(--g6);
-    background: var(--g2);
-    border: 1px solid var(--g3);
-    border-radius: 6px;
-    padding: 2px 8px;
-    z-index: 2;
   }
   .ext-panel .rp-tabs {
     flex-wrap: nowrap;
@@ -12642,155 +10210,6 @@
     width: 24px;
     height: 24px;
   }
-  /* 文件预览标签的头部（路径吸顶 + 编辑/保存/重读） */
-  .rp-preview-head {
-    position: sticky;
-    top: -8px;
-    z-index: 2;
-    flex: none;
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    margin: -8px -8px 6px;
-    padding: 6px 6px 6px 10px;
-    background: var(--g0);
-    border-bottom: 1px solid var(--g3);
-  }
-  .rp-preview-head .rp-preview-path {
-    position: static;
-    top: auto;
-    z-index: auto;
-    margin: 0;
-    padding: 0;
-    flex: 1;
-    min-width: 0;
-    background: transparent;
-    border: none;
-    border-radius: 0;
-  }
-  .rp-btn {
-    flex: none;
-    padding: 2px 10px;
-    border-radius: 6px;
-    border: 1.5px solid var(--g3);
-    background: transparent;
-    color: var(--g6);
-    font-size: 12px;
-    cursor: pointer;
-  }
-  /* 下载按钮是 <a>：去掉下划线、行高对齐 */
-  a.rp-btn {
-    text-decoration: none;
-    line-height: 1.6;
-  }
-  .rp-btn:hover {
-    color: var(--g7);
-    border-color: var(--g4);
-  }
-  .rp-btn:disabled {
-    opacity: 0.5;
-    cursor: default;
-  }
-  .rp-saved {
-    flex: none;
-    font-size: 11.5px;
-    color: var(--tint-green-fg, #7fd6a4);
-  }
-  .rp-note {
-    flex: none;
-    margin: 0 0 6px;
-    padding: 6px 10px;
-    border-radius: 6px;
-    background: var(--tint-yellow-bg, #3a3417);
-    color: var(--tint-yellow-fg, #e8d47f);
-    font-size: 12px;
-  }
-  .rp-image-wrap {
-    flex: 1;
-    min-height: 0;
-    display: grid;
-    place-items: center;
-    overflow: auto;
-    padding: 6px;
-  }
-  .rp-image {
-    max-width: 100%;
-    max-height: 100%;
-    border-radius: 6px;
-    background: var(--g1);
-  }
-  /* PDF 内嵌查看器与音视频播放器 */
-  .rp-pdf {
-    flex: 1;
-    min-height: 0;
-    width: 100%;
-    border: none;
-    background: var(--g1);
-  }
-  .rp-media-wrap {
-    flex: 1;
-    min-height: 0;
-    display: grid;
-    place-items: center;
-    padding: 10px;
-  }
-  .rp-media {
-    max-width: 100%;
-    max-height: 100%;
-    border-radius: 8px;
-    background: var(--g1);
-  }
-  .rp-audio {
-    width: 100%;
-  }
-  /* xlsx 表格渲染区 */
-  .rp-xlsx {
-    flex: 1;
-    min-height: 0;
-    overflow: auto;
-    background: #fff;
-    color: #24292f;
-  }
-  .rp-xlsx-sheet { padding: 12px 16px 20px; }
-  .rp-xlsx-body :global(table) { border-collapse: collapse; }
-  .rp-xlsx-body :global(td), .rp-xlsx-body :global(th) { border: 1px solid #c8ccd4; padding: 3px 8px; font-size: 12px; white-space: nowrap; }
-  .rp-xlsx-body :global(tr:first-child) { background: #f1f3f6; font-weight: 600; }
-  /* pptx 分页渲染区 */
-  .rp-pptx { flex: 1; min-height: 0; overflow: auto; display: flex; flex-direction: column; gap: 14px; padding: 14px; background: var(--g1); }
-  .rp-slide { background: #fff; color: #24292f; border-radius: 8px; padding: 26px 28px; min-height: 160px; box-shadow: 0 1px 4px var(--overlay); }
-  .rp-slide-text { margin: 0; white-space: pre-wrap; font-size: 13px; line-height: 1.7; font-family: inherit; }
-  /* docx 纸张预览：细边框把白纸和深色界面隔开 */
-  .rp-doc-paper {
-    border: 1px solid var(--g3);
-    border-radius: 6px;
-  }
-  .rp-edit-note {
-    flex: none;
-    margin: 0 0 6px;
-    padding: 6px 9px;
-    border-radius: 6px;
-    border: 1px solid color-mix(in srgb, var(--tint-yellow-fg) 40%, transparent);
-    background: var(--tint-yellow-bg);
-    color: var(--tint-yellow-fg);
-    font-size: 12px;
-    line-height: 1.5;
-  }
-  .rp-edit {
-    flex: 1;
-    min-height: 0;
-    margin: 0;
-    padding: 8px;
-    border: 1px solid var(--g3);
-    border-radius: 8px;
-    background: var(--g1);
-    color: var(--g6);
-    font: 12.5px/1.55 Consolas, "Cascadia Code", monospace;
-    resize: none;
-    outline: none;
-  }
-  .rp-edit:focus {
-    border-color: var(--g6);
-  }
   .rp-refresh {
     background: transparent;
     border: none;
@@ -12820,69 +10239,8 @@
     line-height: 1.7;
     padding: 0 16px;
   }
-  .rp-note {
-    color: var(--g5);
-    font-size: 11.5px;
-    padding: 4px 10px 6px;
-    border-bottom: 1px solid var(--g2);
-    margin-bottom: 4px;
-  }
-  .rp-file {
-    text-align: left;
-    padding: 7px 10px;
-    border: none;
-    border-radius: 6px;
-    background: transparent;
-    color: var(--g6);
-    font-family: Consolas, monospace;
-    font-size: 12.5px;
-    cursor: pointer;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .rp-file:hover {
-    background: var(--g2);
-    color: var(--g7);
-  }
-  .rp-file.sel {
-    /* 产物行选中：橙色高亮无底色（2026-11-12 统一口径；底色模式铺 --sel-bg） */
-    background: var(--sel-bg);
-    color: var(--sel-fg);
-    font-weight: 600;
-  }
+  /* .rp-file 家族已随产物面板迁入 lib/panel/ArtifactsPane.svelte（2026-11-14 阶段 A） */
   /* 路径标签吸顶：代码滚动时它不跟着滚，也不会被裁掉半个字 */
-  .rp-preview-path {
-    position: sticky;
-    top: -8px; /* 抵消 .rp-body 的 8px padding，贴住面板上沿 */
-    z-index: 2;
-    flex: none;
-    margin: -8px -8px 6px;
-    padding: 8px 10px;
-    background: var(--g1);
-    border-bottom: 1px solid var(--g2);
-    color: var(--g5);
-    font-family: Consolas, monospace;
-    font-size: 11.5px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .rp-preview {
-    margin: 0;
-    padding: 8px;
-    background: var(--g1);
-    border: 1px solid var(--g3);
-    border-radius: 8px;
-    color: var(--g6);
-    font-family: Consolas, monospace;
-    font-size: 12px;
-    /* 代码按词换行，不从单词中间劈开（原来 break-all 会把 SECURITY 拆成两行） */
-    white-space: pre-wrap;
-    word-break: normal;
-    overflow-wrap: break-word;
-    tab-size: 4;
-  }
   /* —— 界面微调模式 —— */
   :global(body.micro-edit-mode *:hover) {
     outline: 1px dashed color-mix(in srgb, var(--g5) 70%, transparent);
@@ -13056,10 +10414,10 @@
        gap 用相邻 margin 补；空态（没有消息）才临时切回 flex 居中。 */
     display: block;
   }
-  .chat-body > * + * {
+  .chat-body > :global(*) + :global(*) {
     margin-top: 14px; /* 原 flex gap: 14px 的等价物 */
   }
-  .chat-body:has(> .empty-hint) {
+  .chat-body:has(> :global(.empty-hint)) {
     display: flex; /* 空态：没有消息，flex 居中不影响 content-visibility 的收益 */
   }
   /* 屏幕外的消息块跳过布局与绘制——重排时只有可见的那几条参与。拖拽调宽 / 窗口
@@ -13069,20 +10427,20 @@
      收拢成 20 条一块后 IO 开销降一个数量级。块的估位高度由模板按块内条数内联
      （contain-intrinsic-size: auto <条数×140>px，沿用单条 140px 估位口径）。
      口径与「#each messageChunks」一致：cv-chunk 是 chat-body 直接子级 */
-  .cv-chunk {
+  :global(.cv-chunk) {
     content-visibility: auto;
   }
   /* 编辑/回滚后的临时底部留白：只补足视口高度内的差额，保住 scrollTop 不被钳位；
      内容长出来/用户滚动后自动消失（见 beginScrollFreeze / syncScrollFreeze） */
-  .scroll-spacer {
+  :global(.scroll-spacer) {
     width: 100%;
     pointer-events: none;
   }
   /* 原 flex gap: 14px 的块内等价物 */
-  .cv-chunk > .msg + .msg {
+  :global(.cv-chunk > .msg + .msg) {
     margin-top: 14px;
   }
-  .empty-hint {
+  :global(.empty-hint) {
     margin: auto;
     color: var(--g4);
     font-size: 13px;
@@ -13091,12 +10449,12 @@
     flex-direction: column;
     gap: 6px;
   }
-  .empty-title {
+  :global(.empty-title) {
     font-size: 17px;
     font-weight: 600;
     color: var(--g6);
   }
-  .empty-sub {
+  :global(.empty-sub) {
     font-size: 12.5px;
     color: var(--g5);
   }
@@ -13111,40 +10469,18 @@
     align-items: center;
     gap: 9px;
   }
-  .att-ico {
+  :global(.att-ico) {
     width: 15px;
     height: 15px;
     flex: none;
     color: var(--g6);
   }
-  .msg-att-file .att-ico {
+  :global(.msg-att-file .att-ico) {
     vertical-align: -2px;
     margin-right: 2px;
   }
-  .att-ico-lg {
-    width: 17px;
-    height: 17px;
-    display: block;
-  }
 
-  .att-del svg {
-    width: 13px;
-    height: 13px;
-    display: block;
-  }
-  .caret-ico {
-    width: 13px;
-    height: 13px;
-    flex: none;
-    color: var(--g5);
-  }
-  .send-btn svg {
-    width: 16px;
-    height: 16px;
-    display: block;
-    margin: auto;
-  }
-  .approval-kicker {
+  :global(.approval-kicker) {
     display: inline-block;
     font-size: 11px;
     font-weight: 600;
@@ -13155,7 +10491,7 @@
     margin-right: 6px;
     vertical-align: 1px;
   }
-  .typing-dot {
+  :global(.typing-dot) {
     display: inline-block;
     width: 6px;
     height: 6px;
@@ -13164,10 +10500,10 @@
     margin-right: 4px;
     animation: typing-bounce 1.2s ease-in-out infinite;
   }
-  .typing-dot:nth-child(2) {
+  :global(.typing-dot:nth-child(2)) {
     animation-delay: 0.15s;
   }
-  .typing-dot:nth-child(3) {
+  :global(.typing-dot:nth-child(3)) {
     animation-delay: 0.3s;
     margin-right: 0;
   }
@@ -13183,7 +10519,7 @@
       opacity: 1;
     }
   }
-  .msg {
+  :global(.msg) {
     display: flex;
     width: 100%;
     max-width: 820px;
@@ -13191,11 +10527,11 @@
     padding: 0 24px;
     box-sizing: border-box;
   }
-  .msg.user {
+  :global(.msg.user) {
     justify-content: flex-end; /* 只去气泡，位置还在右边（2026-10-02 修正） */
   }
   /* 排队中的消息（027）：气泡里带「立即发送」按钮——并进正在跑的那一轮，引导它的回答 */
-  .queued-row {
+  :global(.queued-row) {
     display: flex;
     align-items: center;
     gap: 8px;
@@ -13204,14 +10540,14 @@
     padding-top: 6px;
     border-top: 1px dashed var(--line, rgba(128, 128, 128, 0.35));
   }
-  .queued-badge {
+  :global(.queued-badge) {
     font-size: 12px;
     opacity: 0.75;
   }
-  .queued-badge.steered {
+  :global(.queued-badge.steered) {
     color: var(--accent, #4a9);
   }
-  .queued-send {
+  :global(.queued-send) {
     font-size: 12px;
     padding: 2px 10px;
     border-radius: 999px;
@@ -13220,11 +10556,11 @@
     background: transparent;
     cursor: pointer;
   }
-  .queued-send:hover {
+  :global(.queued-send:hover) {
     background: color-mix(in srgb, var(--accent, #4a9) 14%, transparent);
   }
   /* 引导消息的静默轻量行（历史回放）：不占气泡位，居中小字 */
-  .steer-line {
+  :global(.steer-line) {
     display: flex;
     align-items: baseline;
     gap: 8px;
@@ -13236,72 +10572,27 @@
     margin-left: auto;
     margin-right: 0;
   }
-  .steer-line-badge {
+  :global(.steer-line-badge) {
     flex: none;
     padding: 1px 8px;
     border-radius: 8px;
     background: color-mix(in srgb, var(--accent, #4a9) 10%, transparent);
     color: var(--accent, #4a9);
   }
-  .steer-line-text {
+  :global(.steer-line-text) {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  /* 「已引导」静默提示（输入区上方，本轮结束消失） */
-  .guided-row {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-    padding: 2px 2px 6px;
-  }
-  .guided-chip {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    max-width: 100%;
-    padding: 3px 10px;
-    border-radius: 10px;
-    font-size: 12px;
-    color: var(--accent, #4a9);
-    background: color-mix(in srgb, var(--accent, #4a9) 10%, transparent);
-  }
-  .guided-chip > svg {
-    width: 12px;
-    height: 12px;
-    flex: none;
-  }
-  .guided-x {
-    display: grid;
-    place-items: center;
-    width: 16px;
-    height: 16px;
-    padding: 0;
-    border: 0;
-    border-radius: 4px;
-    background: transparent;
-    color: inherit;
-    opacity: 0.55;
-    cursor: pointer;
-    flex: none;
-  }
-  .guided-x:hover {
-    opacity: 1;
-    background: color-mix(in srgb, var(--accent, #4a9) 16%, transparent);
-  }
-  .guided-x svg {
-    width: 10px;
-    height: 10px;
-  }
-  .msg.assistant {
+  :global(.msg.assistant) {
     justify-content: flex-start;
   }
-  .msg.system {
+  :global(.msg.system) {
     justify-content: center;
   }
   /* pre-wrap 只放在真正承载文本的叶子节点上；放 .bubble 上会把模板标签间的
      换行缩进也渲染成一个空行（用户气泡开头凭空多一行） */
-  .bubble {
+  :global(.bubble) {
     max-width: 78%;
     padding: 10px 14px;
     border-radius: 12px;
@@ -13309,24 +10600,24 @@
     line-height: 1.7;
     word-break: break-word;
   }
-  .user-text,
-  .content {
+  :global(.user-text),
+  :global(.content) {
     /* markdown 渲染（2026-10-04）：结构标签自带节奏，不再 pre-wrap 平铺 */
     word-break: break-word;
   }
   /* 用户消息是纯文本：换行/连续空格要保留（assistant 的 .content 是 markdown，不加） */
-  .user-text {
+  :global(.user-text) {
     white-space: pre-wrap;
     line-height: 1.7;
   }
   /* 带附件时气泡被撑到附件宽度，正文不能贴左缘（2026-11-11）：
      收缩到内容宽并推到右侧，多行仍正常换行、文字自身保持左对齐 */
-  .msg.user .user-text {
+  :global(.msg.user .user-text) {
     width: fit-content;
     margin-left: auto;
   }
   /* {@html} 注入的 span 不带作用域类，必须 :global（同入下输入框浮层那个坑） */
-  .user-text :global(.ref) {
+  :global(.user-text .ref) {
     /* 引用高亮回橙色（2026-11-12 用户：怎么变成白色了；11-11 统一描边那轮被改成白字） */
     color: var(--brand-text);
     text-decoration: underline;
@@ -13335,7 +10626,7 @@
   }
   /* 2026-10-30 排版重做：正文是主角——15px/1.78 的阅读节奏，标题/列表/代码块
      各自有清晰层级，不再是一坨同灰度小字。 */
-  .content {
+  :global(.content) {
     font-size: 14.5px;
     line-height: 1.78;
     color: var(--g7);
@@ -13343,35 +10634,35 @@
   /* ⚠️ markdown 是 {@html} 运行时生成的，元素上没有 Svelte 作用域类：
      所有 md-* 选择器必须用 :global()，否则会被编译器当「未使用选择器」整段裁掉
      （2026-10-30 实测：md 样式在构建产物里一条都没有，代码块/表格一直吃浏览器默认样式）。 */
-  .content > :first-child {
+  :global(.content > :first-child) {
     margin-top: 0;
   }
-  .content :global(.md-p) {
+  :global(.content .md-p) {
     margin: 0 0 10px;
   }
-  .content :global(.md-p:last-child) {
+  :global(.content .md-p:last-child) {
     margin-bottom: 0;
   }
-  .content :global(.md-h) {
+  :global(.content .md-h) {
     margin: 20px 0 8px;
     font-size: 15.5px;
     font-weight: 650;
     line-height: 1.45;
     letter-spacing: 0.01em;
   }
-  .content :global(.md-h:first-child) {
+  :global(.content .md-h:first-child) {
     margin-top: 0;
   }
-  .content :global(.md-ul),
-  .content :global(.md-ol) {
+  :global(.content .md-ul),
+  :global(.content .md-ol) {
     margin: 6px 0 12px;
     padding-left: 22px;
   }
-  .content :global(.md-li),
-  .content :global(li) {
+  :global(.content .md-li),
+  :global(.content li) {
     margin: 4px 0;
   }
-  .content :global(.md-code) {
+  :global(.content .md-code) {
     /* 代码块也走透明+描边（2026-11-11 用户拍板） */
     background: transparent;
     border: 1px solid var(--g3);
@@ -13381,14 +10672,14 @@
     color: var(--g7);
   }
   /* 代码块：独立卡片 + 语言标签 + 复制按钮（md.js 生成结构，点击委托在 onContentClick） */
-  .content :global(.md-codeblock) {
+  :global(.content .md-codeblock) {
     margin: 10px 0 14px;
     border: 1px solid var(--g3);
     border-radius: 10px;
     overflow: hidden;
     background: transparent;
   }
-  .content :global(.md-codehead) {
+  :global(.content .md-codehead) {
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -13396,14 +10687,14 @@
     background: transparent;
     border-bottom: 1px solid var(--g2);
   }
-  .content :global(.md-codelang) {
+  :global(.content .md-codelang) {
     font-size: 10.5px;
     font-weight: 600;
     letter-spacing: 0.08em;
     text-transform: uppercase;
     color: var(--g5);
   }
-  .content :global(.md-copy) {
+  :global(.content .md-copy) {
     border: none;
     background: transparent;
     color: var(--g5);
@@ -13412,11 +10703,11 @@
     border-radius: 5px;
     cursor: pointer;
   }
-  .content :global(.md-copy:hover) {
+  :global(.content .md-copy:hover) {
     background: var(--veil);
     color: var(--g7);
   }
-  .content :global(.md-pre) {
+  :global(.content .md-pre) {
     background: transparent;
     border: 0;
     border-radius: 0;
@@ -13425,7 +10716,7 @@
     overflow: auto;
     max-height: 520px;
   }
-  .content :global(.md-table) {
+  :global(.content .md-table) {
     border-collapse: collapse;
     margin: 8px 0 14px;
     font-size: 13px;
@@ -13433,45 +10724,45 @@
     overflow-x: auto;
     white-space: normal;
   }
-  .content :global(.md-table th),
-  .content :global(.md-table td) {
+  :global(.content .md-table th),
+  :global(.content .md-table td) {
     border: 1px solid var(--g2);
     padding: 7px 12px;
     text-align: left;
     vertical-align: top;
   }
-  .content :global(.md-table th) {
+  :global(.content .md-table th) {
     background: var(--g2);
     font-weight: 600;
   }
   /* 表格行斑马纹（奇数行浅一档）：md.js 给 td/th 发了稳定类，这里顺带补上 ZCode 式
      隔行底色；微调钩子见下条 */
-  .content :global(.md-table tbody tr):nth-child(odd) :global(.md-td) {
+  :global(.content .md-table tbody tr):nth-child(odd) :global(.md-td) {
     background: color-mix(in srgb, var(--g2) 45%, transparent);
   }
-  .content :global(.md-pre code) {
+  :global(.content .md-pre code) {
     font: 12.5px/1.7 Consolas, 'Cascadia Code', monospace;
     white-space: pre;
   }
   /* 模型把 <tool_call> 协议当正文吐出来的历史消息：折叠成可展开块，不铺满屏幕 */
-  .content :global(.md-toolcall) {
+  :global(.content .md-toolcall) {
     margin: 10px 0 14px;
     border: 1px solid var(--g2);
     border-radius: 10px;
     background: color-mix(in srgb, var(--g2) 45%, transparent);
     overflow: hidden;
   }
-  .content :global(.md-toolcall summary) {
+  :global(.content .md-toolcall summary) {
     padding: 7px 12px;
     font-size: 12.5px;
     color: var(--g5);
     cursor: pointer;
     user-select: none;
   }
-  .content :global(.md-toolcall summary:hover) {
+  :global(.content .md-toolcall summary:hover) {
     color: var(--g7);
   }
-  .content :global(.md-toolcall pre) {
+  :global(.content .md-toolcall pre) {
     margin: 0;
     padding: 10px 12px;
     max-height: 320px;
@@ -13483,18 +10774,18 @@
     white-space: pre-wrap;
     word-break: break-all;
   }
-  .content :global(.md-quote) {
+  :global(.content .md-quote) {
     margin: 10px 0;
     padding: 2px 14px;
     border-left: 2px solid var(--g4);
     color: var(--g6);
   }
-  .content :global(.md-hr) {
+  :global(.content .md-hr) {
     border: none;
     border-top: 1px solid var(--g2);
     margin: 16px 0;
   }
-  .content :global(.md-a) {
+  :global(.content .md-a) {
     /* 链接走中性下划线（全局去橙） */
     color: var(--g7);
     text-decoration: underline;
@@ -13502,12 +10793,12 @@
     text-underline-offset: 2px;
     border-bottom: none;
   }
-  .content :global(.md-a:hover) {
+  :global(.content .md-a:hover) {
     text-decoration-color: var(--g7);
   }
   /* markdown 图片（2026-10-31）：助手回复里的 ![alt](url) 直接显示，点开看大图。
      限制最大高度避免长图撑爆消息流；圆角与代码卡同一语言。 */
-  .content :global(.md-img) {
+  :global(.content .md-img) {
     display: block;
     max-width: 100%;
     max-height: 420px;
@@ -13520,30 +10811,30 @@
     cursor: zoom-in;
     object-fit: contain;
   }
-  .content :global(.md-img:hover) {
+  :global(.content .md-img:hover) {
     border-color: var(--g4);
   }
   /* 用户消息不再画气泡（去掉气泡，纯文本）；
      模型回复也没有边框底色，工具/审批/思考块自己带边框即可 */
-  .user-bubble {
+  :global(.user-bubble) {
     color: var(--g7);
     padding: 2px 0;
   }
-  .asst-bubble {
+  :global(.asst-bubble) {
     padding: 2px 0;
     max-width: 100%;
     width: 100%;
   }
-  .msg.user .bubble,
-  .msg.assistant .bubble {
+  :global(.msg.user .bubble),
+  :global(.msg.assistant .bubble) {
     background: transparent;
     border: none;
     border-radius: 6px;
   }
-  .error-row {
+  :global(.error-row) {
     justify-content: flex-start;
   }
-  .startup-error {
+  :global(.startup-error) {
     align-items: center;
     gap: 8px;
   }
@@ -13551,16 +10842,16 @@
      2026-10-27 布局重排：操作条从消息左侧/右侧挪到消息下方一行；时间贴行边，
      功能图标贴另一边。用户消息右对齐时时间仍在整行最左（视觉上是一条时间轴），
      模型回答的「回答详情」则落右下角。 */
-  .msg-stack {
+  :global(.msg-stack) {
     display: flex;
     flex-direction: column;
     flex: 1 1 auto;
     min-width: 0;
   }
-  .msg.user .msg-stack {
+  :global(.msg.user .msg-stack) {
     align-items: flex-end;
   }
-  .msg-meta {
+  :global(.msg-meta) {
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -13571,20 +10862,20 @@
   }
   /* 用户消息的时间贴着编辑操作组，放它们左边；
      助手消息保持时间在行左、详情在行右。 */
-  .msg-meta.user-meta {
+  :global(.msg-meta.user-meta) {
     justify-content: flex-end;
     gap: 6px;
   }
-  .msg-meta.user-meta .msg-acts {
+  :global(.msg-meta.user-meta .msg-acts) {
     margin-left: 0;
   }
-  .msg-ts {
+  :global(.msg-ts) {
     font-size: 11px;
     color: var(--g5);
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
   }
-  .msg-acts {
+  :global(.msg-acts) {
     display: flex;
     align-items: center;
     gap: 1px;
@@ -13592,11 +10883,11 @@
     opacity: 0.5;
     transition: opacity 0.12s;
   }
-  .msg:hover .msg-acts,
-  .msg:focus-within .msg-acts {
+  :global(.msg:hover .msg-acts),
+  :global(.msg:focus-within .msg-acts) {
     opacity: 1;
   }
-  .msg-act {
+  :global(.msg-act) {
     display: flex;
     align-items: center;
     justify-content: center;
@@ -13610,39 +10901,39 @@
     line-height: 1.4;
     white-space: nowrap;
   }
-  .msg-act:hover {
+  :global(.msg-act:hover) {
     background: var(--g2);
     color: var(--g7);
   }
-  .msg-act svg {
+  :global(.msg-act svg) {
     width: 14px;
     height: 14px;
     display: block;
   }
-  .msg.selecting {
+  :global(.msg.selecting) {
     cursor: pointer;
   }
-  .msg-check {
+  :global(.msg-check) {
     display: flex;
     align-items: center;
     margin-right: 8px;
     align-self: center;
     flex-shrink: 0;
   }
-  .msg-check input {
+  :global(.msg-check input) {
     width: 15px;
     height: 15px;
     cursor: pointer;
     /* 整行点击负责勾选：复选框只做指示，避免 label/change + 行 click 双触发 */
     pointer-events: none;
   }
-  .edit-box {
+  :global(.edit-box) {
     display: flex;
     flex-direction: column;
     gap: 8px;
     width: 78%;
   }
-  .edit-area {
+  :global(.edit-area) {
     width: 100%;
     background: transparent;
     color: var(--g7);
@@ -13656,16 +10947,16 @@
     box-sizing: border-box;
     font-family: inherit;
   }
-  .edit-actions {
+  :global(.edit-actions) {
     display: flex;
     align-items: center;
     gap: 8px;
   }
-  .edit-hint {
+  :global(.edit-hint) {
     font-size: 11px;
     color: var(--g4);
   }
-  .edit-att-hint {
+  :global(.edit-att-hint) {
     margin: 2px 0 6px;
     font-size: 11.5px;
     color: var(--g5);
@@ -13706,7 +10997,7 @@
     word-break: break-all;
     font-variant-numeric: tabular-nums;
   }
-  .error-bubble {
+  :global(.error-bubble) {
     background: var(--tint-red-bg);
     border: 1px solid var(--tint-red-bg);
     color: var(--tint-red-fg);
@@ -13717,55 +11008,15 @@
     font-size: 12.5px;
     line-height: 1.55;
   }
-  .sys-text {
+  :global(.sys-text) {
     font-size: 12px;
     color: var(--g5);
     /* 系统行（[通知]/[错误]）统一居中：外层 .msg.system 只是把盒子居中，长句换行后
        盒内文字仍是左对齐，两条并排看就是「一条居中一条左齐」（2026-11-01 真机实测） */
     text-align: center;
   }
-  /* 上下文压缩阈值行：圆环卡片里缓存命中率下面的小输入框 */
-  .compact-threshold-row .ctx-label {
-    flex: 1;
-  }
-  .compact-threshold-input {
-    width: 46px;
-    padding: 1px 5px;
-    font-size: 12px;
-    /* 数字右对齐贴着 % 后缀，与上面几行的数字列对齐（同款等宽数字） */
-    text-align: right;
-    font-variant-numeric: tabular-nums;
-    color: var(--g7);
-    background: transparent;
-    border: 1.5px solid var(--g3);
-    border-radius: 6px;
-    font-family: inherit;
-  }
-  .threshold-val {
-    display: inline-flex;
-    align-items: center;
-    gap: 2px;
-  }
-  .pct-suffix {
-    font-size: 12px;
-    color: var(--g5);
-  }
-  .compact-threshold-input:focus {
-    outline: none;
-    border-color: var(--g6);
-  }
-  /* 数字输入框右侧的步进按钮会顶住文字，隐藏后数字才真正贴右 */
-  .compact-threshold-input {
-    appearance: textfield;
-    -moz-appearance: textfield;
-  }
-  .compact-threshold-input::-webkit-outer-spin-button,
-  .compact-threshold-input::-webkit-inner-spin-button {
-    -webkit-appearance: none;
-    margin: 0;
-  }
   /* 压缩标记行（2026-11-07）：整轮下方的分隔线；压缩中微弱呼吸感，完成后定格 */
-  .compact-divider {
+  :global(.compact-divider) {
     margin: 10px auto 6px;
     max-width: 92%;
     text-align: center;
@@ -13777,7 +11028,7 @@
      不占滚动高度——标记出现/落定曾把 scrollHeight 撑高，钉底跟随与 3s 运行态轮询
      补滚把对话区往上顶一截（压缩前会往上弹）。
      之后变成历史（后面来了新消息）就回到块内按普通行高占位。 */
-  .compact-divider.tail {
+  :global(.compact-divider.tail) {
     height: 0;
     margin: 0;
     padding: 0;
@@ -13785,14 +11036,14 @@
     position: relative;
     top: 8px; /* 纯视觉下移，不进布局 */
   }
-  .compact-divider.running {
+  :global(.compact-divider.running) {
     animation: compact-pulse 1.6s ease-in-out infinite;
   }
-  .compact-divider.failed {
+  :global(.compact-divider.failed) {
     color: var(--warn, #c98a4b);
   }
   /* 失败行的「重试」按钮：清服务端暂停标记，下轮收尾再试（2026-11-10） */
-  .compact-divider .compact-retry {
+  :global(.compact-divider .compact-retry) {
     margin-left: 8px;
     padding: 0 8px;
     height: 18px;
@@ -13804,7 +11055,7 @@
     border-radius: 999px;
     cursor: pointer;
   }
-  .compact-divider .compact-retry:hover {
+  :global(.compact-divider .compact-retry:hover) {
     color: var(--g7);
     border-color: var(--g6);
   }
@@ -13814,7 +11065,7 @@
   }
   /* —— 一轮的元信息与过程块（2026-10-30 排布重做）——
      思考/工具不再各占一堆卡片：按真实顺序合成「过程」，完成收成一行。 */
-  .turn-bar {
+  :global(.turn-bar) {
     display: flex;
     align-items: center;
     gap: 6px;
@@ -13824,13 +11075,13 @@
     font-variant-numeric: tabular-nums;
     line-height: 1.4;
   }
-  .turn-bar.live {
+  :global(.turn-bar.live) {
     color: var(--g6);
   }
-  .turn-time {
+  :global(.turn-time) {
     color: var(--g5);
   }
-  .live-dot {
+  :global(.live-dot) {
     width: 6px;
     height: 6px;
     border-radius: 50%;
@@ -13849,17 +11100,17 @@
       box-shadow: 0 0 0 0 color-mix(in srgb, var(--brand) 0%, transparent);
     }
   }
-  .process {
+  :global(.process) {
     margin: 8px 0 12px;
     border: 1px solid var(--g2);
     border-radius: 10px;
     background: color-mix(in srgb, var(--g2) 52%, transparent);
     overflow: hidden;
   }
-  .process.live {
+  :global(.process.live) {
     border-color: color-mix(in srgb, var(--brand) 22%, var(--g2));
   }
-  .process-head {
+  :global(.process-head) {
     display: flex;
     align-items: center;
     gap: 7px;
@@ -13874,36 +11125,36 @@
     cursor: pointer;
     user-select: none;
   }
-  .process-head:hover {
+  :global(.process-head:hover) {
     background: color-mix(in srgb, var(--g3) 45%, transparent);
     color: var(--g7);
   }
   /* 纯问答轮的同行样式（无过程可展开）：长得和过程行一样，只是不可点、无悬停反馈 */
-  .process-head.static {
+  :global(.process-head.static) {
     cursor: default;
     user-select: text;
   }
-  .process-head.static:hover {
+  :global(.process-head.static:hover) {
     background: transparent;
     color: var(--g6);
   }
-  .process-ico {
+  :global(.process-ico) {
     width: 14px;
     height: 14px;
     flex: none;
     color: var(--g5);
   }
-  .process-title {
+  :global(.process-title) {
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  .process-live {
+  :global(.process-live) {
     display: inline-flex;
     margin-left: 2px;
   }
-  .process-caret {
+  :global(.process-caret) {
     width: 12px;
     height: 12px;
     flex: none;
@@ -13911,28 +11162,28 @@
     color: var(--g5);
     transition: transform 0.15s;
   }
-  .process-caret.open {
+  :global(.process-caret.open) {
     transform: rotate(180deg);
   }
-  .process-body {
+  :global(.process-body) {
     padding: 0 10px 8px;
   }
   /* 完成态折叠进来的中途说明：保留 markdown 结构，但压暗、缩小，别和最终结语抢 */
-  .process-note {
+  :global(.process-note) {
     margin: 4px 0 8px;
     padding-left: 2px;
     font-size: 13px;
     line-height: 1.7;
     color: var(--g5);
   }
-  .process-note :global(strong) {
+  :global(.process-note strong) {
     color: var(--g6);
   }
-  .think-item {
+  :global(.think-item) {
     position: relative;
     padding: 4px 2px 8px;
   }
-  .think-label {
+  :global(.think-label) {
     display: flex;
     align-items: center;
     gap: 5px;
@@ -13948,10 +11199,10 @@
     cursor: pointer;
     user-select: none;
   }
-  .think-label:hover {
+  :global(.think-label:hover) {
     color: var(--g7);
   }
-  .think-caret {
+  :global(.think-caret) {
     width: 11px;
     height: 11px;
     flex: none;
@@ -13959,10 +11210,10 @@
     color: var(--g5);
     transition: transform 0.15s;
   }
-  .think-caret.open {
+  :global(.think-caret.open) {
     transform: rotate(180deg);
   }
-  .think-live {
+  :global(.think-live) {
     padding: 0 5px;
     border-radius: 4px;
     background: color-mix(in srgb, var(--brand) 12%, transparent);
@@ -13971,7 +11222,7 @@
   }
   /* 流式期间封顶 240px（不随吐字跳变）；读完后超长封顶 280。
      开始没多少字时就是内容高度——攒到一定量才固定并滚动 */
-  .think-text {
+  :global(.think-text) {
     padding: 1px 0 2px 12px;
     border-left: 2px solid var(--g3);
     font-size: 13px;
@@ -13982,10 +11233,10 @@
     max-height: 280px;
     overflow-y: auto;
   }
-  .think-text.streaming {
+  :global(.think-text.streaming) {
     max-height: 240px;
   }
-  .think-jump {
+  :global(.think-jump) {
     position: absolute;
     /* 让出 .think-text 自身滚动条的宽度（~12px），不然回到底部按钮压在滑条上（2026-10-31 实测） */
     right: 18px;
@@ -14002,21 +11253,21 @@
     cursor: pointer;
     box-shadow: 0 4px 12px rgb(0 0 0 / 28%);
   }
-  .think-jump svg {
+  :global(.think-jump svg) {
     width: 13px;
     height: 13px;
   }
-  .think-jump:hover {
+  :global(.think-jump:hover) {
     background: var(--g3);
   }
   /* —— 工具行：一行一个动作，点开才是参数/结果 —— */
-  .tool-item {
+  :global(.tool-item) {
     border-radius: 7px;
   }
-  .tool-item:hover {
+  :global(.tool-item:hover) {
     background: color-mix(in srgb, var(--g3) 30%, transparent);
   }
-  .tool-row {
+  :global(.tool-row) {
     display: flex;
     align-items: center;
     gap: 8px;
@@ -14030,10 +11281,10 @@
     cursor: pointer;
     border-radius: 7px;
   }
-  .tool-row:hover {
+  :global(.tool-row:hover) {
     background: color-mix(in srgb, var(--g3) 34%, transparent);
   }
-  .tool-ico {
+  :global(.tool-ico) {
     display: grid;
     place-items: center;
     width: 22px;
@@ -14044,20 +11295,20 @@
     border: 1px solid color-mix(in srgb, var(--g3) 60%, transparent);
     color: var(--g5);
   }
-  .tool-ico svg {
+  :global(.tool-ico svg) {
     width: 13px;
     height: 13px;
   }
-  .tool-ico.running {
+  :global(.tool-ico.running) {
     color: var(--brand-text);
   }
-  .tool-name {
+  :global(.tool-name) {
     flex: none;
     font-size: 12.5px;
     font-weight: 550;
     color: var(--g7);
   }
-  .tool-subject {
+  :global(.tool-subject) {
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -14067,15 +11318,15 @@
     font-family: Consolas, 'Cascadia Code', monospace;
   }
   /* 可点主语（ZCode 式）：悬停亮起+下划线，提示「点一下侧栏预览」 */
-  .tool-subject.linkable {
+  :global(.tool-subject.linkable) {
     cursor: pointer;
   }
-  .tool-subject.linkable:hover {
+  :global(.tool-subject.linkable:hover) {
     color: var(--g8);
     text-decoration: underline;
     text-underline-offset: 2px;
   }
-  .tool-status {
+  :global(.tool-status) {
     display: grid;
     place-items: center;
     width: 15px;
@@ -14084,18 +11335,18 @@
     margin-left: auto;
     color: var(--g5);
   }
-  .tool-status svg {
+  :global(.tool-status svg) {
     width: 13px;
     height: 13px;
   }
-  .tool-status.ok {
+  :global(.tool-status.ok) {
     color: var(--tint-green-fg);
     opacity: 0.85;
   }
-  .tool-status.fail {
+  :global(.tool-status.fail) {
     color: var(--tint-red-fg);
   }
-  .tool-spin {
+  :global(.tool-spin) {
     width: 11px;
     height: 11px;
     border-radius: 50%;
@@ -14108,28 +11359,28 @@
       transform: rotate(360deg);
     }
   }
-  .tool-caret {
+  :global(.tool-caret) {
     width: 12px;
     height: 12px;
     flex: none;
     color: var(--g5);
     transition: transform 0.15s;
   }
-  .tool-caret.open {
+  :global(.tool-caret.open) {
     transform: rotate(90deg);
   }
   /* 工具结果里的截图（browser 截图）：提到气泡层面常显（过程块收起了也看得到），
      点开进大图预览 */
-  .msg-shots {
+  :global(.msg-shots) {
     display: flex;
     flex-direction: column;
     gap: 8px;
     margin: 10px 0 4px;
   }
-  .tool-shot {
+  :global(.tool-shot) {
     max-width: min(100%, 720px);
   }
-  .tool-shot :global(.md-img) {
+  :global(.tool-shot .md-img) {
     display: block;
     max-width: 100%;
     max-height: 420px;
@@ -14142,30 +11393,30 @@
     cursor: zoom-in;
     object-fit: contain;
   }
-  .tool-shot :global(.md-img:hover) {
+  :global(.tool-shot .md-img:hover) {
     border-color: var(--g4);
   }
-  .tool-detail {
+  :global(.tool-detail) {
     margin: 2px 4px 8px 34px;
     padding: 8px 10px;
     border: 1px solid var(--g2);
     border-radius: 8px;
     background: color-mix(in srgb, var(--g1) 70%, transparent);
   }
-  .tool-sec {
+  :global(.tool-sec) {
     position: relative;
   }
-  .tool-sec + .tool-sec {
+  :global(.tool-sec + .tool-sec) {
     margin-top: 8px;
   }
-  .tool-sec-label {
+  :global(.tool-sec-label) {
     margin-bottom: 3px;
     font-size: 10.5px;
     font-weight: 600;
     letter-spacing: 0.06em;
     color: var(--g5);
   }
-  .tool-pre {
+  :global(.tool-pre) {
     margin: 0;
     padding: 8px 10px;
     border-radius: 6px;
@@ -14179,7 +11430,7 @@
     overflow: auto;
   }
   /* 参数区上滑后「回到底部」：与思考框同款，让出滚动条宽度 */
-  .tool-jump {
+  :global(.tool-jump) {
     position: absolute;
     right: 18px;
     bottom: 10px;
@@ -14195,19 +11446,19 @@
     cursor: pointer;
     box-shadow: 0 4px 12px rgb(0 0 0 / 28%);
   }
-  .tool-jump svg {
+  :global(.tool-jump svg) {
     width: 12px;
     height: 12px;
   }
-  .tool-jump:hover {
+  :global(.tool-jump:hover) {
     background: var(--g3);
   }
-  .tool-wait {
+  :global(.tool-wait) {
     font-size: 11.5px;
     color: var(--g5);
   }
   /* 审批卡（2026-11-03 重塑：跟随柔和主题，不再红框警示——严重度由档位徽章自己说话） */
-  .approval-box {
+  :global(.approval-box) {
     background: color-mix(in srgb, var(--g1) 70%, transparent);
     border: 1px solid var(--g3);
     border-left: 2px solid var(--g5);
@@ -14215,263 +11466,40 @@
     padding: 10px 12px;
     font-size: 13px;
   }
-  /* —— 阻塞式提问卡（ask 工具，2026-11-03）：与审批同一个 dock 槽位、同一主题 —— */
-  .ask-box .ask-question {
-    width: 100%;
-    margin-top: 2px;
-    font-size: 13.5px;
-    line-height: 1.45;
-  }
-  .ask-multi-tag {
-    padding: 1px 6px;
-    border-radius: 4px;
-    background: var(--tint-purple-bg);
-    color: var(--tint-purple-fg);
-    font-size: 11px;
-  }
-  .ask-options {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-    gap: 6px;
-    margin-top: 8px;
-  }
-  .ask-opt {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    text-align: left;
-    padding: 7px 9px;
-    border: 1px solid var(--g3);
-    border-radius: 8px;
-    background: transparent;
-    color: var(--g6);
-    cursor: pointer;
-    font-size: 12.5px;
-  }
-  .ask-opt:hover {
-    border-color: var(--g5);
-  }
-  .ask-opt.sel {
-    /* 提问卡选中项：统一选中口径（橙字无底色描边；底色模式铺 --sel-bg） */
-    border-color: transparent;
-    background: var(--sel-bg);
-    color: var(--sel-fg);
-    font-weight: 650;
-  }
-  .ask-opt-label {
-    font-weight: 600;
-    color: var(--g7);
-  }
-  .ask-opt-desc {
-    font-size: 11.5px;
-    color: var(--g6);
-    line-height: 1.4;
-  }
-  .ask-other {
-    display: flex;
-    gap: 6px;
-    align-items: center;
-    margin-top: 8px;
-  }
-  .ask-other-in {
-    flex: 1;
-    min-width: 0;
-    padding: 6px 9px;
-    border: 1px solid var(--g3);
-    border-radius: 8px;
-    background: var(--g2);
-    color: var(--g7);
-    font-size: 12.5px;
-  }
-  /* —— 任务清单 dock（ZCode TodoWrite 同款语义，2026-11-03 贴输入框上方）——
-     清单在最上、展开向上长；审批/提问在它下面贴输入框（阻塞交互优先）。
-     展开体限高内部滚动，避免把对话区挤没或盖住提问。 */
-  .todo-dock {
-    margin: 0 0 8px;
-    padding-bottom: 2px;
-    border-bottom: 1px solid var(--g3);
-    font-size: 13px;
-    min-width: 0;
-  }
-  .todo-dock-row {
-    display: flex;
-    align-items: center;
-    gap: 2px;
-    min-width: 0;
-  }
-  .todo-head {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    width: 100%;
-    min-width: 0;
-    flex: 1;
-    padding: 4px 2px;
-    background: none;
-    border: none;
-    color: var(--g6);
-    cursor: pointer;
-    font-size: 12.5px;
-  }
-  .todo-x {
-    width: 22px;
-    height: 22px;
-    flex: none;
-    padding: 0;
-    border: none;
-    border-radius: 6px;
-    background: transparent;
-    color: var(--g6);
-    font-size: 16px;
-    line-height: 1;
-    cursor: pointer;
-  }
-  .todo-x:hover {
-    color: var(--g7);
-    background: var(--g3);
-  }
-  .todo-dock .todo-body {
-    max-height: min(32vh, 260px);
-    overflow-y: auto;
-    padding: 0 2px 6px;
-  }
-  .todo-head:hover {
-    color: var(--g7);
-  }
-  .todo-ico {
-    width: 15px;
-    height: 15px;
-    color: var(--g6);
-  }
-  .todo-title {
-    font-weight: 600;
-    color: var(--g7);
-  }
-  .todo-cur {
-    flex: 1;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    text-align: left;
-  }
-  .todo-count {
-    font-family: ui-monospace, monospace;
-    font-size: 11.5px;
-    color: var(--g6);
-  }
-  .todo-caret {
-    width: 14px;
-    height: 14px;
-    transition: transform 0.15s;
-  }
-  .todo-caret.open {
-    transform: rotate(180deg);
-  }
-  .todo-body {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    padding: 2px 12px 10px 12px;
-  }
-  .todo-item {
-    display: flex;
-    align-items: flex-start;
-    gap: 8px;
-    line-height: 1.5;
-  }
-  .todo-mark {
-    width: 15px;
-    height: 15px;
-    flex: none;
-    margin-top: 2px;
-    color: var(--g6);
-  }
-  .todo-mark svg {
-    width: 15px;
-    height: 15px;
-  }
-  .todo-item.completed .todo-mark {
-    color: var(--tint-green-fg);
-  }
-  .todo-item.in_progress .todo-mark {
-    color: var(--g6);
-    font-weight: 650;
-  }
-  .todo-text {
-    min-width: 0;
-  }
-  .todo-item.pending .todo-text {
-    color: var(--g6);
-  }
-  .todo-item.in_progress .todo-text {
-    color: var(--g7);
-    font-weight: 600;
-  }
-  .todo-item.completed .todo-text {
-    color: var(--g6);
-    text-decoration: line-through;
-    opacity: 0.75;
-  }
-  .approval-dock {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    margin-bottom: 8px;
-  }
-  .approval-head {
+  :global(.approval-head) {
     display: flex;
     gap: 8px;
     align-items: center;
     flex-wrap: wrap;
     color: var(--g7);
   }
-  .approval-reason {
-    display: inline-block;
-    padding: 1px 6px;
-    border-radius: 4px;
-    background: var(--g2);
-    color: var(--g6);
-    font-size: 11px;
-  }
   /* A4：风险档位徽章（安全/常规改动/高危操作，与 RiskLevel::label 对齐） */
-  .approval-risk {
+  :global(.approval-risk) {
     display: inline-block;
     padding: 1px 6px;
     border-radius: 4px;
     font-size: 11px;
     font-weight: 600;
   }
-  .approval-risk.risk-0 {
+  :global(.approval-risk.risk-0) {
     background: var(--tint-green-bg);
     color: var(--tint-green-fg);
   }
-  .approval-risk.risk-1 {
+  :global(.approval-risk.risk-1) {
     background: var(--tint-blue-bg);
     color: var(--tint-blue-fg);
   }
-  .approval-risk.risk-2 {
+  :global(.approval-risk.risk-2) {
     background: var(--tint-red-bg);
     color: var(--tint-red-fg);
   }
-  .approval-actions {
-    display: flex;
-    gap: 8px;
-    margin-top: 8px;
-    align-items: center;
-  }
-  .approval-state {
+  :global(.approval-state) {
     margin-top: 6px;
     color: var(--g6);
     font-size: 12px;
   }
-  .approval-hint {
-    color: var(--g5);
-    font-size: 11px;
-    align-self: center;
-  }
   /* 工具卡下的审批记录行：时间线位置还原（2026-11-03） */
-  .tool-approval {
+  :global(.tool-approval) {
     display: flex;
     align-items: center;
     gap: 6px;
@@ -14480,11 +11508,11 @@
     color: var(--g6);
     min-width: 0;
   }
-  .tool-approval .ta-state {
+  :global(.tool-approval .ta-state) {
     flex: none;
     color: var(--g7);
   }
-  .tool-approval .ta-reason {
+  :global(.tool-approval .ta-reason) {
     flex: 1;
     min-width: 0;
     overflow: hidden;
@@ -14493,71 +11521,16 @@
     color: var(--g5);
   }
 
-  /* 待发送附件条 */
-  .composer-attachments {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
-    padding: 8px 12px 4px;
-    border-bottom: 1px solid var(--g2);
-  }
-  .att-chip {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    background: var(--g2);
-    border: 1px solid var(--g3);
-    border-radius: 6px;
-    padding: 3px 8px;
-    font-size: 12px;
-    color: var(--tint-blue-fg);
-    max-width: 240px;
-    cursor: pointer; /* 点击打开预览（2026-11-10） */
-  }
-  .att-chip:hover {
-    border-color: var(--g5);
-  }
-  .att-thumb {
-    width: 22px;
-    height: 22px;
-    object-fit: cover;
-    border-radius: 4px;
-  }
-  .att-badge {
-    font-size: 13px;
-  }
-  .att-name {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    max-width: 120px;
-  }
-  .att-size {
-    font-size: 10.5px;
-    color: var(--g5);
-  }
-  .att-del {
-    background: transparent;
-    border: none;
-    color: var(--g6);
-    cursor: pointer;
-    font-size: 11px;
-    padding: 0 2px;
-    line-height: 1;
-  }
-  .att-del:hover {
-    color: var(--tint-red-fg);
-  }
 
   /* 气泡内的附件渲染 */
-  .msg-attachments {
+  :global(.msg-attachments) {
     display: flex;
     flex-wrap: wrap;
     justify-content: flex-end; /* 用户消息整体靠右，附件也要贴右缘 */
     gap: 8px;
     margin-bottom: 6px;
   }
-  .msg-att-img {
+  :global(.msg-att-img) {
     max-width: 280px;
     max-height: 200px;
     border-radius: 6px;
@@ -14566,17 +11539,17 @@
     object-fit: contain;
     background: var(--g0);
   }
-  .msg-att-video {
+  :global(.msg-att-video) {
     max-width: 320px;
     max-height: 220px;
     border-radius: 6px;
   }
-  .msg-att-audio {
+  :global(.msg-att-audio) {
     max-width: 320px;
     height: 38px;
     border-radius: 6px;
   }
-  .msg-att-file {
+  :global(.msg-att-file) {
     font-size: 12px;
     color: var(--tint-blue-fg);
     padding: 4px 8px;
@@ -14584,26 +11557,17 @@
     border-radius: 4px;
   }
   /* 解码兜底的文件条是按钮（点击系统播放器打开）：重置按钮外观，hover 提亮 */
-  .msg-att-file-act {
+  :global(.msg-att-file-act) {
     font-family: inherit;
     border: none;
     cursor: pointer;
     align-self: flex-start;
   }
-  .msg-att-file-act:hover {
+  :global(.msg-att-file-act:hover) {
     background: color-mix(in srgb, var(--veil) 70%, var(--tint-blue-fg) 8%);
   }
 
-  /* 缺 git 明说条（2026-10-06）：git 面板顶部直接讲清楚功能为什么没了 */
-  .git-missing-note {
-    padding: 8px 12px;
-    font-size: 12.5px;
-    line-height: 1.6;
-    color: var(--tint-orange-fg);
-    border-bottom: 1px solid var(--g2);
-  }
-  /* 基线陈旧警告（顶层目录被挪走造成的幽灵删除）：与 git-missing-note 同一只警示色，
-     不带底边——它挂在清单上方，不是把横幅顶掉 */
+  /* 基线陈旧警告（顶层目录被挪走造成的幽灵删除）：与 git-missing-note 同一只警示色，不带底边——它挂在清单上方，不是把横幅顶掉 */
   .rv-warn {
     margin: 8px 10px 0;
     padding: 8px 10px;
@@ -14614,385 +11578,6 @@
     border: 1px solid color-mix(in srgb, var(--tint-orange-fg) 35%, transparent);
     border-radius: 6px;
   }
-  .commit-msg {
-    width: 100%;
-    box-sizing: border-box;
-    resize: vertical;
-  }
-  .commit-err {
-    font-size: 12px;
-    color: var(--tint-red-fg);
-    white-space: pre-wrap;
-    word-break: break-word;
-  }
-  /* —— git 面板状态行（分支 / HEAD / 领先落后）—— */
-  .git-ref {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    color: var(--g7);
-    font-size: 12px;
-    max-width: 260px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .git-ref b {
-    font-weight: 600;
-  }
-  .git-ico {
-    width: 13px;
-    height: 13px;
-    flex: 0 0 auto;
-    color: var(--g5);
-  }
-  .git-head {
-    color: var(--g5);
-    font-family: monospace;
-    font-size: 11px;
-  }
-  .git-ab {
-    color: var(--g6);
-    font-family: monospace;
-    font-size: 11px;
-  }
-  /* —— git 面板（状态行 + 范围选择 + 提交盒 + 文件行）—— */
-  .git-pane {
-    flex: 1;
-    min-height: 0;
-    display: flex;
-    flex-direction: column;
-  }
-  .git-status {
-    flex: none;
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 8px 10px 6px;
-  }
-  /* 提交盒：未提交档顶部——一句话 + 「提交 N 个文件」；勾选在下面清单行上 */
-  .commit-box {
-    flex: none;
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    padding: 8px 10px;
-    border-bottom: 1px solid var(--g2);
-    background: var(--g1);
-  }
-  .commit-msg {
-    font-size: 12.5px;
-    line-height: 1.5;
-  }
-  .commit-bar {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-  }
-  .commit-go {
-    flex: none;
-    background: var(--g3);
-    border: 1px solid var(--g5);
-    color: var(--g7);
-    font-size: 12px;
-    font-weight: 650;
-    cursor: pointer;
-    padding: 4px 12px;
-    border-radius: 6px;
-    font-family: inherit;
-  }
-  .commit-go:hover:not(:disabled) {
-    background: var(--g4);
-    border-color: var(--g6);
-  }
-  .commit-go:disabled {
-    opacity: 0.55;
-    cursor: default;
-  }
-  .commit-hint {
-    font-size: 11px;
-    color: var(--g5);
-  }
-  /* —— git 面板：范围选择/撤销/刷新 + 紧凑行 + 就地展开 diff —— */
-  .rv-head {
-    flex: none;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 8px 10px;
-    border-bottom: 1px solid var(--g2);
-  }
-  /* git 面板范围选择器：Select 组件按面板尺寸收窄（默认是设置弹窗里的整行宽）。
-     button.csel 提一档特异性：稳压 Select 组件自身的 .csel.svelte-hash 规则 */
-  .rv-src {
-    flex: none;
-    max-width: 100%;
-  }
-  .rv-src :global(.csel-wrap) {
-    width: auto;
-  }
-  .rv-src :global(button.csel) {
-    padding: 4px 8px;
-    border: 1px solid var(--g3);
-    border-radius: 6px;
-    font-size: 12px;
-  }
-  .rv-src :global(button.csel:hover) {
-    border-color: var(--g4);
-  }
-  .rv-src :global(.csel-menu) {
-    min-width: 150px;
-  }
-  .rv-totals {
-    flex: none;
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 11.5px;
-    color: var(--g5);
-    white-space: nowrap;
-  }
-  .rv-totals b {
-    color: var(--g6);
-  }
-  .rv-tsep {
-    flex: none;
-    color: var(--g4);
-    padding: 0 5px;
-  }
-  /* 增删计数（git 面板行与合计行共用） */
-  .review-add {
-    flex: none;
-    color: var(--tint-green-fg);
-    font-family: monospace;
-    font-size: 11.5px;
-  }
-  .review-del {
-    flex: none;
-    color: var(--tint-red-fg);
-    font-family: monospace;
-    font-size: 11.5px;
-  }
-  /* 刷新：转圈图标，加载中不重复点 */
-  .rv-btn {
-    flex: none;
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    background: transparent;
-    border: none;
-    color: var(--g6);
-    font-size: 12px;
-    font-family: inherit;
-    padding: 4px 6px;
-    border-radius: 6px;
-    cursor: pointer;
-  }
-  .rv-btn:hover {
-    background: var(--g2);
-    color: var(--g7);
-  }
-  .rv-btn svg {
-    width: 15px;
-    height: 15px;
-  }
-  .rv-btn.spin svg {
-    animation: rv-spin 0.9s linear infinite;
-  }
-  @keyframes rv-spin {
-    to {
-      transform: rotate(360deg);
-    }
-  }
-  .rv-list {
-    flex: 1;
-    min-height: 0;
-    overflow-y: auto;
-    padding: 2px 0;
-  }
-  .rv-empty {
-    margin: auto;
-    text-align: center;
-    color: var(--g5);
-    font-size: 12.5px;
-    line-height: 1.7;
-    padding: 24px 16px;
-  }
-  .rv-empty svg {
-    width: 30px;
-    height: 30px;
-    color: var(--g4);
-    margin-bottom: 8px;
-  }
-  .rv-empty-t {
-    font-size: 13.5px;
-    font-weight: 600;
-    color: var(--g6);
-  }
-  .rv-empty-d {
-    font-size: 12px;
-    margin-top: 3px;
-  }
-  /* 行：紧凑行——文件名粗体 + 目录暗色，右侧增删 + 展开箭头。
-     未提交档行首多一个提交勾选框：行改 flex，勾选框不参与伸缩、文件按钮吃掉余量、
-     diff 展开块整行换行（flex-basis:100%），收起/展开两种态都不破版 */
-  .rv-row {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    border-bottom: 1px solid var(--g2);
-  }
-  .rv-row:last-child {
-    border-bottom: none;
-  }
-  .rv-check {
-    flex: none;
-    margin: 0 2px 0 8px;
-    cursor: pointer;
-    accent-color: var(--g5);
-  }
-  .rv-file {
-    flex: 1 1 auto;
-    display: flex;
-    align-items: center;
-    gap: 7px;
-    width: 100%;
-    min-width: 0;
-    height: 30px;
-    padding: 0 10px;
-    background: transparent;
-    border: none;
-    color: var(--g7);
-    font-size: 12.5px;
-    font-family: inherit;
-    text-align: left;
-    cursor: pointer;
-  }
-  .rv-file:hover {
-    background: var(--g2);
-  }
-  .rv-row.open .rv-file {
-    background: var(--g2);
-  }
-  .rv-file .rv-fico {
-    flex: none;
-    width: 14px;
-    height: 14px;
-    color: var(--g5);
-  }
-  .rv-file.added .rv-fico {
-    color: var(--tint-green-fg);
-  }
-  .rv-file.deleted .rv-fico {
-    color: var(--tint-red-fg);
-  }
-  .rv-fname {
-    flex: none;
-    font-weight: 650;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .rv-fdir {
-    flex: 1 1 auto;
-    min-width: 0;
-    font-size: 11px;
-    color: var(--g5);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .rv-stat {
-    flex: none;
-    display: flex;
-    align-items: center;
-    gap: 7px;
-    font-family: monospace;
-    font-size: 11.5px;
-    font-variant-numeric: tabular-nums;
-  }
-  .rv-chev {
-    flex: none;
-    width: 13px;
-    height: 13px;
-    color: var(--g5);
-    transition: transform 0.12s;
-  }
-  .rv-row.open .rv-chev {
-    transform: rotate(180deg);
-  }
-  /* 就地展开的 diff：左右行号列 + 增删着色 */
-  .rv-diffwrap {
-    flex: 1 1 100%; /* 父行是 flex-wrap：展开的 diff 独占一行，不跟勾选框/文件名并排 */
-    background: var(--g0);
-    border-top: 1px solid var(--g2);
-    max-height: 460px;
-    overflow: auto;
-  }
-  .rv-diffnote {
-    padding: 10px 12px;
-    font-size: 12px;
-    color: var(--g5);
-  }
-  .rv-diff {
-    margin: 0;
-    padding: 8px 0;
-    font-family: Consolas, 'Courier New', monospace;
-    font-size: 12px;
-    line-height: 1.6;
-    min-width: max-content;
-  }
-  .rv-dl {
-    display: flex;
-    align-items: stretch;
-  }
-  .rv-dno {
-    flex: none;
-    width: 38px;
-    padding-right: 9px;
-    text-align: right;
-    color: var(--g4);
-    user-select: none;
-    font-variant-numeric: tabular-nums;
-  }
-  .rv-dtx {
-    white-space: pre;
-    padding-right: 14px;
-    color: var(--g6);
-  }
-  .rv-dl-add {
-    background: color-mix(in srgb, var(--tint-green-bg) 55%, transparent);
-  }
-  .rv-dl-add .rv-dtx {
-    color: var(--tint-green-fg);
-  }
-  .rv-dl-add .rv-dno {
-    color: color-mix(in srgb, var(--tint-green-fg) 55%, var(--g4));
-  }
-  .rv-dl-del {
-    background: color-mix(in srgb, var(--tint-red-bg) 55%, transparent);
-  }
-  .rv-dl-del .rv-dtx {
-    color: var(--tint-red-fg);
-  }
-  .rv-dl-del .rv-dno {
-    color: color-mix(in srgb, var(--tint-red-fg) 55%, var(--g4));
-  }
-  .rv-dl-hunk {
-    background: var(--g2);
-  }
-  .rv-dl-hunk .rv-dtx {
-    color: var(--tint-blue-fg);
-    padding-left: 4px;
-  }
-  .rv-dl-hunk .rv-dno {
-    color: var(--g4);
-  }
-  .rv-dl-meta .rv-dtx {
-    color: var(--g5);
-    padding-left: 4px;
-  }
-  /* 行右键菜单 */
   .rv-menu-back {
     position: fixed;
     inset: 0;
@@ -15028,14 +11613,6 @@
     height: 1px;
     margin: 4px 6px;
     background: var(--g3);
-  }
-  /* 审批卡里仍要显示原始工具参数（工具调用行已改成人话说明） */
-  .approval-box .tool-args {
-    color: var(--g5);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    max-width: 320px;
   }
   /* —— 子代理（2026-10-20 第 2 轮；主区实时条 + 居中小弹窗，不落侧边栏）—— */
   .subagent-strip {
@@ -15123,7 +11700,7 @@
     background: var(--g3);
     color: var(--tint-amber-fg, #d4a017);
   }
-  .subagent-badge.running {
+  .subagent-badge:global(.running) {
     background: var(--g3);
     color: var(--tint-blue-fg);
   }
@@ -15321,6 +11898,29 @@
     line-height: 1.7;
     padding: 10px 2px;
   }
+  /* 「项目文件夹」弹窗里的移除钮（.row-btn 的宿主之一；侧栏行的同名样式在
+     lib/session/Sidebar.svelte——scoped CSS 不跨组件，各自要带一份） */
+  .row-btn {
+    width: 28px;
+    height: 28px;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: none;
+    color: var(--g6);
+    cursor: pointer;
+    flex: none;
+  }
+  .row-btn:hover {
+    background: var(--g2);
+    color: var(--g7);
+  }
+  .row-btn svg {
+    width: 17px;
+    height: 17px;
+  }
   .folders-foot {
     margin-top: 10px;
     display: flex;
@@ -15401,7 +12001,7 @@
     border-radius: 8px;
     margin: 0 2px 4px;
   }
-  .typing {
+  :global(.typing) {
     color: var(--g6);
   }
   /* —— 输入区：悬浮在对话区底部（无分隔线，消息从其下方穿过）—— */
@@ -15438,407 +12038,6 @@
   .composer:focus-within {
     border-color: var(--g6);
     box-shadow: none;
-  }
-  .composer-input {
-    display: block;
-    width: 100%;
-    box-sizing: border-box;
-    resize: none;
-    border: none;
-    outline: none;
-    background: transparent;
-    color: var(--g7);
-    font-size: 14px;
-    line-height: 1.5;
-    padding: 8px 6px 6px;
-    max-height: 200px;
-    font-family: inherit;
-  }
-  .composer-input::placeholder {
-    color: var(--g5);
-  }
-  /* 引用高亮浮层：与 .composer-input 同字号/行高/内边距/断词。默认由它画全部文字
-     （输入框文字透明，只留光标），引用 token 用强调色；中文输入法拼写期间反过来——
-     浮层隐藏、输入框自己显示文字，否则 IME 的候选/下划线会看不见。 */
-  .composer-field {
-    position: relative;
-  }
-  .composer-field .composer-input {
-    color: transparent;
-    caret-color: var(--g7);
-  }
-  .composer-field.composing .composer-input {
-    color: var(--g7);
-  }
-  .composer-field.composing .composer-hl {
-    visibility: hidden;
-  }
-  .composer-hl {
-    position: absolute;
-    inset: 0;
-    z-index: 1;
-    box-sizing: border-box;
-    padding: 8px 6px 6px;
-    font-family: inherit;
-    font-size: 14px;
-    line-height: 1.5;
-    white-space: pre-wrap;
-    overflow-wrap: break-word;
-    word-break: normal;
-    overflow: hidden;
-    color: var(--g7);
-    pointer-events: none;
-    user-select: none;
-  }
-  /* {@html} 注入的 span 不带 Svelte 作用域类，必须 :global 才吃得到样式（同 markdown 那坑） */
-  .composer-hl :global(.ref) {
-    /* 引用高亮（/能力、@文件）回到橙色（2026-11-12 用户：怎么变成白色了）——
-       11-11 全局透明+描边那轮改成白字+下划线，丢了强调色 */
-    color: var(--brand-text);
-    text-decoration: underline;
-    text-decoration-color: color-mix(in srgb, var(--brand-text) 45%, transparent);
-    text-underline-offset: 2px;
-  }
-  .composer-input:disabled {
-    opacity: 0.6;
-  }
-  .composer-bar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
-  }
-  .composer-left,
-  .composer-right {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    min-width: 0;
-  }
-  .icon-btn {
-    width: 28px;
-    height: 28px;
-    border-radius: 7px;
-    /* 全局描边口径：常态无框，hover 才出 1px 描边 */
-    border: 1px solid transparent;
-    background: transparent;
-    color: var(--g6);
-    font-size: 16px;
-    line-height: 1;
-    cursor: pointer;
-  }
-  .icon-btn:hover {
-    background: transparent;
-    border-color: var(--g5);
-    color: var(--g7);
-  }
-  .icon-btn:disabled {
-    opacity: 0.4;
-    cursor: default;
-  }
-  .bar-menu {
-    position: relative;
-    min-width: 0;
-  }
-  .pill {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    max-width: 240px;
-    padding: 4px 8px;
-    border-radius: 8px;
-    /* 输入栏里的 chip 不加描边（用户 2026-11-11 圈选：模型/思考/审批锁） */
-    border: none;
-    background: transparent;
-    color: var(--g6);
-    font-size: 12.5px;
-    cursor: pointer;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .pill:hover {
-    /* 输入栏 chip 一律无底色（用户 2026-11-11：思考那里不要背景色） */
-    background: transparent;
-    color: var(--g7);
-  }
-  .pill.active {
-    /* 输入栏 chip（思考开）不走全局「背景高亮」口径：永远橙字、无底色
-       （2026-11-12 用户：背景高亮下这里也不要有背景色） */
-    background: transparent;
-    color: var(--brand-text);
-  }
-  /* 完全访问档只留红字作静态警示：边框去掉（2026-10-07 真机实测「把红色框
-     去掉」——整个输入栏就这一块挂红框太扎眼；档位含义有 title 与菜单说明讲）。 */
-  .pill.danger {
-    color: var(--tint-red-fg);
-  }
-  /* 审批档收起态：只留一枚图标（档位名称只在展开菜单里显示） */
-  .approval-pill {
-    padding: 4px 7px;
-  }
-  .approval-ico {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 16px;
-    height: 16px;
-    flex: none;
-  }
-  .approval-ico svg {
-    width: 15px;
-    height: 15px;
-    display: block;
-  }
-  .approval-item {
-    align-items: center;
-  }
-  .approval-opt {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .model-pill {
-    font-family: Consolas, monospace;
-  }
-  .bar-dropdown {
-    position: absolute;
-    left: 0;
-    bottom: calc(100% + 8px);
-    min-width: 230px;
-    max-height: 320px;
-    overflow-y: auto;
-    background: color-mix(in srgb, var(--g2) 92%, transparent);
-    border: 1px solid var(--g3);
-    border-radius: 10px;
-    padding: 4px;
-    z-index: 40;
-    box-shadow: 0 8px 24px var(--overlay);
-  }
-  .bar-dropdown.right {
-    left: auto;
-    right: 0;
-  }
-  /* 思考三态分段 + 档位滑杆（2026-11-01，ZCode「思考强度」面板样式） */
-  .think-states {
-    display: flex;
-    gap: 4px;
-    background: var(--g1);
-    border-radius: 9px;
-    padding: 3px;
-  }
-  .think-state {
-    flex: 1;
-    border: none;
-    background: transparent;
-    color: var(--g6);
-    font-size: 12.5px;
-    padding: 5px 0;
-    border-radius: 7px;
-    cursor: pointer;
-    transition: background 0.15s, color 0.15s;
-  }
-  .think-state:hover {
-    color: var(--g7);
-  }
-  .think-state.active {
-    /* 三态分段选中：橙色高亮无底色（2026-11-12 用户：去背景色用选中高亮） */
-    background: var(--sel-bg);
-    color: var(--sel-fg);
-    font-weight: 600;
-  }
-  /* —— 档位滑杆：结构/动效自 ZCode ComposerModelMenu + composer-thought-slider.css 复刻 ——
-     几何：滑块块 32px、轨道 24px（top 4）、圆钮 28px（行程 100%-28px）；
-     动效：圆钮/填充 120ms ease-out（拖动也保留——离散档位切换不跳变，ZCode 源码注释同款）、
-     渐变层 200ms 透明度。
-     2026-11-01 两处定稿偏离 ZCode：①配色跟随主色橙（非 ZCode 绿蓝）；
-     ②粒子全档流动，速度随档位升高加快（ZCode 只在最高档有气泡）。
-     2026-11-08 三处：①去掉静止档点（首/中/尾各一颗，看着像卡住的粒子）；
-     ②粒子 12→40→140→238 颗并掺 1px 细尘/横丝；③缓入曲线+整体提速（涡轮加速感）；
-     ④填充改多色夕烧渐变；粒子回到以白为主（少量米金 + 一颗冷白点缀）。
-     掉落火花试装过一次，用户看后要求撤掉，代码已移除（要恢复看提交 3f1f1f5）。 */
-  .think-panel {
-    min-width: 320px;
-    padding: 6px;
-  }
-  .think-strength {
-    padding: 10px 10px 8px;
-  }
-  .ts-head {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-bottom: 4px;
-  }
-  .ts-label {
-    font-size: 12px;
-    color: color-mix(in srgb, var(--g7) 60%, transparent);
-  }
-  .ts-value {
-    font-size: 13.5px;
-    color: var(--g7);
-  }
-  .ts-kbd {
-    margin-left: auto;
-    font-size: 11px;
-    line-height: 1;
-    color: color-mix(in srgb, var(--g7) 55%, transparent);
-    background: color-mix(in srgb, var(--g7) 8%, transparent);
-    border-radius: 6px;
-    padding: 4px 8px;
-  }
-  .ts-slider {
-    position: relative;
-    height: 32px;
-    width: 100%;
-  }
-  .ts-vis {
-    position: absolute;
-    inset: 0;
-    pointer-events: none;
-  }
-  .ts-track {
-    position: absolute;
-    left: 0;
-    right: 0;
-    top: 4px;
-    height: 24px;
-    border-radius: 999px;
-    background: color-mix(in srgb, var(--g7) 10%, transparent);
-    overflow: hidden;
-  }
-  /* 描边放底层：填充选中区域会完全盖住它（ZCode 同款结构） */
-  .ts-ring {
-    position: absolute;
-    inset: 0;
-    border-radius: 999px;
-    border: 1px solid color-mix(in srgb, var(--g7) 10%, transparent);
-  }
-  .ts-fill {
-    position: absolute;
-    top: 0;
-    bottom: 0;
-    left: 0;
-    border-radius: 999px;
-    /* 2026-11-08「整体颜色单一」：单色橙换成夕烧四段（余烬红→陶土→琥珀→浅金）。
-       低档填充窄时只露出左段（深火），档位越高色带越完整、越亮。
-       同日「左边颜色太深」：整条左端提亮一档（深酒红→灰玫瑰，深锈→中锈） */
-    background: linear-gradient(90deg, #b05a3c 0%, #c8734a 35%, #dfa06e 68%, #f0c795 100%);
-    overflow: hidden;
-    transition: width 120ms ease-out;
-  }
-  /* 最高档渐变层：再加两档色相（左端压进酒红、右端推到浅金），比基础层更亮更有层次。
-     纯色与渐变无法直接插值，用常驻层透明度过渡（200ms），反向调档也不瞬切（ZCode 结构同款） */
-  .ts-fill::before {
-    content: '';
-    position: absolute;
-    inset: 0;
-    border-radius: inherit;
-    opacity: 0;
-    transition: opacity 200ms ease-out;
-    background: linear-gradient(90deg, #8f4450 0%, #b2583f 18%, #d06f45 45%, #e89a63 72%, #f8dfa8 100%);
-  }
-  .ts-fill.max::before {
-    opacity: 1;
-  }
-  .ts-bubbles {
-    position: absolute;
-    inset: 0;
-  }
-  .ts-bubble {
-    position: absolute;
-    left: 0;
-    right: 0;
-    opacity: 0;
-    /* 缓入曲线=涡轮加速：进场慢、越走越快，出口甩出视线（不是匀速滑过） */
-    animation: ts-bubble-flow cubic-bezier(0.45, 0.05, 0.8, 0.6) infinite;
-  }
-  .ts-bubble-dot {
-    display: block;
-    border-radius: 50%;
-    background: currentColor; /* 色板经 color 传进来（主白 + 暖金点缀） */
-  }
-  /* 粒子在可见区间的峰值透明度：238 颗时要把细尘托起来才看得出「满」，0.55→0.62 */
-  @keyframes ts-bubble-flow {
-    0% {
-      transform: translateX(104%);
-      opacity: 0;
-    }
-    12%,
-    82% {
-      opacity: 0.62;
-    }
-    100% {
-      transform: translateX(-4%);
-      opacity: 0;
-    }
-  }
-  /* 档点已移除（首/中/尾不要有点占着不动，滑杆只留流动粒子）。
-     档位位置靠填充宽度+圆钮+上方档位名表达。 */
-  .ts-thumb {
-    position: absolute;
-    top: 2px;
-    width: 28px;
-    height: 28px;
-    border-radius: 50%;
-    background: #fff;
-    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45);
-    transition: left 120ms ease-out;
-  }
-  /* 原生 range：只做交互层，视觉全透明；滑块尺寸与自绘圆钮一致保证首尾档与拖动坐标对齐 */
-  .ts-range {
-    position: absolute;
-    inset: 0;
-    margin: 0;
-    width: 100%;
-    height: 32px;
-    appearance: none;
-    -webkit-appearance: none;
-    background: transparent;
-    outline: none;
-    cursor: pointer;
-  }
-  .ts-range::-webkit-slider-runnable-track {
-    height: 32px;
-    background: transparent;
-  }
-  .ts-range::-webkit-slider-thumb {
-    -webkit-appearance: none;
-    width: 28px;
-    height: 28px;
-    margin-top: 2px;
-    border: 0;
-    border-radius: 50%;
-    background: transparent;
-  }
-  .ts-range::-moz-range-track {
-    height: 32px;
-    background: transparent;
-  }
-  .ts-range::-moz-range-thumb {
-    width: 28px;
-    height: 28px;
-    border: 0;
-    border-radius: 50%;
-    background: transparent;
-  }
-  /* 注：不跟 prefers-reduced-motion 藏粒子——用户机器关了 Windows 客户区动画
-     （SPI GETCLIENTAREAANIMATION=False 实测），WebView2 会把它映射成
-     reduced-motion，照搬 ZCode 的隐藏守卫会让粒子在这台机器上永远不可见
-     （2026-11-01 真机实测「我没看到粒子动效」）。粒子是本功能的主视觉，
-     要直接可见，不交给系统开关裁断。 */
-  /* 「/」统一能力菜单的分组标签（能力/技能/MCP·插件） */
-  .bar-group {
-    padding: 7px 10px 3px;
-    font-size: 11px;
-    color: var(--g5);
-    user-select: none;
-  }
-  /* 能力菜单的加载占位：菜单先开、数据后台补（点了必须有反应，2026-11-07） */
-  .bar-empty {
-    padding: 4px 10px 6px;
-    font-size: 12px;
-    color: var(--g5);
   }
   /* @ 弹窗的 对话/文件 页签 */
   .ctx-tabs {
@@ -15886,14 +12085,14 @@
     color: var(--g5);
   }
   /* 用户气泡上的「对话 · 标题」引用标签 */
-  .msg-convs {
+  :global(.msg-convs) {
     display: flex;
     flex-wrap: wrap;
     justify-content: flex-end; /* 与附件/正文同向：气泡被撑宽时标签也贴右缘 */
     gap: 6px;
     margin-top: 6px;
   }
-  .conv-tag {
+  :global(.conv-tag) {
     display: inline-flex;
     align-items: center;
     gap: 5px;
@@ -15907,102 +12106,7 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .conv-chip .att-name {
-    max-width: 200px;
-  }
-  .bar-dropdown.compact {
-    min-width: 90px;
-  }
   /* 插件行 ▾ 箭头 + 展开后的技能子项（2026-10-02） */
-  .menu-caret {
-    width: 13px;
-    height: 13px;
-    flex: none;
-    align-self: center;
-    color: var(--g5);
-    transition: transform 0.12s;
-  }
-  .bar-item.active .menu-caret {
-    transform: rotate(90deg);
-  }
-  .bar-item-sub {
-    padding-left: 28px;
-  }
-  /* 菜单行右侧的弱化小字（MCP 行显示工具数） */
-  .menu-sub {
-    margin-left: 8px;
-    font-size: 11px;
-    color: var(--g4, #8a8f98);
-  }
-  .bar-dropdown.compact .bar-item {
-    justify-content: center;
-    padding: 6px 14px;
-  }
-  .bar-item {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 12px;
-    width: 100%;
-    text-align: left;
-    padding: 7px 10px;
-    background: transparent;
-    border: none;
-    border-radius: 7px;
-    color: var(--g7);
-    font-size: 13px;
-    cursor: pointer;
-    white-space: nowrap;
-  }
-  .bar-item:hover {
-    background: var(--veil);
-  }
-  /* 模型快选：配置分组头 + 子项 */
-  .bar-item.group-head {
-    font-weight: 650;
-    color: var(--g6);
-    align-items: center;
-  }
-  .bar-item.group-head.active {
-    color: var(--sel-fg);
-  }
-  .bar-item.group-head .caret-ico {
-    width: 13px;
-    height: 13px;
-    flex: none;
-    transition: transform 0.15s;
-  }
-  .bar-item.group-head .caret-ico.open {
-    transform: rotate(90deg);
-  }
-  .bar-item.sub {
-    padding-left: 24px;
-  }
-  .menu-sym {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 20px;
-    height: 20px;
-    flex: none;
-    border-radius: 5px;
-    background: var(--g3);
-    font-size: 12px;
-    font-weight: 650;
-    margin-right: 8px;
-  }
-  /* 「/」菜单插件行图标：同一格子不画字母，画各插件自己的 SVG（图标集见 EXT_ICONS） */
-  .menu-sym.menu-ico {
-    background: transparent;
-    color: var(--g5);
-  }
-  .menu-sym.menu-ico svg {
-    width: 16px;
-    height: 16px;
-  }
-  .bar-item:hover .menu-sym.menu-ico {
-    color: var(--g7);
-  }
   .ctx-modal {
     width: 620px;
     height: 70vh;
@@ -16056,65 +12160,6 @@
   .ctx-file:hover {
     background: var(--g2);
     color: var(--g7);
-  }
-  .bar-item.active {
-    /* 菜单内当前项（模型快选/@ 菜单等）：橙色高亮无底色（2026-11-12 统一口径） */
-    background: var(--sel-bg);
-    color: var(--sel-fg);
-  }
-  /* 上下文圆环：空色轨道 + 实色占用弧 */
-  .ctx-ring .ctx-track {
-    fill: none;
-    stroke: var(--g3);
-    stroke-width: 4.5;
-  }
-  .ctx-ring .ctx-arc {
-    fill: none;
-    stroke-width: 4.5;
-    stroke-linecap: round;
-    transition: stroke-dasharray 0.3s;
-  }
-  .send-btn {
-    width: 34px;
-    height: 34px;
-    border-radius: 10px;
-    border: none;
-    background: linear-gradient(180deg,
-      color-mix(in srgb, var(--brand) 72%, #fff),
-      color-mix(in srgb, var(--brand-deep) 64%, #fff));
-    color: var(--brand-ink);
-    font-size: 16px;
-    line-height: 1;
-    cursor: pointer;
-    flex-shrink: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    box-shadow: 0 2px 10px color-mix(in srgb, var(--brand) 14%, transparent);
-    transition: filter 0.15s ease, transform 0.15s ease;
-  }
-  .send-btn:hover:not(:disabled) {
-    filter: brightness(1.04);
-    transform: translateY(-1px);
-  }
-  .send-btn:disabled {
-    background: var(--g3);
-    color: var(--g5);
-    cursor: default;
-  }
-  .send-btn.stop {
-    background: var(--tint-red-bg);
-    color: var(--tint-red-fg);
-  }
-  .send-btn.stop:hover {
-    background: var(--tint-red-bg);
-    filter: brightness(1.12);
-  }
-  /* —— 工作区切换 —— */
-  .menu-sep {
-    height: 1px;
-    background: var(--g2);
-    margin: 4px 2px;
   }
   .menu-empty {
     color: var(--g5);

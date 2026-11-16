@@ -75,7 +75,6 @@
       <div class="plug-meta">
         <div class="plug-title">{e.title}</div>
         <div class="plug-desc">{e.description || e.dir}</div>
-        {#if e.skills?.length}<div class="plug-desc">自带技能：{e.skills.join('、')}</div>{/if}
       </div>
       {#if e.draft}<span class="plug-chip warn">草稿</span>{/if}
       {#if e.origin === 'model_generated'}<span class="plug-chip">模型自产</span>{/if}
@@ -107,7 +106,6 @@
         <div class="plug-meta">
           <div class="plug-title">{e.title}</div>
           <div class="plug-desc">{e.description || e.dir}</div>
-          {#if e.skills?.length}<div class="plug-desc">自带技能：{e.skills.join('、')}</div>{/if}
         </div>
         {#if e.draft}<span class="plug-chip warn">草稿</span>{/if}
         {#if e.origin === 'model_generated'}<span class="plug-chip">模型自产</span>{/if}

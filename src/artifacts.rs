@@ -87,6 +87,31 @@ pub(crate) fn safe_rel_path(p: &str) -> bool {
     !p.split(['/', '\\']).any(|seg| seg == "..")
 }
 
+/// 依赖与缓存目录/文件不算交付产物：装一次 venv / npm install 会把几千个第三方
+/// 文件全部落进任务 mtime 时间窗，账本被刷成依赖清单（2026-11-14 实锤：抖音工作区
+/// 装包后面板 2164 条里几乎全是 .venv/Lib/site-packages，且经检查点回溯路径涌入）。
+/// 按路径段匹配，出现在任何层级都算噪声；段名单取惯例 .gitignore 口径里
+/// 「装出来/编出来」的那类，不收 dist/build/target 这类可能是真产物的名字。
+const NOISE_SEGMENTS: &[&str] = &[
+    ".venv", "venv", "site-packages", "node_modules", "__pycache__", ".git", ".tox",
+    ".pytest_cache", ".mypy_cache", ".ruff_cache", ".gradle",
+];
+
+/// 依赖/缓存路径判定：命中噪声目录段（任何层级）或编译缓存文件后缀。
+pub(crate) fn is_noise_path(p: &str) -> bool {
+    let lower = p.to_ascii_lowercase();
+    for seg in lower.split(['/', '\\']) {
+        if NOISE_SEGMENTS.contains(&seg) {
+            return true;
+        }
+        // Python 包装元数据目录（xxx-1.0.dist-info / xxx.egg-info）
+        if seg.ends_with(".dist-info") || seg.ends_with(".egg-info") {
+            return true;
+        }
+    }
+    lower.ends_with(".pyc") || lower.ends_with(".pyo")
+}
+
 /// 把「相对基线的改动清单」过滤成「本轮任务真正改到的文件」：
 /// - 删除态不记（面板里点开已不存在的文件没有意义）；
 /// - 只认 mtime 落在任务时间窗内的文件——基线可能是一天前的旧快照，
@@ -101,7 +126,7 @@ pub fn paths_from_changed(files: &[ChangedFile], ws: &Path, since: SystemTime) -
         }
         let raw = f.path.replace('\\', "/");
         let raw = raw.trim_start_matches("./").to_string();
-        if !safe_rel_path(&raw) || raw.to_lowercase().starts_with(".agent/") {
+        if !safe_rel_path(&raw) || raw.to_lowercase().starts_with(".agent/") || is_noise_path(&raw) {
             continue;
         }
         let Ok(meta) = std::fs::metadata(ws.join(&raw)) else { continue };
@@ -164,9 +189,21 @@ fn merge(logs_root: &Path, session: &str, ws: &Path, paths: Vec<String>, backfil
     }
     for p in paths {
         let p = p.replace('\\', "/");
-        if safe_rel_path(&p) && !ledger.paths.iter().any(|x| x == &p) {
+        // 新增路径过噪声过滤：正常记账走 paths_from_changed 已滤过，检查点回溯
+        // （session_changed_paths）不经过它，必须在这里再滤一道（11-14 venv 洪水
+        // 就是走回溯路径涌入的）
+        if safe_rel_path(&p) && !is_noise_path(&p) && !ledger.paths.iter().any(|x| x == &p) {
             ledger.paths.push(p);
         }
+    }
+    // 存量自愈：老账本里已经躺着的噪声路径，趁重写一次性清掉
+    let before = ledger.paths.len();
+    ledger.paths.retain(|p| !is_noise_path(p));
+    if ledger.paths.len() != before {
+        crate::observability::try_event(
+            crate::observability::EventType::State,
+            serde_json::json!({ "kind": "artifacts.noise_dropped", "session": session, "count": before - ledger.paths.len() }),
+        );
     }
     // 上限：只留最近记录的（新路径在尾部）
     if ledger.paths.len() > MAX_PATHS {
@@ -194,11 +231,13 @@ pub fn clear_in(logs_root: &Path, session: &str) {
 }
 
 /// 当前工作区里仍然存在的产物路径（账本里删掉/挪走的条目不显示）。
+/// 依赖/缓存噪声在这里也滤一道：老账本在首次 merge 自愈前就能显示干净，
+/// 不用等下一次记账（11-14 实锤的存量 2164 条 .venv 路径）。
 pub fn existing_paths(ledger: &Ledger, ws: &Path) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for p in &ledger.paths {
         let p = p.replace('\\', "/");
-        if safe_rel_path(&p) && ws.join(&p).is_file() && !out.iter().any(|x| x == &p) {
+        if safe_rel_path(&p) && !is_noise_path(&p) && ws.join(&p).is_file() && !out.iter().any(|x| x == &p) {
             out.push(p);
         }
     }
@@ -297,6 +336,9 @@ mod tests {
         std::fs::write(ws.join("fresh.txt"), "new").unwrap();
         std::fs::create_dir_all(ws.join(".agent")).unwrap();
         std::fs::write(ws.join(".agent").join("tmp.js"), "x").unwrap();
+        // 依赖噪声：venv 深处的第三方文件（2026-11-14 实锤的洪水形态）
+        std::fs::create_dir_all(ws.join(".venv/Lib/site-packages/PIL/__pycache__")).unwrap();
+        std::fs::write(ws.join(".venv/Lib/site-packages/PIL/__pycache__/Image.cpython-313.pyc"), "x").unwrap();
         let mk = |path: &str, status: char| ChangedFile {
             path: path.to_string(),
             status,
@@ -308,6 +350,7 @@ mod tests {
             mk("gone.txt", 'D'),
             mk(".agent/tmp.js", 'M'),
             mk("../escape.txt", 'M'),
+            mk(".venv/Lib/site-packages/PIL/__pycache__/Image.cpython-313.pyc", 'A'),
         ];
         // 任务窗口取在过去一小时：fresh.txt 的 mtime 在窗内
         let since = SystemTime::now() - Duration::from_secs(3600);
@@ -315,6 +358,41 @@ mod tests {
         // 任务窗口取在将来：什么都不算本轮产物（模拟基线里混进了旧改动）
         let future = SystemTime::now() + Duration::from_secs(3600);
         assert!(paths_from_changed(&files, &ws, future).is_empty());
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn noise_paths_are_filtered_on_read_and_merge() {
+        assert!(is_noise_path(".venv/Lib/site-packages/PIL/Image.py"));
+        assert!(is_noise_path("web/node_modules/.bin/x.js"));
+        assert!(is_noise_path("a/b/__pycache__/m.cpython-313.pyc"));
+        assert!(is_noise_path("pkg/deepseek-1.2.dist-info/METADATA"));
+        assert!(is_noise_path("libs/thing.egg-info/PKG-INFO"));
+        assert!(!is_noise_path("运营方案.md"));
+        assert!(!is_noise_path("src/main.rs"), "正常源码不能误伤");
+
+        let root = tmproot("noise");
+        let ws = plain_ws("noise-ws");
+        std::fs::write(ws.join("real.txt"), "x").unwrap();
+        std::fs::create_dir_all(ws.join(".venv/Lib/site-packages/PIL")).unwrap();
+        std::fs::write(ws.join(".venv/Lib/site-packages/PIL/Image.py"), "x").unwrap();
+        // 模拟老账本里已躺着的垃圾（直接 record 不经过 capture 过滤）
+        record_in(&root, "sess-noise", &ws, vec![".venv/Lib/site-packages/PIL/Image.py".into()]).unwrap();
+        // 下一次记账把存量噪声一并清掉，且新增噪声进不来
+        record_in(&root, "sess-noise", &ws, vec!["real.txt".into(), "node_modules/x.js".into()]).unwrap();
+        let l = read_in(&root, "sess-noise").unwrap();
+        assert_eq!(l.paths, vec!["real.txt".to_string()], "存量与新增噪声都该被清掉");
+
+        // 读取侧过滤：老账本没来得及 merge 自愈也显示干净
+        let l2 = Ledger {
+            session: "s".into(),
+            workspace: ws.display().to_string(),
+            paths: vec!["real.txt".into(), ".venv/Lib/site-packages/PIL/Image.py".into()],
+            backfilled: true,
+            updated_ms: 0,
+        };
+        assert_eq!(existing_paths(&l2, &ws), vec!["real.txt".to_string()]);
+        let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&ws);
     }
 
