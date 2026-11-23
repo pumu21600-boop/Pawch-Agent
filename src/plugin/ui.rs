@@ -327,7 +327,7 @@ fn load_one(dir: &Path, name: &str, source: &str, disabled: &[String]) -> UiExt 
             .filter(|p| {
                 matches!(
                     *p,
-                    "composer.insert" | "workspace.write" | "bus.publish" | "notify" | "storage" | "usage.prices" | "clipboard" | "settings.feature" | "action.run" | "session.create"
+                    "composer.insert" | "workspace.write" | "bus.publish" | "notify" | "storage" | "usage.prices" | "clipboard" | "settings.feature" | "action.run" | "session.create" | "android.control"
                 )
             })
             .map(str::to_string)

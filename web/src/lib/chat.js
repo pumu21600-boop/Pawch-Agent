@@ -83,6 +83,8 @@ export function addToolPart(parts, tool) {
     args: tool.args || '',
     status: tool.status || 'running',
     preview: tool.preview || '',
+    adds: null,
+    dels: null,
   });
   return arr;
 }
@@ -150,14 +152,25 @@ export function settleToolArgs(parts, toolIndex, name, args) {
   return arr;
 }
 
+/// 工具结果前缀 `[pawch-diff +A -D] `（write_file/edit_file 的结果）：
+/// 前端画行尾 +A -D，预览文本去掉前缀；老会话没有前缀就不显示。
+const DIFF_PREFIX = /^\[pawch-diff \+(\d+) -(\d+)\] /;
+export function parseToolStats(text) {
+  const s = String(text || '');
+  const m = DIFF_PREFIX.exec(s);
+  if (!m) return { adds: null, dels: null, text: s };
+  return { adds: Number(m[1]), dels: Number(m[2]), text: s.slice(m[0].length) };
+}
+
 /// 工具结果到达：只结算最后一个同名、仍在执行的工具段
 export function settleToolPart(parts, name, ok, preview) {
   if (!parts || !parts.length) return parts || [];
   const arr = parts.slice();
+  const st = parseToolStats(preview);
   for (let i = arr.length - 1; i >= 0; i--) {
     const p = arr[i];
     if (p.type === 'tool' && p.name === name && p.status === 'running') {
-      arr[i] = { ...p, status: ok ? 'ok' : 'fail', preview: preview || '' };
+      arr[i] = { ...p, status: ok ? 'ok' : 'fail', preview: st.text, adds: st.adds, dels: st.dels };
       break;
     }
   }
@@ -198,6 +211,8 @@ export function partsFromStoredMessage(m) {
       args: tc.function?.arguments || '',
       status: 'ok',
       preview: '',
+      adds: null,
+      dels: null,
     });
   });
   return parts;
@@ -216,6 +231,8 @@ export function legacyParts(m) {
       args: t.args || '',
       status: t.status || 'ok',
       preview: t.preview || '',
+      adds: t.adds ?? null,
+      dels: t.dels ?? null,
     });
   });
   if (m.content) parts.push({ type: 'content', text: m.content });
@@ -340,7 +357,8 @@ export function attachToolPreview(parts, toolCallId, preview) {
   const idx = parts.findIndex((p) => p.type === 'tool' && p.id === toolCallId);
   if (idx < 0) return parts;
   const arr = parts.slice();
-  arr[idx] = { ...arr[idx], preview: preview || '' };
+  const st = parseToolStats(preview);
+  arr[idx] = { ...arr[idx], preview: st.text, adds: st.adds, dels: st.dels };
   return arr;
 }
 
@@ -813,16 +831,47 @@ export function toolIcon(kind) {
     return highlightComposer(typeof content === 'string' ? content : String(content ?? ''));
   }
 
-/// 引用对话块（App 的 convBlocks 生成）→ { text, convs }。会话文件里存的是拼好的
+/// 回答的正文（收尾态上屏的那一段）：最后一段非空 content。多步任务里的中途说明
+/// 折在过程块里，不算「这条回答」——复制与引用都只取用户看到的那段。
+export function finalAnswerText(m) {
+  const parts = messageParts(m);
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i];
+    if (p.type === 'content' && String(p.text || '').trim()) return p.text;
+  }
+  return '';
+}
+
+/// 引用回答 chip 的短标题：取首个非空行，去掉 markdown 标记（标题符号/强调/行内码/
+/// 列表点/链接壳），超长截断。chip 只给人看，发送拼块用的是全文。
+export function quoteSnippet(text, n = 30) {
+  const line = String(text || '').split('\n').map((l) => l.trim()).find(Boolean) || '';
+  const t = line
+    .replace(/^#+\s*/, '')
+    .replace(/^[-*+]\s+/, '')
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/(\*\*|__|~~|`)/g, '')
+    .replace(/[*_]/g, '');
+  return t.length > n ? `${t.slice(0, n)}…` : t;
+}
+
+/// 引用块（App 的 convBlocks 生成）→ { text, convs }。会话文件里存的是拼好的
 /// 全文（模型上下文要它），但气泡只该显示「用户打的那句 + 引用 chip」。刷新、分叉、
 /// 重开会话都是从文件重建气泡——2026-11-16 用户实测：分叉后整段他人对话被铺进消息流。
 /// convs 里保留 body 原文：编辑重发要按原样拼回去（chip 只读 title）。
+/// kind='quote' 是引用某条回答（单条），'conv'/缺省是引用整个对话。
 export function splitConvBlocks(text) {
   const s = String(text ?? '');
   const convs = [];
   const omittedMark = '\n（该对话较长，此处只保留了最近部分）';
-  const re = /\n\n【引用对话：([^\n]*?)】\n([\s\S]*?)\n【引用对话结束】/g;
-  const cleaned = s.replace(re, (_, title, body) => {
+  const re =
+    /\n\n【引用对话：([^\n]*?)】\n([\s\S]*?)\n【引用对话结束】|\n\n【引用回答】\n([\s\S]*?)\n【引用回答结束】/g;
+  const cleaned = s.replace(re, (_, title, body, answer) => {
+    if (answer !== undefined) {
+      // 同一会话里同索引的多个 quote 靠长度再分一次；id 只给输入区 chip 的移除用
+      convs.push({ id: `quote-${convs.length}-${answer.length}`, kind: 'quote', title: quoteSnippet(answer), text: answer });
+      return '';
+    }
     const omitted = body.endsWith(omittedMark);
     convs.push({ title, text: omitted ? body.slice(0, -omittedMark.length) : body, omitted });
     return '';

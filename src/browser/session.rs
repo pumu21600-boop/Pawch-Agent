@@ -165,6 +165,15 @@ pub(crate) async fn dev_close_target(port: u16, id: &str) {
 
 /// 建一条标签页连接（Page.enable + 可选导航等待加载完成）并挂进会话。
 pub(crate) async fn create_tab(session: &BrowserSession, url: &str, agent: bool) -> Result<Arc<WebTab>, String> {
+    // 串行化整段「发现 target + 入表」：并发建页时两边都会把对方刚建出来的 target
+    // 当成自己的（2026-11-20 真机：两条 browser.tab.new 同毫秒、同 id → tabs 重复
+    // id → 前端 keyed each 抛错中断整轮渲染）。导航在锁内做，代价是并发建页排队，
+    // 换的是 id 唯一。
+    let _gate = session.tab_create_lock.lock().await;
+    create_tab_locked(session, url, agent).await
+}
+
+async fn create_tab_locked(session: &BrowserSession, url: &str, agent: bool) -> Result<Arc<WebTab>, String> {
     let (id, ws, shell_label) = match session.mode {
         // shell 模式一律 about:blank 起步：WebView2 的 child webview 带初始 URL 创建时，
         // 导航一提交 CDP target 就被换掉（实测 Edg/153：about:blank target 上线 180ms 后
@@ -175,6 +184,25 @@ pub(crate) async fn create_tab(session: &BrowserSession, url: &str, agent: bool)
             (id, ws, None)
         }
     };
+    // 最后一道闸：同一个 target 只入表一次。理论上建页锁已经排除了这条路径，但
+    // target 发现依赖异步的壳/CDP 侧状态，宁可复用既有 tab 也不能让重复 id 落到
+    // 前端。多建出来的 shell webview 立刻回收。
+    if let Some(existing) = session
+        .tabs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|t| t.id == id)
+        .cloned()
+    {
+        if let Some(label) = shell_label.as_deref() {
+            shell::close(label);
+        }
+        if agent {
+            existing.agent.store(true, Ordering::Relaxed);
+        }
+        return Ok(existing);
+    }
     let cdp = cdp::Cdp::connect(&ws).await?;
     cdp.call("Page.enable", json!({})).await?;
     let tab = WebTab::new(id, agent, cdp, shell_label);
@@ -355,6 +383,10 @@ pub(crate) async fn close_tab(session: &BrowserSession, id: &str) -> bool {
 /// agent 工具的当前工作页：① 会话记录的 agent 页（跨站点导航迁到新页后指向新页）；
 /// ② 兜底找任何带 agent 标记的页（旧会话迁移）；③ 都没有就建一个。
 pub(crate) async fn agent_tab(session: &BrowserSession) -> Result<Arc<WebTab>, String> {
+    // 检查+建页同一把锁：两个工具调用同时进来都看到「没有 agent 页」时，后进锁的
+    // 那个复查能看到前者刚建好的页，不会再多建一页（与 create_tab 的 target 认领
+    // 竞态是同一次真机事故的两半）。
+    let _gate = session.tab_create_lock.lock().await;
     {
         let tabs = session.tabs.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some(id) = session.agent_tab_now()
@@ -367,7 +399,7 @@ pub(crate) async fn agent_tab(session: &BrowserSession) -> Result<Arc<WebTab>, S
             return Ok(t.clone());
         }
     }
-    let tab = create_tab(session, "about:blank", true).await?;
+    let tab = create_tab_locked(session, "about:blank", true).await?;
     session.set_agent_tab(&tab.id);
     Ok(tab)
 }
@@ -552,6 +584,7 @@ pub(crate) async fn launch() -> Result<Arc<BrowserSession>, String> {
                     agent_touched_ms: AtomicU64::new(0),
                     agent_tab_id: std::sync::Mutex::new(None),
                     shell_label_seq: std::sync::atomic::AtomicU64::new(1),
+                    tab_create_lock: Mutex::new(()),
                 });
                 ensure_reaper();
                 return Ok(session);
@@ -597,7 +630,8 @@ pub(crate) async fn shell_launch() -> Result<Arc<BrowserSession>, String> {
         last_frame_poll_ms: AtomicU64::new(0),
         agent_touched_ms: AtomicU64::new(0),
         agent_tab_id: std::sync::Mutex::new(None),
-                    shell_label_seq: std::sync::atomic::AtomicU64::new(1),
+        shell_label_seq: std::sync::atomic::AtomicU64::new(1),
+        tab_create_lock: Mutex::new(()),
     });
     // 壳不重启而服务重启过时，上一个会话的 webview 还活着——先清干净再建，
     // 免得残留 target 干扰发现、白白常驻

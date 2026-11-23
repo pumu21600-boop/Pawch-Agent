@@ -32,6 +32,8 @@ fn allowed(tool: &str) -> bool {
             | "edit_file"
             | "computer"
             | "browser"
+            // 2026-11-22：安卓模拟器进批（tap_text→screenshot 连招；中间图只留最后一张）
+            | "android"
             // 2026-11-03：任务清单更新进批（连做多步时步进汇报）
             | "todo"
     )
@@ -83,6 +85,24 @@ fn one_line(s: &str, max: usize) -> String {
     }
 }
 
+/// 子结果前缀 `[pawch-diff +A -D] ` → (adds, dels, 去掉前缀的正文)。
+/// batch 里可能夹 write_file/edit_file：汇总增删给外层工具行，子行不再带各自前缀。
+fn take_stats(s: &str) -> (usize, usize, String) {
+    let Some(rest) = s.strip_prefix("[pawch-diff +") else {
+        return (0, 0, s.to_string());
+    };
+    let Some((adds, tail)) = rest.split_once(" -") else {
+        return (0, 0, s.to_string());
+    };
+    let Some((dels, msg)) = tail.split_once("] ") else {
+        return (0, 0, s.to_string());
+    };
+    match (adds.parse::<usize>(), dels.parse::<usize>()) {
+        (Ok(a), Ok(d)) => (a, d, msg.to_string()),
+        _ => (0, 0, s.to_string()),
+    }
+}
+
 pub async fn run(cfg: &ExecConfig, args: &str) -> Result<String, String> {
     let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
     let plan = plan_steps(&v)?;
@@ -92,9 +112,15 @@ pub async fn run(cfg: &ExecConfig, args: &str) -> Result<String, String> {
     let mut failed: Option<String> = None;
     let mut image: Option<(usize, String)> = None;
     let mut dropped = 0usize;
+    let mut adds = 0usize;
+    let mut dels = 0usize;
     for (i, (tool, a)) in plan.iter().enumerate() {
         match execute_one(cfg, tool, a).await {
             Ok(mut content) => {
+                let (a, d, rest) = take_stats(&content);
+                adds += a;
+                dels += d;
+                content = rest;
                 if let Some(b64) = crate::computer::take_image(&mut content) {
                     if image.is_some() {
                         dropped += 1;
@@ -116,6 +142,9 @@ pub async fn run(cfg: &ExecConfig, args: &str) -> Result<String, String> {
         Some(why) => format!("{done}/{total} 步成功，{why}。"),
     };
     let mut out = format!("batch {head}\n{}\n", lines.join("\n"));
+    if adds + dels > 0 {
+        out = format!("[pawch-diff +{adds} -{dels}] {out}");
+    }
     if let Some((step, _)) = &image
         && *step != done
     {
@@ -150,6 +179,16 @@ mod tests {
         }
         let many: Vec<Value> = (0..MAX_STEPS + 1).map(|_| json!({"tool": "computer", "args": {}})).collect();
         assert!(plan_steps(&json!({"steps": many})).unwrap_err().contains("最多"));
+    }
+
+    #[test]
+    fn take_stats_parses_and_strips_prefix() {
+        assert_eq!(take_stats("[pawch-diff +12 -3] 已编辑 a.txt"), (12, 3, "已编辑 a.txt".to_string()));
+        assert_eq!(take_stats("普通结果"), (0, 0, "普通结果".to_string()));
+        assert_eq!(
+            take_stats("[pawch-diff +x -1] 坏前缀"),
+            (0, 0, "[pawch-diff +x -1] 坏前缀".to_string())
+        );
     }
 
     #[test]

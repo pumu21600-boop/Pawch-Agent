@@ -667,7 +667,23 @@ pub async fn run_task(
         let ws = ws.clone();
         let sid = gate.session_id().to_string();
         tokio::task::spawn_blocking(move || -> Option<String> {
-            let _ = recovery::checkpoint(&ws, "任务起点", &sid);
+            // 基线拍失败不许静默：改动条/撤销/产物归属全押在它身上（2026-11-23 实锤：
+            // git add 撞 .gitignore 忽略路径整批拒掉，基线悄悄停在旧提交，全项目变 +N）
+            match recovery::checkpoint(&ws, "任务起点", &sid) {
+                Ok(Some(cp)) => {
+                    observability::event(
+                        EventType::State,
+                        json!({ "kind": "checkpoint.created", "id": cp.id, "ts": cp.ts, "reason": cp.reason, "session": cp.session }),
+                    );
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    observability::event(
+                        EventType::Error,
+                        json!({ "kind": "checkpoint.failed", "reason": "任务起点", "error": e.to_string(), "session": sid }),
+                    );
+                }
+            }
             recovery::head_id(&ws).ok().flatten()
         })
         .await

@@ -856,7 +856,6 @@
     <div class="gx-search">
       <input
         bind:value={query}
-        placeholder="搜索记忆，例如「安装器单文件」"
         on:keydown={(e) => e.key === 'Enter' && doSearch()}
         spellcheck="false"
       />

@@ -1,1 +1,1 @@
-{}
+{"default":{"identifier":"default","description":"主窗口默认能力：核心插件默认权限 + 无边框窗标题栏拖拽（data-tauri-drag-region 走 plugin:window|start_dragging，core:window:default 不含它；缺这条时拖顶栏会被 ACL 拒绝，窗口移动不了）。","local":true,"windows":["main"],"permissions":["core:default","core:window:allow-start-dragging"]}}

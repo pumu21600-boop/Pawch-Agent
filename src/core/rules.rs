@@ -71,6 +71,8 @@ const KNOWN_TOOLS: &[&str] = &[
     "memory",
     // 2026-10-20 操作电脑（截图/键鼠/窗口；按 method 分级，见 evaluate_risk 的 computer 臂）
     "computer",
+    // 2026-11-22 安卓模拟器（截图/点击/装 APK/logcat/shell；按 method 分级，见 android 臂）
+    "android",
     // 2026-11-02 一次调用连做多步（白名单 + 整包取最高档，见 evaluate_risk 的 batch 臂）
     "batch",
     // 2026-11-03 任务清单（ZCode TodoWrite 同款：只动会话内清单状态，恒 Safe）
@@ -269,6 +271,22 @@ pub fn evaluate_risk(tool_name: &str, args: &Value, workspace_root: &Path) -> (R
                 (
                     RiskLevel::Normal,
                     "电脑操作（键鼠/聚焦，真的在动你的桌面）".into(),
+                )
+            }
+        }
+
+        // 安卓模拟器（2026-11-22）：模拟器是隔离设备——env/state/截图/控件树/
+        // logcat/剪贴板读恒 Safe；start/stop/touch/key/text/install/launch/tap_text
+        // 是常规改动（动的是虚拟机，不动宿主机）；shell 真跑设备内任意命令，
+        // 与终端同级按常规改动走闸（模拟器可随意重置，宿主机不受影响）
+        "android" => {
+            let method = args.get("method").and_then(|v| v.as_str()).unwrap_or("");
+            if crate::android::method_is_read_only(method) {
+                (RiskLevel::Safe, "安卓只读操作（状态/截图/控件树/logcat）".into())
+            } else {
+                (
+                    RiskLevel::Normal,
+                    "安卓模拟器操作（启动/点击/装应用，动的是隔离设备）".into(),
                 )
             }
         }

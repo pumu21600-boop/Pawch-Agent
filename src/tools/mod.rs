@@ -393,6 +393,35 @@ fn builtin_tools() -> Vec<ToolSpec> {
             danger_level: 1,
         },
         ToolSpec {
+            name: "android",
+            description: "安卓模拟器（「安卓模拟器」插件面板实时可见你操作的同一台设备）。一个工具按 method 覆盖：env 看环境（SDK 路径/AVD 清单/配置，先调它确认环境齐不齐）；state 看运行状态；list_avds 列模拟器；start 启动（可配 avd 名，首次冷启动约 40s，等待 boot 完成）；stop 关机；screenshot 截当前画面 PNG（结果内联图片你能直接看见，全图存工作区 screenshots/）；touch 点击/滑动（x,y 必填；给 x2,y2 = 从起点滑到终点，duration_ms 缺省 240）；key 发 Android keycode（4=返回 3=HOME 187=最近任务）；text 直送 ASCII 文本（中文不支持，走 clip）；clip 设/读模拟器剪贴板（中文输入路径：clip 设好后让用户在面板里长按粘贴，或 tap_text 到输入框再用粘贴键）；ui 拉界面控件树（中心坐标+可点标记+文本，找控件先调它，别在截图上估坐标）；tap_text 按控件文本直接点（如 \"设置\"）；install 装 APK（path 相对工作区或绝对路径）；launch 启动应用（package 包名，不带 activity 时自动找 launcher）；logcat 拉最近日志（查崩溃先看它，grep FATAL/AndroidRuntime）；shell 在设备上跑任意 adb shell 命令（高危，按档位审批）。工作流：start → install → launch → ui/tap_text/screenshot 自测；改了代码重装 APK 前先 force-stop。模拟器是隔离设备，shell 可以放开手脚，但 install/launch 之外别动宿主机。插件面板和你看的是同一台设备：你截图/点击时用户实时看得见。",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "method": {
+                        "type": "string",
+                        "enum": crate::android::ALL_METHODS.to_vec(),
+                        "description": "命令方法（见工具说明）"
+                    },
+                    "avd": { "type": "string", "description": "start：AVD 名（缺省用设置 android.avd 或列表最后一个）" },
+                    "x": { "type": "integer", "description": "touch：设备屏幕 x（像素，screenshot/ui 返回的坐标系）" },
+                    "y": { "type": "integer", "description": "touch：设备屏幕 y" },
+                    "x2": { "type": "integer", "description": "touch：滑动终点 x（给了就当滑动）" },
+                    "y2": { "type": "integer", "description": "touch：滑动终点 y" },
+                    "duration_ms": { "type": "integer", "description": "touch：滑动时长（缺省 240）" },
+                    "keycode": { "type": "integer", "description": "key：Android keycode（4=返回 3=HOME 187=最近任务）" },
+                    "text": { "type": "string", "description": "text：ASCII 文本；clip：剪贴板内容；tap_text：要点的控件文本" },
+                    "path": { "type": "string", "description": "install：APK 路径（相对工作区或绝对路径）" },
+                    "package": { "type": "string", "description": "launch：应用包名（如 com.sgu.timetable）" },
+                    "activity": { "type": "string", "description": "launch：可选 activity（缺省自动找 launcher）" },
+                    "lines": { "type": "integer", "description": "logcat：行数（缺省 200）" },
+                    "cmd": { "type": "string", "description": "shell：adb shell 命令（如 \"pm list packages\"）" }
+                },
+                "required": ["method"]
+            }),
+            danger_level: 1,
+        },
+        ToolSpec {
             name: "batch",
             description: "一次调用连做多步（省往返）：steps 按顺序串行执行，每步是一个工具调用。适合**确定要做的连招**——点击→输入→回车、打开应用→截图、find→click、一次读/改多个文件。某步失败立刻停，已经做过的如实返回；最多 8 步。**互不依赖的调用别塞进 batch**：那些直接在同一条消息里发多个 tool_call，会并行跑、更快。shell/git/settings/plugin/skill/session/subagent_spawn/memory 不在白名单（不可批）。中间截图只保留最后一张。审批按整包最高风险一次问清。",
             parameters: json!({
@@ -606,6 +635,10 @@ pub fn definitions() -> Vec<Value> {
     if !computer_enabled() {
         out.retain(|v| v["function"]["name"].as_str() != Some("computer"));
     }
+    // 安卓总闸：同款（模拟器没环境时工具在，调了会给人话报错引导装环境）
+    if !crate::android::android_enabled() {
+        out.retain(|v| v["function"]["name"].as_str() != Some("android"));
+    }
     out.extend(crate::mcp::tool_definitions());
     out.extend(crate::plugin::wasm::tool_definitions());
     out
@@ -665,6 +698,14 @@ pub(crate) async fn execute_one(cfg: &ExecConfig, name: &str, args: &str) -> Res
         // Chromium 自带站点隔离即边界，不进 Windows 沙箱；审批门按 method 分级
         // （只读 Safe / 页面操作 Normal，见 core/rules.rs）。
         "browser" => crate::browser::command(args, cfg.max_chars).await,
+        // 安卓模拟器（截图/点击/装 APK；2026-11-22 轮）。同 browser：method 判别，
+        // 审批门按 method 分级（core/rules.rs），插件停用时 definitions 已下架+此处拒绝。
+        "android" => {
+            if !crate::android::android_enabled() {
+                return Err(crate::android::ANDROID_OFF_MSG.to_string());
+            }
+            crate::android::execute(args, cfg.max_chars, &cfg.workspace).await
+        }
         // 操作电脑（截图/键鼠/窗口；2026-10-20 第 4 轮）
         "computer" => {
             // 电脑操作总闸（2026-11-04 起为插件开关）：关着时工具清单里也没有它，

@@ -1,0 +1,12 @@
+{
+  "apiVersion": 1,
+  "source": "built_in",
+  "title": "安卓模拟器",
+  "description": "安卓模拟器：实时画面、agent 装 APK 点界面自测，停用即全禁",
+  "version": "0.1.1",
+  "entry": "index.html",
+  "ui": [
+    { "slot": "dock", "id": "android", "title": "安卓模拟器" }
+  ],
+  "permissions": ["android.control"]
+}

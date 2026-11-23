@@ -44,6 +44,8 @@
     parseArgs,
     prettyArgs,
     splitConvBlocks,
+    finalAnswerText,
+    quoteSnippet,
   } from './lib/chat.js';
   import RenameModal from './lib/RenameModal.svelte';
   import ConfirmModal from './lib/ConfirmModal.svelte';
@@ -184,7 +186,8 @@
     const out = [];
     for (let i = 0; i < list.length; i += CV_CHUNK) {
       const msgs = list.slice(i, i + CV_CHUNK);
-      out.push({ key: msgs[0].id, n: msgs.length, msgs });
+      // key 兜底：块首消息万一没有 id，两个空 key 块也会撞 each_key_duplicate
+      out.push({ key: msgs[0] && msgs[0].id != null ? msgs[0].id : 'chunk-' + i, n: msgs.length, msgs });
     }
     return out;
   })();
@@ -223,12 +226,11 @@
 
   // —— 消息操作 ——
   // 回滚/删除共用服务端截断端点（/api/sessions/truncate，按文件里第 N 条 user 消息定位）；
-  // 编辑=停流→回滚到该消息之前→以新文本重发；多选用于批量删除与生成上下文摘录。
+  // 编辑=停流→回滚到该消息之前→以新文本重发；多选用于批量删除。
   let editingMsg = null; // { id, text } 正在编辑的用户消息
   let msgSelectMode = false;
   let msgSelected = []; // 选中的消息 id
   let statsModal = null; // 信息卡：正在展示的那条 assistant 消息
-  let ctxCopied = false; // 「已复制」轻提示（2s 自灭，不弹不落盘）
 
   const curKey = () => currentSessionId || '@new';
   // 刷新「当前会话」的三个镜像变量（切会话、流开始/结束时调用）
@@ -241,13 +243,23 @@
     streaming = nowStreaming;
     controller = streams[k] ? streams[k].controller : null;
     messages = sessionMsgs[k] || [];
-    // 任务清单 dock：只有**切会话**重置手动态。发消息/起止流不重置——叉掉的清单
-    // 不能被下一条消息召回，旧清单也不能在发消息瞬间自动弹开（2026-11-13 两问）；
-    // 跨轮新清单的判定在 trackTodoCall（按清单出处 + 流式轮）。
+    // 任务清单 dock：叉掉按**清单指纹**持久化（2026-11-22 用户定案）——同一条清单
+    // 跨刷新/重启/切走再切回永不再出现；指纹变了=新任务，回到自动规则；
+    // 发消息/起止流不重置（2026-11-13 两问口径不变）。
     if (k !== todoDockKey) {
-      todoDockPinned = null;
-      todoDockDismissed = false;
       todoDockKey = k;
+      const ref = latestTodoCall(messages)?.ref ?? null;
+      const saved = todoManualLoad(k === '@new' ? null : k);
+      if (saved && saved.ref === ref) {
+        todoDockDismissed = !!saved.dismissed;
+        todoDockPinned = saved.pinned === undefined ? null : saved.pinned;
+      } else {
+        todoDockPinned = null;
+        todoDockDismissed = false;
+      }
+      todoSeenRef = ref;
+      todoSeenTurn = todoTurnNo;
+      todoAutoOpen = false;
     }
     // 草稿附件的「未能保留」通知：等这条会话的消息数组存在了再补（否则会建出
     // 一个只有通知的数组，loadSession 见到「已有缓存」就不重建历史了）。
@@ -263,11 +275,74 @@
     }
   }
   function setMsgs(key, arr) {
-    sessionMsgs = { ...sessionMsgs, [key]: arr };
-    if (key === curKey()) messages = arr;
+    const clean = dedupeMsgs(arr);
+    sessionMsgs = { ...sessionMsgs, [key]: clean };
+    if (key === curKey()) messages = clean;
+  }
+  // 同一 id 出现两行会让键控列表（消息分块 key=块首 id、块内 each key=m.id）在下一轮
+  // flush 抛 each_key_duplicate——**整个界面停止更新而后台照跑**（2026-11-22 真机两次，
+  // 用户观感：引导没提示、排队消息消失、刷新后工具调用折叠、点停止才「露出来」）。
+  // 所有消息写入都汇到 setMsgs，这里就地兜底：首次出现的位置保留、内容取后到的
+  // （后到=更新的状态），并上报 client-log 留排查线索，别让兜底把根因吞了。
+  function dedupeMsgs(arr) {
+    const seen = new Set();
+    let dup = false;
+    for (const m of arr) {
+      if (!m || m.id == null) continue;
+      if (seen.has(m.id)) {
+        dup = true;
+        break;
+      }
+      seen.add(m.id);
+    }
+    if (!dup) return arr;
+    const out = [];
+    const at = new Map();
+    let dupId = '';
+    for (const m of arr) {
+      if (m && m.id != null && at.has(m.id)) {
+        if (!dupId) dupId = String(m.id);
+        out[at.get(m.id)] = m;
+        continue;
+      }
+      if (m && m.id != null) at.set(m.id, out.length);
+      out.push(m);
+    }
+    console.warn('[pawch] 消息数组出现重复 id，已去重兜底：', dupId);
+    try {
+      fetch('/api/client-log', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kind: 'client', level: 'warn', message: 'msgs deduped id=' + dupId, stack: '', file: 'App.svelte setMsgs', line: 0, col: 0, url: location.href }),
+      }).catch(() => {});
+    } catch {}
+    return out;
   }
   function updMsgs(key, fn) {
     setMsgs(key, fn(sessionMsgs[key] || []));
+  }
+  // 流式卡顿哨兵的上报（2026-11-23）：同一页最多 10 秒一条，防止饱和期刷屏
+  let lastStreamSlowAt = 0;
+  function warnSlowStream(ms, n) {
+    const now = Date.now();
+    if (now - lastStreamSlowAt < 10000) return;
+    lastStreamSlowAt = now;
+    try {
+      fetch('/api/client-log', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          kind: 'client',
+          level: 'warn',
+          message: `流式事件批处理慢 ${Math.round(ms)}ms（${n} 条事件，含渲染）`,
+          stack: '',
+          file: 'App.svelte 流读取哨兵',
+          line: 0,
+          col: 0,
+          url: location.href,
+        }),
+      }).catch(() => {});
+    } catch {}
   }
   function pushMsg(key, msg) {
     updMsgs(key, (a) => [...a, msg]);
@@ -768,6 +843,8 @@
       // 面板还挂着上一个工作区的清单，而 git 状态横幅已跟着新工作区更新——
       // 2026-10-13 真机实测「智云的改动串到另一个工作区」就是这个症状
       rvBaseline = '';
+      rvOverview = null;
+      rvCumBase = '';
       rvFiles = [];
       rvOpen = {};
       rvDiff = {};
@@ -784,7 +861,7 @@
       rvStaleClosed = false;
       rpStaleErr = '';
       rvStaleErr = '';
-      if (rpTab === 'git') loadReview();
+      if (rpTab === 'git') refreshGitPane(true);
       else if (rpTab === 'artifacts') loadArtifacts();
     } catch (e) {
       // wsMsg 只渲染在 WorkspaceModal 里，而那个弹窗没有任何置 true 的入口（死代码）——
@@ -1735,16 +1812,33 @@
   }
   function removePendingConv(id) {
     pendingConvs = pendingConvs.filter((c) => c.id !== id);
+    persistComposer(curKey()); // 移除立即落草稿：不然刷新/切会话又把引用带回来
   }
-  /// 引用对话块：拼在发送正文之后（放进 message 与本地 history，模型与界面同一份）
+  /// 引用一条回答：挂进输入区（与引用对话同一套 chip），发送时整块拼进消息正文。
+  /// 同一条回答重复点=替换不叠加；kind='quote' 决定拼块用「引用回答」而不是「引用对话」。
+  function quoteAnswer(m) {
+    const text = finalAnswerText(m);
+    if (!text.trim()) return;
+    const id = `quote:${m.id}`;
+    pendingConvs = [
+      ...pendingConvs.filter((c) => !(c.kind === 'quote' && c.id === id)),
+      { id, kind: 'quote', title: quoteSnippet(text), text },
+    ];
+    persistComposer(curKey());
+    plusMenuOpen = false;
+    abilityMenuOpen = false;
+    tick().then(() => composerInputEl && composerInputEl.focus());
+  }
+  /// 引用块：拼在发送正文之后（放进 message 与本地 history，模型与界面同一份）
   function convBlocks(convs) {
     if (!convs || !convs.length) return '';
     return (
       '\n\n' +
       convs
-        .map(
-          (c) =>
-            `【引用对话：${c.title}】\n${c.text}${c.omitted ? '\n（该对话较长，此处只保留了最近部分）' : ''}\n【引用对话结束】`
+        .map((c) =>
+          c.kind === 'quote'
+            ? `【引用回答】\n${c.text}\n【引用回答结束】`
+            : `【引用对话：${c.title}】\n${c.text}${c.omitted ? '\n（该对话较长，此处只保留了最近部分）' : ''}\n【引用对话结束】`
         )
         .join('\n\n')
     );
@@ -1794,7 +1888,9 @@
   ];
   // 侧栏只收编这三个宿主面板插件（时间线/项目文件/用量）——其余插件哪怕 manifest 声明
   // dock 也不进侧栏，+ 菜单与选择页都不出（装的插件别全列出来，六个够了）
-  const RP_EXT_PANELS = new Set(['trace', 'board', 'usage']);
+  // 2026-11-22：安卓模拟器进 dock 白名单——它和另外三个一样是宿主内置渲染
+  // （画面走桥），只是面板本体做成了插件页
+  const RP_EXT_PANELS = new Set(['trace', 'board', 'usage', 'android']);
   function rpDefaultTabs() {
     return [];
   }
@@ -1831,10 +1927,13 @@
   // 旧会话历史由检查点回溯而来：可能不全，列表上方给一句说明
   let rpBackfilled = false;
   // —— git 面板（审查+提交合成一个标签）——
-  // 范围选择器：task=本任务改动（影子仓库检查点）、
-  // work=未提交改动（工作区真仓库相对 HEAD）——同时是提交的暂存区（勾选即入选）
+  // 两张汇总卡切换文件树：
+  // task=本任务改动（影子仓库相对任务起点检查点）
+  // cum=累计改动（真仓库相对上游分叉点/HEAD，含已提交+工作区+未跟踪）
   let rvSource = 'task';
   let rvBaseline = ''; // source='task' 时的基线；点「审查」进面板会带上它自己的
+  let rvOverview = null; // /api/git/overview：摘要/状态计数/两张卡/归属集合/时间线
+  let rvCumBase = ''; // 累计卡基线（merge-base 或 HEAD，后端算）
   let rvFiles = [];
   let rvLoading = false;
   let rvError = '';
@@ -1867,35 +1966,41 @@
     }
     rightPanelOpen = true;
     terminalOpen = false;
-    const needReload = rvSource === 'task' && baseline && baseline !== rvBaseline;
+    // 产物审查入口：不管当前停在哪张卡，都切回本任务卡并按显式基线重拉
+    const needReload = baseline && (rvSource !== 'task' || baseline !== rvBaseline);
     if (needReload) {
       // 带来的基线与面板当前用的不是同一个 → 换基线重拉，别拿旧的冒充
+      rvSource = 'task';
       rvBaseline = baseline;
       rvFiles = [];
       rvOpen = { [path]: true };
-      loadReview();
+      loadReview(true); // 显式带来的基线（产物审查入口）不许被重解析顶掉
+      loadGitOverview(rvBaseline); // 总览的任务卡也要跟上这条显式基线
     } else {
       rvOpen = { ...rvOpen, [path]: true };
       const f = rvFiles.find((x) => x.path === path);
       if (f) loadRvDiff(f);
     }
-    activateRpTab('git');
+    activateRpTab('git', false);
   }
-  // git 面板文件清单（source 切换：本任务改动 / 未提交改动；未提交档即提交暂存区）
-  async function loadReview() {
+  // git 面板文件清单（两张卡：task=本任务改动 / cum=累计改动）：
+  // 卡片切换时重拉；cum 档的基线由 /api/git/overview 算好（上游分叉点/HEAD）。
+  // keepBaseline=true：调用方刚显式写了 rvBaseline（产物审查入口），本次不许重解析顶掉
+  async function loadReview(keepBaseline = false, presolvedBase = '') {
     rvLoading = true;
     rvError = '';
     rvWarn = '';
-    if (rvSource === 'work') {
+    if (rvSource === 'cum') {
+      // 累计档：已跟踪文件对上游分叉点；未提交文件对各自首见快照（后端逐行带 base）
       try {
-        const r = await fetch('/api/changes?origin=workspace').then((x) => x.json());
+        const r = await fetch('/api/changes?origin=cumulative').then((x) => x.json());
         if (r.error) {
           rvFiles = [];
           rvError = r.error;
         } else {
           rvFiles = r.files || [];
           rvWarn = r.warning || '';
-          initCommitSel(rvFiles); // 清单换了，勾选态跟着重建（新文件默认按未跟踪不勾）
+          initCommitSel(rvFiles, rvOverview); // 清单换了，勾选态跟着重建（未提交文件默认勾）
         }
       } catch (e) {
         rvFiles = [];
@@ -1905,10 +2010,12 @@
       rvLoadOpenDiffs();
       return;
     }
-    // 本任务改动：没有基线先按 resolveBaseline 兜底一套（与产物同源）
-    if (!rvBaseline) {
-      const { id } = await resolveBaseline();
-      rvBaseline = id || '';
+    // 本任务改动的基线每次加载都重解析（任务起点每轮都拍，基线跟着走）：
+    // 一次解析后钉死会让面板停在上一个任务——新任务跑完还在 diff 旧基线，
+    // 整项目变 +N（2026-11-23 实锤）。keepBaseline=true = 调用方刚显式写了基线，跳过。
+    if (!keepBaseline) {
+      const id = presolvedBase || (await resolveBaseline()).id;
+      if (id) rvBaseline = id;
     }
     if (!rvBaseline) {
       rvFiles = [];
@@ -1916,7 +2023,9 @@
       return;
     }
     try {
-      const r = await fetch(`/api/changes?baseline=${encodeURIComponent(rvBaseline)}`).then((x) => x.json());
+      const sidQ = currentSessionId ? `&session=${encodeURIComponent(currentSessionId)}` : '';
+      // pending=1：只留仍未提交的改动——提交后从「本任务改动」消失（历史归累计档）
+      const r = await fetch(`/api/changes?baseline=${encodeURIComponent(rvBaseline)}${sidQ}&pending=1`).then((x) => x.json());
       if (r.error) {
         rvFiles = [];
         rvError = r.error;
@@ -1925,6 +2034,7 @@
         // 基线过期气泡已撤（「点了没用/一直留着」）：
         // 删除类条目对「这个任务改了什么」没意义，静默过滤，不再打扰用户确认。
         rvFiles = rvFiles.filter((f) => f.status !== 'D');
+        initCommitSel(rvFiles, rvOverview);
         rvWarn = '';
         rvStale = false;
       }
@@ -1934,6 +2044,50 @@
     }
     rvLoading = false;
     rvLoadOpenDiffs();
+  }
+  // git 面板总览：摘要/状态计数/两张卡/归属集合/时间线。任务起点由调用方解析好传入，
+  // 与文件清单共用同一个基线，避免两处各查一次 /api/checkpoints。
+  async function loadGitOverview(taskBase = '') {
+    try {
+      const q = taskBase ? `?baseline=${encodeURIComponent(taskBase)}` : '';
+      const r = await fetch(`/api/git/overview${q}`).then((x) => x.json());
+      if (r.error) {
+        rvOverview = null;
+        return;
+      }
+      rvOverview = r;
+      rvCumBase = r.cumulative?.base || '';
+    } catch (e) {
+      rvOverview = null;
+    }
+  }
+  // 任务跑动中让 git 面板跟上：工具结果/检查点到达时重拉总览+当前清单。
+  // 只开着 git 标签时做，3000ms 节流（大工作区一次要跑若干 git 命令），尾随补一拍。
+  let gitPaneTimer = 0;
+  let gitPaneLastAt = 0;
+  function refreshGitPane(immediate = false) {
+    if (!rightPanelOpen || rpTab !== 'git') return;
+    const run = async () => {
+      gitPaneLastAt = Date.now();
+      const { id } = await resolveBaseline();
+      if (id) rvBaseline = id;
+      await loadGitOverview(id);
+      await loadReview(false, id);
+      refreshGit();
+    };
+    const wait = 3000 - (Date.now() - gitPaneLastAt);
+    if (immediate || wait <= 0) {
+      if (gitPaneTimer) {
+        clearTimeout(gitPaneTimer);
+        gitPaneTimer = 0;
+      }
+      run();
+    } else if (!gitPaneTimer) {
+      gitPaneTimer = setTimeout(() => {
+        gitPaneTimer = 0;
+        run();
+      }, wait);
+    }
   }
   // 已被标记展开、但 diff 还没拉过的行补拉（变更条「审查」先置展开态、清单后到的情形）
   function rvLoadOpenDiffs() {
@@ -1952,8 +2106,10 @@
     if (hit.loading || (hit.text !== undefined && !hit.error)) return;
     rvDiff = { ...rvDiff, [f.path]: { loading: true } };
     const url =
-      rvSource === 'work'
-        ? `/api/review/diff?origin=workspace&path=${encodeURIComponent(f.path)}`
+      rvSource === 'cum'
+        ? f.base
+          ? `/api/review/diff?baseline=${encodeURIComponent(f.base)}&path=${encodeURIComponent(f.path)}`
+          : `/api/review/diff?origin=workspace&baseline=${encodeURIComponent(rvCumBase || 'HEAD')}&path=${encodeURIComponent(f.path)}`
         : `/api/review/diff?baseline=${encodeURIComponent(rvBaseline)}&path=${encodeURIComponent(f.path)}`;
     try {
       const r = await fetch(url).then((x) => x.json());
@@ -2071,15 +2227,28 @@
   //      占位区并把矩形报给后端（壳里的 webview 摆到这块）；浏览器直开 5173 时
   //      仍是 screencast 帧流，两条路径由后端 state.mode + 是否在 Tauri 里共同决定。
   let webTabs = []; // { id, agent, title, url, loading, suspended, visible }
+  // 服务端标签清单按 target id 唯一；建页竞态（2026-11-20 并发 agent 建页，日志里
+  // 两条 browser.tab.new 同毫秒、同 id）会漏出重复 id。标签条按 id 做 keyed each，
+  // 重复 key 抛 each_key_duplicate 会中断整轮 Svelte 更新——右栏面板不渲染、窗口
+  // 按钮跟着错位。入前端时先按 id 去重，保序留第一条。
+  function uniqWebTabs(list) {
+    const seen = new Set();
+    return (Array.isArray(list) ? list : []).filter((t) => {
+      if (!t || !t.id || seen.has(t.id)) return false;
+      seen.add(t.id);
+      return true;
+    });
+  }
   // —— 思考/工具：过程块的展开态（2026-10-30 排布重做）——
   // —— 任务清单 dock（贴输入框上方、展开向上、与提问上下堆叠）——
   // 清单语义=当前会话最后一次 todo 调用（整表替换）。
-  // 手动态规则（2026-11-13 重写，两问同修）：
-  // - **自动展开只认「本轮里真的来了新的清单调用」**：发消息本身不展开旧清单
-  //  （旧规则 streaming && 有未完项 → 消息一发出上轮清单就弹开）；
-  // - **叉掉/手动收起跨消息、跨轮保留**：只有**条目内容变了且跨了轮**的新清单
-  //   （新一轮里模型真写了新任务）或切会话才重置——旧规则「新一轮开始就重置叉掉」
-  //   让下一条消息把叉掉的清单又召回来（真机 2026-11-13）；条目只更新状态不算新清单。
+  // 手动态规则（2026-11-13 立规则；2026-11-22 补持久化并定案）：
+  // - **叉掉按清单指纹生效**：同一条清单（条目内容同）跨刷新/重启/切会话永不再出现
+  //   （细行/面板都算出现）——叉掉态存 localStorage，之前只存内存，一刷新就复活
+  //   （2026-11-22 用户两次实锤）；
+  // - **模型写了条目不同的新清单 = 新任务，正常出现**（流式期间到来的自动展开，
+  //   2026-11-13 口径）——用户明确：限制新清单出现不合理；
+  // - 条目只更新状态不算新清单；发消息本身不展开旧清单。
   let todoDockPinned = null; // null=跟随自动规则；true/false=用户手动展开/收起
   let todoDockDismissed = false; // 用户叉掉：新的清单调用出现前不再自动冒出
   let todoDockKey = null; // 上一次同步的会话 key（切会话重置手动态）
@@ -2088,6 +2257,27 @@
   let todoSeenStreaming = false; // 上一刻的流式态（轮计数用）
   let todoTurnNo = 0; // 流式轮计数（false→true 加一）
   let todoAutoOpen = false; // 本轮出现过新清单调用（唯一的自动展开资格）
+  // 手动态持久化（2026-11-22 用户实锤「叉掉之后刷新又显示出来」）：之前只存内存，
+  // 刷新即丢、重建消息后叉掉态清零、dock 复活。按「会话 + 清单指纹」存 localStorage
+  // ——同一条清单的叉掉/手动收展跨刷新、跨切会话保留；指纹变了（新一轮真写了
+  // 新任务）才回到自动规则（2026-11-13 口径不变）。@new 未定会话不存。
+  const TODO_MANUAL_KEY = 'pawchTodoDockManual';
+  function todoManualLoad(sid) {
+    if (!sid) return null;
+    try {
+      return JSON.parse(localStorage.getItem(TODO_MANUAL_KEY) || '{}')[sid] || null;
+    } catch {
+      return null;
+    }
+  }
+  function todoManualSave(sid, ref, dismissed, pinned) {
+    if (!sid || ref == null) return;
+    try {
+      const all = JSON.parse(localStorage.getItem(TODO_MANUAL_KEY) || '{}');
+      all[sid] = { ref, dismissed: !!dismissed, pinned: pinned === null ? null : !!pinned };
+      localStorage.setItem(TODO_MANUAL_KEY, JSON.stringify(all));
+    } catch {}
+  }
   $: currentTodoCall = latestTodoCall(messages);
   // 显式空清单（模型清零）= 藏 dock；currentTodo null = 没有清单
   $: currentTodo = currentTodoCall && currentTodoCall.todos.length ? { todos: currentTodoCall.todos } : null;
@@ -2113,10 +2303,19 @@
   }
   function trackTodoCall(ref) {
     if (ref === todoSeenRef) return;
-    // 跨轮 = 会话里第一次出现清单，或它属于另一个流式轮 → 新任务，重置手动态
+    // 叉掉按**清单指纹**生效：同一条清单（条目内容同）跨刷新/重启永不再出现；
+    // 模型写了条目不同的新清单 = 新任务，按原自动规则出现（流式期间到来的自动展开）
+    // ——2026-11-22 用户定案：限制新清单出现不合理。
     if (todoSeenRef === null || todoSeenTurn !== todoTurnNo) {
-      todoDockDismissed = false;
-      todoDockPinned = null;
+      const saved = todoManualLoad(currentSessionId || null);
+      if (saved && saved.ref === ref) {
+        todoDockDismissed = !!saved.dismissed;
+        todoDockPinned = saved.pinned === undefined ? null : saved.pinned;
+      } else {
+        todoDockDismissed = false;
+        todoDockPinned = null;
+        todoManualSave(currentSessionId || null, ref, false, null);
+      }
     }
     todoSeenRef = ref;
     todoSeenTurn = todoTurnNo;
@@ -2124,9 +2323,11 @@
   }
   function toggleTodoDock() {
     todoDockPinned = !todoDockOpen;
+    todoManualSave(curKey() === '@new' ? null : curKey(), todoSeenRef, todoDockDismissed, todoDockPinned);
   }
   function dismissTodoDock() {
     todoDockDismissed = true;
+    todoManualSave(curKey() === '@new' ? null : curKey(), todoSeenRef, true, todoDockPinned);
   }
   let nowTick = Date.now(); // 实时计时滴答（流式期间每秒更新）
   let tickTimer = null;
@@ -2429,7 +2630,7 @@
   async function loadWebState(keepActive = true) {
     try {
       const s = await webApi('/api/browser/state', { cache: 'no-store' });
-      webTabs = s.tabs || [];
+      webTabs = uniqWebTabs(s.tabs);
       webMode = resolveWebMode(s);
       webDialog = s.dialog || null;
       // 就绪门：状态到手后 web-tabbar 行才定型（有标签 = 多一行，无标签 = 整行消失），
@@ -2517,7 +2718,7 @@
         // 标签清单随时同步：agent 开新页/导航之后，页签条上的标题和地址必须跟着变。
         // 以前只有 loadWebState 才刷这份清单——agent 操作完面板里留着旧标题，用户看到的
         // 就是「一个 DeepSeek 标签显示着 Google」这种灵异现象
-        const tabs = s.tabs || [];
+        const tabs = uniqWebTabs(s.tabs);
         const stale =
           tabs.length !== webTabs.length ||
           tabs.some((t, i) => {
@@ -2914,9 +3115,17 @@
   }
 
   // 当前任务基线 = 消息流里最近一次 checkpoint
+  // 检查点 id 的两种形态都要认：实时流的 cp 消息是对象 {id,...}，落盘再读回来的
+  // 用户消息 cp 是字符串（核心 json!(cp_id)）。只认对象的话，刷新会话后「本任务
+  // 改动」拿不到基线 → 面板假空（2026-11-21 实锤）。
+  function cpIdOf(v) {
+    if (typeof v === 'string') return v;
+    return v && typeof v === 'object' && typeof v.id === 'string' ? v.id : '';
+  }
   function currentBaseline() {
     for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].cp && messages[i].cp.id) return messages[i].cp.id;
+      const id = cpIdOf(messages[i].cp);
+      if (id) return id;
     }
     return '';
   }
@@ -2946,8 +3155,10 @@
         if (mineAll.length) return { id: mineAll[mineAll.length - 1].id, note: '' };
         return { id: '', note: currentSessionId ? '该会话运行时还没有检查点（产物归因需要任务起点快照）' : '新对话还没有任务记录' };
       }
-      const mine = (r.mine || [])[0];
-      if (mine) return { id: mine.id, note: '' };
+      // 任务档基线取「最新一条任务起点」：中途危险工具快照（shell/edit…）会挤在
+      // mine 前面，拿它当基线会把整轮改动切碎（任务跑动中尤其明显）。
+      const task = r.task || (r.mine || [])[0];
+      if (task) return { id: task.id, note: '' };
       return { id: '', note: currentSessionId ? '该会话运行时还没有检查点（产物归因需要任务起点快照）' : '新对话还没有任务记录' };
     } catch (e) {
       return { id: '', note: `读取检查点失败: ${e.message || e}` };
@@ -3003,6 +3214,8 @@
   // 还是上一个会话的 campusnet」：startNewSession 漏了这套，切换会话有、新建没有
   function resetScopedPanels() {
     rvBaseline = '';
+    rvOverview = null;
+    rvCumBase = '';
     rvFiles = [];
     rvOpen = {};
     rvDiff = {};
@@ -3020,7 +3233,7 @@
     rvStaleClosed = false;
     rpStaleErr = '';
     rvStaleErr = '';
-    if (rpTab === 'git') loadReview();
+    if (rpTab === 'git') refreshGitPane(true);
     else if (rpTab === 'artifacts') loadArtifacts();
   }
 
@@ -3051,7 +3264,7 @@
       // 无变更重拍：服务端会带人话（直接以最近检查点为起点），空清单时有处可说
       rpArtifactsNote = r.note || '';
       loadArtifacts();
-      if (rpTab === 'git') loadReview();
+      if (rpTab === 'git') refreshGitPane(true);
     } catch (e) {
       rpStaleErr = `重拍失败: ${e.message || e}`;
       rvStaleErr = rpStaleErr;
@@ -3059,15 +3272,15 @@
   }
 
   // —— 右侧标签页：增 / 关 / 激活 / 文件预览标签 ——
-  function activateRpTab(key) {
+  function activateRpTab(key, reload = true) {
     rpTab = key;
     rpAddOpen = false;
     const t = rpTabs.find((x) => x.key === key);
     if (!t) return;
     if (t.kind === 'artifacts') loadArtifacts();
-    if (t.kind === 'git') {
-      loadReview();
-      refreshGit(); // 状态行（分支/HEAD/脏数）要跟清单一起新
+    if (t.kind === 'git' && reload) {
+      // 总览 + 清单 + 状态行一起新；显式基线审查入口传 reload=false（刚自己拉过）
+      refreshGitPane(true);
     }
     if (t.kind === 'web') loadWebState();
     if (t.kind === 'file') loadPreview(t.path);
@@ -3276,11 +3489,18 @@
   let commitSel = {}; // path → 是否勾选（暂存）
   let commitBusy = false;
   let commitErr = '';
-  // 清单重拉后按 path 沿用旧勾选；新出现的文件按上面的默认规则补
-  function initCommitSel(files) {
+  // 清单重拉后按 path 沿用旧勾选；只有「未提交」文件参与本次 commit——
+  // 累计档里已提交的文件不出现勾选框。已跟踪的未提交文件默认勾；**真仓库里未跟踪的
+  // 文件默认不勾**（防日志/构建产物误入 commit）——任务档的 '?' 不能当判据，那边
+  // 只代表「不在影子基线里」，文件可能其实早就在真仓库跟踪着。
+  function initCommitSel(files, ov = null) {
+    const dirty = new Set((ov && ov.dirty) || []);
+    const untracked = new Set((ov && ov.untracked_paths) || []);
     const next = {};
     for (const f of files || []) {
-      next[f.path] = f.path in commitSel ? commitSel[f.path] : !f.status.includes('?');
+      const eligible = ov ? dirty.has(f.path) : true;
+      const dflt = eligible && !untracked.has(f.path);
+      next[f.path] = f.path in commitSel ? commitSel[f.path] && eligible : dflt;
     }
     commitSel = next;
   }
@@ -3290,7 +3510,7 @@
   }
   // Svelte4 坑：模板里调函数不建立函数体内变量的依赖——计数必须用 $: 派生，
   // 直接调 commitSelCount() 的话勾选变了按钮文字不重算（真机实测）
-  $: commitSelN = rvSource === 'work' ? rvFiles.filter((f) => commitSel[f.path]).length : 0;
+  $: commitSelN = rvFiles.filter((f) => commitSel[f.path]).length;
   async function doCommit() {
     if (commitBusy) return;
     const msg = commitMsg.trim();
@@ -3320,9 +3540,8 @@
       commitBusy = false;
       commitMsg = '';
       commitErr = '';
-      await refreshGit();
-      refreshDock();
-      if (rpTabs.some((t) => t.kind === 'git')) loadReview(); // 提完清单重拉：勾选态按新清单重建
+      // 提完重拉总览+清单：已提交数、归属标签、两张卡的数字都跟着变
+      refreshGitPane(true);
     } catch (e) {
       commitBusy = false;
       commitErr = `提交失败: ${e.message || e}`;
@@ -3331,8 +3550,9 @@
   async function refreshDock() {
     refreshGit(); // git 面板状态行（分支/脏数）一并刷新
     for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].cp && messages[i].cp.id) {
-        dockCp = messages[i].cp;
+      const id = cpIdOf(messages[i].cp);
+      if (id) {
+        dockCp = { id };
         return;
       }
     }
@@ -3344,7 +3564,8 @@
       return;
     }
     try {
-      const c = await fetch(`/api/changes?baseline=${encodeURIComponent(baseline)}`).then((x) => x.json());
+      const sidQ = currentSessionId ? `&session=${encodeURIComponent(currentSessionId)}` : '';
+      const c = await fetch(`/api/changes?baseline=${encodeURIComponent(baseline)}${sidQ}`).then((x) => x.json());
       dockCp = { id: baseline, files: (c.files || []).length, additions: null, deletions: null };
     } catch (e) {
       dockCp = null;
@@ -4658,9 +4879,15 @@
       const decoder = new TextDecoder();
       let buf = '';
       let attachStale = false;
+      // 流式卡顿哨兵（2026-11-23）：按 read() 批次计时，事件处理（含同步 flush）
+      // 超过 300ms 就上报——「任务跑着的时候点什么都点不动」必须落到日志里才有得查
+      let evBatchT0 = performance.now();
+      let evBatchN = 0;
       attachOuter: for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
+        evBatchT0 = performance.now();
+        evBatchN = 0;
         buf += decoder.decode(value, { stream: true });
         let idx;
         while ((idx = buf.indexOf('\n\n')) !== -1) {
@@ -4670,6 +4897,7 @@
             if (!line.startsWith('data: ')) continue;
             try {
               const d = JSON.parse(line.slice(6));
+              evBatchN++;
               // 重附着时 seq 不该倒退：倒退=同一会话已经开始了新一轮（旧页的尾号
               // 比新轮大）——别再往旧气泡上贴，退出走文件重载
               if (resume && d.seq && d.seq <= (resume.after || 0)) {
@@ -4849,7 +5077,7 @@
                     parts: settleToolArgs(m.parts, hit, d.tool_call_args.name, d.tool_call_args.args),
                   };
                 });
-              else if (d.tool_result)
+              else if (d.tool_result) {
                 patch((m) => {
                   const tools = [...(m.tools || [])];
                   for (let i = tools.length - 1; i >= 0; i--) {
@@ -4866,6 +5094,11 @@
                   }
                   return { ...m, tools, parts };
                 });
+                // 工具跑完文件可能变了：git 面板开着就跟着重拉（3s 节流，
+                // 大工作区一次要跑若干 git 命令）。2026-11-23 用户实锤：
+                // 另外两档此前只在开面板/切档时拉一次，任务全程不动。
+                refreshGitPane();
+              }
               else if (d.approval_request)
                 patch((m) => {
                   const appr = {
@@ -4898,8 +5131,8 @@
               else if (d.checkpoint) {
                 pushMsg(skey, { id: nextId(), role: 'cp', cp: d.checkpoint });
                 refreshDock(); // git 面板数据（基线/分支/脏数）更新
-                // git 面板正开着（且看的是本任务档）：新检查点到了就地重拉，跑完就能看见
-                if (rpTabs.some((t) => t.kind === 'git') && rvSource === 'task') loadReview();
+                // 任务收尾检查点到了：不管停在哪张卡，面板都重拉（总览+清单）
+                refreshGitPane(true);
                 // 产物账本在任务收尾才写入：产物标签开着就地重拉
                 if (rpTab === 'artifacts') loadArtifacts();
                 // 回滚锚点（2026-10-27）：任务起点基线记到触发的那条用户消息上，
@@ -4995,6 +5228,8 @@
                 settleCompactMarker(skey, d.compact_failed.id, d.compact_failed.text || '————压缩失败，下轮结束后重试————', 'failed');
               } else if (d.done) {
                 patch(endTurn);
+                // 收尾再拉一次：零改动的任务没有 checkpoint 事件，面板状态也要落定
+                refreshGitPane(true);
                 // done = 回答完成态。**流登记只摘自己的**（controller 是本请求的才摘）：
                 // 引导回执的 done 曾把在跑那轮的登记误摘——停止按钮闪没（完成态），
                 // 3 秒后「运行中」轮询又翻回未完成态（真机 2026-11-08）。压缩等收尾
@@ -5024,6 +5259,12 @@
               // 忽略坏行
             }
           }
+          // 单批 SSE 事件（含 Svelte 同步 flush）的处理耗时：>300ms = 这一批把主线程
+          // 占住了——流式长任务里「点了没反应/收不回」类卡顿的直查证据（2026-11-23 哨兵）
+          const batchMs = performance.now() - evBatchT0;
+          if (batchMs > 300 && evBatchN > 0) warnSlowStream(batchMs, evBatchN);
+          evBatchT0 = performance.now();
+          evBatchN = 0;
         }
       }
       if (attachStale) resume.stale = true;
@@ -5549,24 +5790,8 @@
     }
   }
 
-  // 生成上下文摘录：按对话顺序拼 markdown，进剪贴板——用户去别的对话粘贴即可当参考
-  async function copySelectedAsContext() {
-    const key = curKey();
-    const arr = sessionMsgs[key] || [];
-    const picked = arr.filter((m) => msgSelected.includes(m.id) && (m.role === 'user' || m.role === 'assistant'));
-    if (!picked.length) return;
-    const lines = [`【上下文摘录】来自对话「${currentTitle || '未命名'}」（${new Date().toLocaleString()}）`, ''];
-    for (const m of picked) {
-      lines.push(m.role === 'user' ? `【用户】${m.content}` : `【助手】${m.content}`);
-    }
-    try {
-      await putClipboard(lines.join('\n\n'));
-      ctxCopied = true;
-      setTimeout(() => (ctxCopied = false), 2000);
-    } catch (e) {
-      pushMsg(key, { id: nextId(), role: 'error', content: `[复制失败] ${e.message || e}` });
-    }
-  }
+  // 生成上下文摘录的复制按钮已撤（2026-11-23）：复制改在单条消息的操作条上，
+  // 多选只留批量删除。
 
   // 服务端接管排队消息后的对账（2026-09-27）：本页的 SSE 流已死，服务端跑这条消息时
   // 发的 d.turn / 回答流进的是那条死连接——轮询到服务端空闲后从会话文件重载，
@@ -6927,6 +7152,9 @@
   // 2026-10-06 插件重整：5 个纯技能插件（Word/PDF/演示/表格/GitHub）降级成全局技能、
   // git-panel/sandbox-panel 移出插件位，它们的图标一并收掉；「中枢」（原自改）补图标
   const EXT_ICONS = {
+    // 安卓：Android 机器人头（半圆+双天线+双眼）；整体下移 2.7 让图形落在 24 画布正中
+    // （原画法底部留白 8 格，图标相对文字偏上——2026-11-22 用户实锤）
+    android: '<path d="M2.5 18.7a9.5 9.5 0 0 1 19 0z"/><path d="M7.2 9.1 5.4 5.3"/><path d="M16.8 9.1 18.6 5.3"/><circle cx="7.8" cy="14.3" r="1.4" fill="currentColor" stroke="none"/><circle cx="16.2" cy="14.3" r="1.4" fill="currentColor" stroke="none"/>',
     board: '<path d="M4.6 16.5a7.6 7.6 0 1 1 14.8 0"/><path d="M12 14.5 15.5 9.5"/><circle cx="12" cy="15" r="0.9" fill="currentColor" stroke="none"/>',
     trace: '<path d="M5 6.5h11.5M5 12h6.5M5 17.5h13.5"/><circle cx="19.6" cy="6.5" r="1.4"/><circle cx="14.4" cy="12" r="1.4"/><circle cx="21.4" cy="17.5" r="1.4"/>',
     usage: '<circle cx="12" cy="12" r="8.4"/><path d="M8.8 7.5 12 12l3.2-4.5"/><path d="M12 12v5.2"/><path d="M9.3 13.8h5.4"/>',
@@ -7110,6 +7338,15 @@
           rightPanelOpen = true;
           if (terminalOpen) terminalOpen = false;
         }
+      },
+    },
+    // agent 碰安卓（android 工具任何调用）→ 自动唤起「安卓模拟器」插件面板（agentTouched 同款）
+    android_touched: {
+      kind: 'android_touched', title: '（内部）agent 碰了安卓', risk: 'safe', internal: true,
+      args: 'ms: 触碰时刻（仅通知用）',
+      run() {
+        if (!RP_EXT_PANELS.has('android')) return;
+        rpOpenExtByName('android');
       },
     },
     close_tab: {
@@ -7720,6 +7957,37 @@
       kind: 'subagent.cancelled', title: '（内部）子代理取消', risk: 'safe', internal: true,
       args: 'dispatch/parent/child',
       run(m) { subagentUpsert(m, 'cancelled'); },
+    },
+
+    // —— 安卓模拟器插件面板（2026-11-22 改 dock）：帧快照轮询 + 动作直发 ——
+    // 只读（state/frame）不占权限；写动作（start/stop/touch/key）要 manifest 声明
+    // 的 android.control——其他插件 iframe 拿不到这把钥匙
+    'android.state': {
+      bridge: true, title: '读安卓模拟器状态',
+      async run({ reply, get }) {
+        reply(true, await get('/api/android/state'));
+      },
+    },
+    'android.frame': {
+      bridge: true, title: '读当前帧快照（带 seq：没变只回小 JSON 不带图；无帧全 null）',
+      async run({ reply, get, params }) {
+        const s = params && params.seq != null ? `?seq=${encodeURIComponent(params.seq)}` : '';
+        reply(true, await get('/api/android/frame' + s));
+      },
+    },
+    'android.action': {
+      bridge: true, perm: 'android.control', title: '安卓动作（ep=start/stop/touch/key + payload）',
+      async run({ reply, params }) {
+        const ep = String(params.ep || '');
+        if (!['start', 'stop', 'touch', 'key'].includes(ep)) return reply(false, '不支持的动作: ' + ep);
+        const r = await fetch('/api/android/' + ep, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(params.payload || {}),
+        });
+        const j = await r.json().catch(() => ({}));
+        (r.ok && !j.error) ? reply(true, j) : reply(false, j.error || ('HTTP ' + r.status));
+      },
     },
 
     // —— 操作电脑实时动作（2026-10-20 第 4 轮；server computer 模块 ui_push）——
@@ -8732,6 +9000,7 @@
         on:fork={(e) => forkMsg(e.detail)}
         on:delete={(e) => deleteMsg(e.detail)}
         on:enterselect={enterSelect}
+        on:quote={(e) => quoteAnswer(e.detail)}
         on:sendnow={(e) => sendNow(e.detail.id, e.detail.mode)}
         on:retrycompact={(e) => retryCompact(e.detail)}
         on:contentclick={(e) => onContentClick(e.detail)}
@@ -8753,8 +9022,6 @@
         <div class="select-bar">
           <span>已选 {msgSelected.length} 条</span>
           <button class="btn" disabled={!msgSelected.length} on:click={deleteSelected}>删除所选</button>
-          <button class="btn" disabled={!msgSelected.length} on:click={copySelectedAsContext} title="把选中的消息拼成上下文摘录复制到剪贴板，去别的对话粘贴即可">复制</button>
-          {#if ctxCopied}<span class="select-copied">已复制，去别的对话粘贴即可</span>{/if}
           <span class="select-flex"></span>
           <button class="btn ghost" on:click={exitSelect}>退出多选</button>
         </div>
@@ -9037,9 +9304,10 @@
           <div class="rp-open">
             <div class="rp-open-title">打开标签页</div>
             <div class="rp-open-sub">选择要在侧边面板中打开的标签。</div>
-            <div class="rp-open-grid">
+            <!-- 2026-11-22：卡片网格改列表状（单列行式，七个排得下也不显臃肿） -->
+            <div class="rp-open-list">
               {#each rpAddable as p (p.key)}
-                <button class="rp-open-card" on:click={() => addRpTab(p)}>
+                <button class="rp-open-row" on:click={() => addRpTab(p)}>
                   {#if p.kind === 'ext' && extIcon(p.name)}
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">{@html extIcon(p.name)}</svg>
                   {:else if p.kind === 'web'}
@@ -9078,8 +9346,11 @@
                   open={rvOpen}
                   diff={rvDiff}
                   baseline={rvBaseline}
+                  overview={rvOverview}
+                  cumBase={rvCumBase}
                   loading={rvLoading}
                   error={rvError}
+                  warn={rvWarn}
                   dockCp={dockCp}
                   gitInfo={gitInfo}
                   gitMissing={gitMissing}
@@ -9088,8 +9359,14 @@
                   commitSel={commitSel}
                   commitSelN={commitSelN}
                   commitErr={commitErr}
-                  on:rangechanged={() => { rvFiles = []; rvOpen = {}; rvDiff = {}; loadReview(); }}
-                  on:refresh={() => { loadReview(); refreshGit(); }}
+                  on:rangechanged={(e) => {
+                    if (e.detail) rvSource = e.detail;
+                    rvFiles = [];
+                    rvOpen = {};
+                    rvDiff = {};
+                    refreshGitPane(true);
+                  }}
+                  on:refresh={() => refreshGitPane(true)}
                   on:undo={() => undoCheckpoint(dockCp)}
                   on:commit={doCommit}
                   on:togglefile={(e) => toggleCommitFile(e.detail)}
@@ -9558,7 +9835,6 @@
       <div class="modal-head">
         <b>项目文件夹</b>
         <span class="hint">{foldersMsg}</span>
-        <button class="btn ghost" on:click={() => (foldersModal = false)}>关闭</button>
       </div>
       <div class="folders-body">
         <div class="folders-row">
@@ -9586,6 +9862,8 @@
       </div>
       <div class="folders-foot">
         <button class="btn" on:click={addWorkspaceFolder} disabled={foldersBusy}>{foldersBusy ? '选择中…' : '添加文件夹…'}</button>
+        <!-- 关闭挪到卡片右下角（2026-11-24 用户要求）：和左侧「添加文件夹…」分居两端 -->
+        <button class="btn ghost" on:click={() => (foldersModal = false)}>关闭</button>
       </div>
     </div>
   </div>
@@ -10031,7 +10309,8 @@
     background: var(--veil);
   }
   .rp-tabs button.active {
-    /* 页签激活：橙色高亮无底色（2026-11-12 选中口径统一；底色模式铺 --sel-bg） */
+    /* 页签激活（2026-11-12 选中口径统一）：背景高亮口径铺 --sel-bg；文字高亮口径
+       走下面的 :not([data-sel=bg]) 段（描边橙字无底色） */
     background: var(--sel-bg);
     color: var(--sel-fg);
     font-weight: 600;
@@ -10071,10 +10350,13 @@
   .rp-tab {
     display: inline-flex !important;
     align-items: center;
+    justify-content: center; /* 图标+文字整组居中（2026-11-22 用户：文字一直居中，别因 × 有无忽左忽右） */
     gap: 4px;
-    padding: 4px 6px 4px 10px !important;
+    padding: 4px 18px 4px 10px !important;
     width: 120px;
-    flex: none; /* 固定宽：不随标签个数/面板宽/字数变（「就一直不变」），120px 连激活态带 × 也放得下 4 个汉字不省略 */
+    height: 26px; /* 统一高度：中文/英文行高不同曾致 26.7/24.7 一大一小（真机实测） */
+    flex: none; /* 固定宽：不随标签个数/面板宽/字数变（「就一直不变」） */
+    position: relative; /* × 绝对定位贴右缘，不挤内容 */
   }
   .rp-tab .rp-tab-ico {
     width: 13px;
@@ -10082,13 +10364,18 @@
     flex: none;
   }
   .rp-tab .rp-tab-title {
-    flex: 1 1 auto; /* 吃掉余量，把激活标签的 × 顶到标签最右（用户：别靠在文字边上） */
+    flex: 0 1 auto; /* 不吃满余量：整组才居得中；超长仍省略 */
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
     min-width: 0;
+    line-height: 16px; /* 两类文字行高统一，高度才齐 */
   }
   .rp-tab .rp-tab-x {
+    position: absolute;
+    right: 2px;
+    top: 50%;
+    transform: translateY(-50%);
     color: var(--g4);
     font-size: 13px;
     line-height: 1;
@@ -10098,6 +10385,21 @@
   .rp-tab .rp-tab-x:hover {
     color: var(--g7);
     background: var(--g3);
+  }
+  /* 网页标签页式描边（2026-11-22）——**只作用于文字高亮口径**（:not([data-sel=bg])）：
+     背景高亮口径维持原样（激活铺 --sel-bg、悬浮铺 veil、无描边），两种口径各自成立。
+     特异压过 .rp-tabs button(:hover) 的底色——+/↻/窗口键不在 .rp-tabstrip 里不受影响 */
+  :root:not([data-sel=bg]) .rp-tabstrip .rp-tab {
+    border: 1px solid var(--g3);
+    background: transparent;
+  }
+  :root:not([data-sel=bg]) .rp-tabstrip .rp-tab:hover {
+    border-color: var(--g4);
+    background: transparent;
+  }
+  :root:not([data-sel=bg]) .rp-tabstrip .rp-tab.active {
+    border-color: var(--sel-line);
+    background: transparent;
   }
   .rp-add-wrap {
     position: relative;
@@ -10182,33 +10484,34 @@
     color: var(--g5);
     margin-bottom: 22px;
   }
-  .rp-open-grid {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 14px;
-  }
-  .rp-open-card {
+  /* 2026-11-22：卡片网格改列表状——单列行式（图标+名字一行一个），七个排得下 */
+  .rp-open-list {
     display: flex;
     flex-direction: column;
+    gap: 8px;
+  }
+  .rp-open-row {
+    display: flex;
     align-items: center;
-    justify-content: center;
-    gap: 14px;
-    padding: 30px 16px;
-    border-radius: 12px;
+    gap: 12px;
+    padding: 11px 14px;
+    border-radius: 10px;
     border: 1px solid var(--g3);
     background: var(--g1);
     color: var(--g6);
-    font-size: 14px;
+    font-size: 13.5px;
+    text-align: left;
     cursor: pointer;
   }
-  .rp-open-card:hover {
+  .rp-open-row:hover {
     background: var(--g2);
     color: var(--g7);
     border-color: var(--g4);
   }
-  .rp-open-card svg {
-    width: 24px;
-    height: 24px;
+  .rp-open-row svg {
+    width: 20px;
+    height: 20px;
+    flex: none;
   }
   .rp-refresh {
     background: transparent;
@@ -10974,9 +11277,6 @@
   .select-flex {
     flex: 1;
   }
-  .select-copied {
-    color: var(--tint-green-fg);
-  }
   .stats-modal {
     width: min(430px, 92vw);
   }
@@ -11325,6 +11625,22 @@
     color: var(--g8);
     text-decoration: underline;
     text-underline-offset: 2px;
+  }
+  /* 文件编辑行的增删统计（write_file/edit_file 结果前缀 [pawch-diff +A -D]） */
+  :global(.tool-diff) {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-family: Consolas, 'Cascadia Code', monospace;
+    font-size: 11.5px;
+    font-variant-numeric: tabular-nums;
+  }
+  :global(.tool-diff-add) {
+    color: var(--tint-green-fg);
+  }
+  :global(.tool-diff-del) {
+    color: var(--tint-red-fg);
   }
   :global(.tool-status) {
     display: grid;
@@ -11925,6 +12241,7 @@
     margin-top: 10px;
     display: flex;
     align-items: center;
+    justify-content: space-between; /* 添加文件夹在左、关闭在右下角（2026-11-24） */
     gap: 10px;
   }
   .folders-foot .hint {

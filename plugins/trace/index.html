@@ -167,7 +167,9 @@
         align-items: center;
         gap: 10px;
         width: 100%;
-        background: var(--hover);
+        /* 文字高亮口径：行只留外面那圈描边，不铺底（2026-11-24 用户圈出）；
+           背景高亮口径在下面用 html.sel-bg 保持原来的成片浅底 */
+        background: transparent;
         border: none;
         color: var(--strong);
         padding: 8px 12px;
@@ -176,6 +178,12 @@
         text-align: left;
       }
       .task-head:hover {
+        background: var(--hover);
+      }
+      html.sel-bg .task-head {
+        background: var(--hover);
+      }
+      html.sel-bg .task-head:hover {
         background: var(--sel);
       }
       .idx {
@@ -338,6 +346,8 @@
           // 主题跟随宿主（init 里带已解析的 theme；宿主切主题会重发 init）
           document.documentElement.classList.toggle('light', ((d.payload || {}).theme) === 'light'); // 画布跟主题（只认根元素）
           document.body.classList.toggle('light', ((d.payload || {}).theme) === 'light');
+          // 选中口径跟随宿主（hl=文字高亮 / bg=背景高亮）：任务行铺不铺底看它
+          document.documentElement.classList.toggle('sel-bg', ((d.payload || {}).selStyle) === 'bg');
           if (!booted) { booted = true; load(); }
           return;
         }

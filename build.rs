@@ -10,8 +10,33 @@
 fn main() {
     println!("cargo:rerun-if-changed=desktop/icons/icon.ico");
     println!("cargo:rerun-if-changed=build.rs");
+    compile_android_proto();
     #[cfg(windows)]
     embed_icon();
+}
+
+/// 安卓模拟器 gRPC 契约：proto vendor 在 `src/android/proto/`（Apache-2.0，
+/// 取自 Android Emulator 37.3.10）。protoc 用 protoc-bin-vendored 自带的二进制，
+/// 构建机不需要另装 protoc。
+fn compile_android_proto() {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    let proto_dir = std::path::PathBuf::from(manifest).join("src").join("android").join("proto");
+    let proto = proto_dir.join("emulator_controller.proto");
+    println!("cargo:rerun-if-changed={}", proto.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        proto_dir.join("google").join("protobuf").join("empty.proto").display()
+    );
+    if let Ok(protoc) = protoc_bin_vendored::protoc_bin_path() {
+        // SAFETY: build.rs 单线程执行，只在本进程内给 prost-build 指定 protoc 路径。
+        unsafe { std::env::set_var("PROTOC", protoc) };
+    }
+    // tonic 0.14 起 prost 代码生成拆到 tonic-prost-build（configure 也搬了过去）
+    tonic_prost_build::configure()
+        .build_server(false)
+        .build_client(true)
+        .compile_protos(&[&proto], &[&proto_dir])
+        .expect("编译 emulator_controller.proto 失败");
 }
 
 #[cfg(windows)]

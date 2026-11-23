@@ -183,7 +183,8 @@
         padding: 5px 9px;
         border-radius: 7px;
         border: 1px solid var(--line2);
-        background: var(--input-bg);
+        /* 过滤框不铺底：与宿主输入框同口径（透明+描边，2026-11-24 用户圈出） */
+        background: transparent;
         color: var(--fg);
         font-size: 12px;
       }
@@ -280,7 +281,8 @@
         position: fixed;
         z-index: 10;
         min-width: 160px;
-        background: var(--hover);
+        /* 和宿主浮层同款透明度（92% 玻璃）：右键菜单别比宿主菜单更实 */
+        background: color-mix(in srgb, var(--hover) 92%, transparent);
         border: 1px solid var(--line2);
         border-radius: 8px;
         padding: 4px;

@@ -289,6 +289,13 @@ pub(crate) struct BrowserSession {
     /// `wv-{tabs.len()+1}`——关掉一个再建就复用同名 label，而壳侧关闭是异步的
     /// （无 ack），短暂窗口里两个 webview 同名，close/visible/rect 作用对象歧义。
     shell_label_seq: AtomicU64,
+    /// 建页互斥（2026-11-20 真机）：`create_tab` 的「快照现有 target → 让壳建 webview
+    /// → 轮询新 target」是跨 await 的复合操作。两个 agent 工具调用并发进来时，两边
+    /// 都看不到新 target，就会**认领同一个**（日志里两条 browser.tab.new 同毫秒、
+    /// 同一 id），tabs 出现重复 id。前端标签条按 id 做 keyed each，重复 key 抛
+    /// each_key_duplicate 会中断整轮 Svelte 更新——右栏面板不渲染、窗口按钮跟着错位。
+    /// 所有建页（含 agent_tab 的「检查+建页」）串行过这把锁。
+    tab_create_lock: Mutex<()>,
 }
 
 impl BrowserSession {
@@ -365,8 +372,16 @@ impl BrowserSession {
                 suspended: t.suspended.load(Ordering::Relaxed),
             });
         }
-        out
+        dedupe_briefs(out)
     }
+}
+
+/// 按 target id 去重（保序，留第一条）。正常路径不该有重复——只有建页竞态会让
+/// 两条 WebTab 认领同一个 CDP target（2026-11-20 真机）。前端标签条按 id 做
+/// keyed each，重复 key 抛错会中断整轮渲染，出接口前先兜住。
+fn dedupe_briefs(briefs: Vec<TabBrief>) -> Vec<TabBrief> {
+    let mut seen = std::collections::HashSet::new();
+    briefs.into_iter().filter(|b| seen.insert(b.id.clone())).collect()
 }
 
 fn now_ms() -> u64 {
@@ -401,6 +416,25 @@ fn log(kind: &str, extra: Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 重复 target id 不能漏到前端（2026-11-20 真机：并发建页同 id → keyed each 抛错）。
+    #[test]
+    fn dedupe_briefs_keeps_first_per_target_id() {
+        let mk = |id: &str, title: &str| TabBrief {
+            id: id.into(),
+            agent: true,
+            title: title.into(),
+            url: String::new(),
+            visible: false,
+            loading: false,
+            suspended: false,
+        };
+        let out = dedupe_briefs(vec![mk("A", "first"), mk("B", "b"), mk("A", "second")]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].id, "A");
+        assert_eq!(out[0].title, "first", "保序留第一条");
+        assert_eq!(out[1].id, "B");
+    }
 
     /// 后端类错误人话化：超时要让模型能自然地说「访问超时」，技术细节留尾部诊断。
     #[test]

@@ -32,6 +32,8 @@ import {
   fileUserIndexOf,
   outboxNotYetSent,
   splitConvBlocks,
+  finalAnswerText,
+  quoteSnippet,
 } from '../src/lib/chat.js';
 
 test('splitConvBlocks：文件里的引用对话块还原成 chip，正文只留用户原话', () => {
@@ -55,6 +57,41 @@ test('splitConvBlocks：文件里的引用对话块还原成 chip，正文只留
   // 没有块：原样返回，不动用户自己打的字
   assert.deepEqual(splitConvBlocks('普通一句'), { text: '普通一句', convs: [] });
   assert.deepEqual(splitConvBlocks(''), { text: '', convs: [] });
+});
+
+test('splitConvBlocks：引用回答块还原成 quote chip，可与引用对话混排', () => {
+  const s =
+    '解释一下这段\n\n【引用对话：甲】\nA\n【引用对话结束】\n\n【引用回答】\n## 结论\n先改配置再重启\n【引用回答结束】';
+  const r = splitConvBlocks(s);
+  assert.equal(r.text, '解释一下这段');
+  assert.equal(r.convs.length, 2);
+  assert.equal(r.convs[1].kind, 'quote');
+  assert.equal(r.convs[1].text, '## 结论\n先改配置再重启');
+  assert.equal(r.convs[1].title, '结论'); // chip 标题取首行、去 markdown 标题符号
+  assert.ok(r.convs[1].id);
+});
+
+test('finalAnswerText：只取上屏的结语（最后一段正文），过程里的说明不算', () => {
+  const parts = [
+    { type: 'thinking', text: '想一下' },
+    { type: 'content', text: '我先看看文件' },
+    { type: 'tool', name: 'read_file', status: 'ok' },
+    { type: 'content', text: '改好了。' },
+  ];
+  assert.equal(finalAnswerText({ parts }), '改好了。');
+  // 尾部空正文不顶掉最后一段有内容的
+  assert.equal(finalAnswerText({ parts: [...parts, { type: 'content', text: '  ' }] }), '改好了。');
+  // 旧消息只有 content
+  assert.equal(finalAnswerText({ content: '旧会话回答' }), '旧会话回答');
+  assert.equal(finalAnswerText({ parts: [{ type: 'tool', name: 'shell', status: 'ok' }] }), '');
+});
+
+test('quoteSnippet：首行、去标题符号、超长截断', () => {
+  assert.equal(quoteSnippet('\n\n### 第一步：改配置\n后面还有'), '第一步：改配置');
+  assert.equal(quoteSnippet('改好了，真正原因是**折射半径**。'), '改好了，真正原因是折射半径。');
+  assert.equal(quoteSnippet('- `x.js` 改完了'), 'x.js 改完了');
+  assert.equal(quoteSnippet(''), '');
+  assert.equal(quoteSnippet('啊'.repeat(40)), '啊'.repeat(30) + '…');
 });
 
 test('审批记录挂在最后一个同名工具段上，决定回填按 id 命中', () => {

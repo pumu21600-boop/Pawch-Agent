@@ -158,6 +158,37 @@ pub(crate) const MAX_FILE_BYTES: usize = 512 * 1024;
 /// 日志/构建产物只会把进程撑爆；更大的文件走 read_page 分页或 shell/search 取片段。
 pub(crate) const READ_FILE_MAX_BYTES: u64 = 2 * 1024 * 1024;
 
+/// 行级增删统计：只裁公共前后缀，中间替换块按新增/删除行数计。
+/// 对 agent 的定点编辑足够准，也比逐行 LCS 便宜得多（512KB 文件不会卡）。
+fn line_change_stats(old: &str, new: &str) -> (usize, usize) {
+    let a: Vec<&str> = old.lines().collect();
+    let b: Vec<&str> = new.lines().collect();
+    let mut p = 0;
+    while p < a.len() && p < b.len() && a[p] == b[p] {
+        p += 1;
+    }
+    let mut s = 0;
+    while s < a.len().saturating_sub(p)
+        && s < b.len().saturating_sub(p)
+        && a[a.len() - 1 - s] == b[b.len() - 1 - s]
+    {
+        s += 1;
+    }
+    (b.len() - p - s, a.len() - p - s)
+}
+
+/// 工具结果前缀：`[pawch-diff +A -D] `。前端靠它画行尾 `+A -D`，
+/// 模型也看得懂（就是本次改动的增删行数）；拿不到旧内容时不加前缀。
+fn with_stats_prefix(old: Option<&str>, new: &str, msg: String) -> String {
+    match old {
+        Some(o) => {
+            let (adds, dels) = line_change_stats(o, new);
+            format!("[pawch-diff +{adds} -{dels}] {msg}")
+        }
+        None => msg,
+    }
+}
+
 pub(crate) fn write_file(ws: &Path, args: &str, unconfined: bool) -> Result<String, String> {
     let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
     let rel = v.get("path").and_then(Value::as_str).ok_or("缺少 path 参数")?;
@@ -166,9 +197,17 @@ pub(crate) fn write_file(ws: &Path, args: &str, unconfined: bool) -> Result<Stri
         return Err(format!("内容过大（{} 字节，上限 512KB）", content.len()));
     }
     let full = resolve_in_workspace(ws, rel, false, unconfined)?;
+    // 旧内容用于结果前缀的增删统计；文件过大/非文本/读不了就不给数字
+    let old = match std::fs::metadata(&full) {
+        Ok(m) if m.is_file() && m.len() <= MAX_FILE_BYTES as u64 => std::fs::read_to_string(&full).ok(),
+        Ok(m) if m.is_file() => None,
+        Ok(_) => None,                 // 目录：让原子写去报错
+        Err(_) => Some(String::new()), // 新文件
+    };
     // 原子写：写到一半失败不能留下半截文件（模型写代码文件时这是最常见的损坏来源）
     crate::fsx::write_atomic_str(&full, content).map_err(|e| format!("写文件失败: {e}"))?;
-    Ok(format!("已写入 {} 字节 → {}", content.len(), rel))
+    let msg = format!("已写入 {} 字节 → {}", content.len(), rel);
+    Ok(with_stats_prefix(old.as_deref(), content, msg))
 }
 
 /// 局部修改：文件里唯一出现的 old_string → new_string。
@@ -210,8 +249,9 @@ pub(crate) fn edit_file(ws: &Path, args: &str, unconfined: bool) -> Result<Strin
     }
     // 与其他落盘点同一原子写：替换一半失败不留半截文件
     crate::fsx::write_atomic_str(&full, &out).map_err(|e| format!("写文件失败: {e}"))?;
+    let (adds, dels) = line_change_stats(&text, &out);
     Ok(format!(
-        "已编辑 {rel}：{count} 处替换（首处在第 {line} 行，{} → {} 字节）",
+        "[pawch-diff +{adds} -{dels}] 已编辑 {rel}：{count} 处替换（首处在第 {line} 行，{} → {} 字节）",
         text.len(),
         out.len()
     ))
@@ -278,5 +318,35 @@ pub(crate) fn near_line_hint(text: &str, old: &str) -> String {
             format!("（old_string 首行「{head}」出现在第 {line} 行附近，多半是缩进/空行/相邻行对不上）")
         }
         None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{edit_file, line_change_stats, write_file};
+
+    #[test]
+    fn line_change_stats_counts_localized_edits() {
+        assert_eq!(line_change_stats("a\nb\nc\n", "a\nB\nc\n"), (1, 1), "中间改一行");
+        assert_eq!(line_change_stats("a\n", "a\nb\n"), (1, 0), "追加一行");
+        assert_eq!(line_change_stats("a\nb\n", "a\n"), (0, 1), "删掉一行");
+        assert_eq!(line_change_stats("", "x\ny\n"), (2, 0), "空文件起步");
+    }
+
+    #[test]
+    fn write_and_edit_results_carry_diff_prefix() {
+        let dir = std::env::temp_dir().join(format!("pawch-fs-stats-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = write_file(&dir, r#"{"path":"a.txt","content":"a\nb\n"}"#, false).unwrap();
+        assert!(out.starts_with("[pawch-diff +2 -0] "), "新建文件要带增删前缀: {out}");
+        let out2 = edit_file(
+            &dir,
+            r#"{"path":"a.txt","old_string":"a\nb\n","new_string":"a\nB\n"}"#,
+            false,
+        )
+        .unwrap();
+        assert!(out2.starts_with("[pawch-diff +1 -1] "), "替换一行要带真实增删: {out2}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

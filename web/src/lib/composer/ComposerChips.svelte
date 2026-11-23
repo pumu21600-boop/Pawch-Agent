@@ -46,9 +46,20 @@
         {#if pendingConvs.length > 0}
           <div class="composer-attachments">
             {#each pendingConvs as cv}
-              <div class="att-chip conv-chip" title={`引用对话：${cv.title}（发送时拼进消息正文${cv.omitted ? '，只保留最近部分' : ''}）`}>
-                <svg class="att-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 8.9 8.9 0 0 1-3.8-.8L3 21l1.9-4.6a8.4 8.4 0 1 1 16.1-4.9"/><path d="M8.5 10.5h7M8.5 14h4.5"/></svg>
-                <span class="att-name">{cv.title}</span>
+              <!-- kind='quote' = 引用某条回答（与引用对话同一套 chip/发送拼块） -->
+              <div
+                class="att-chip conv-chip"
+                title={cv.kind === 'quote'
+                  ? `引用回答：${cv.title}（发送时拼进消息正文）`
+                  : `引用对话：${cv.title}（发送时拼进消息正文${cv.omitted ? '，只保留最近部分' : ''}）`}
+              >
+                {#if cv.kind === 'quote'}
+                  <svg class="att-ico" viewBox="0 0 24 24" fill="currentColor"><path d="M6.5 5.5C4.6 5.5 3 7.1 3 9c0 1.9 1.6 3.5 3.5 3.5.3 0 .6 0 .9-.1-.6 1.9-2 3.3-3.9 3.9l.6 1.8c3.4-1.1 5.6-4 5.6-7.6V9c0-1.9-1.6-3.5-3.5-3.5Z"/><path d="M17.5 5.5C15.6 5.5 14 7.1 14 9s1.6 3.5 3.5 3.5c.3 0 .6 0 .9-.1-.6 1.9-2 3.3-3.9 3.9l.6 1.8c3.4-1.1 5.6-4 5.6-7.6V9c0-1.9-1.6-3.5-3.5-3.5Z"/></svg>
+                  <span class="att-name">回答 · {cv.title}</span>
+                {:else}
+                  <svg class="att-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 8.9 8.9 0 0 1-3.8-.8L3 21l1.9-4.6a8.4 8.4 0 1 1 16.1-4.9"/><path d="M8.5 10.5h7M8.5 14h4.5"/></svg>
+                  <span class="att-name">{cv.title}</span>
+                {/if}
                 <button class="att-del" on:click={() => dispatch('rmconv', cv.id)} title="移除" aria-label="移除"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
               </div>
             {/each}

@@ -20,7 +20,6 @@
     <div class="modal rename-modal" on:click|stopPropagation>
       <div class="modal-head">
         <b>{modal.kind === 'session' ? '重命名会话' : '重命名项目'}</b>
-        <button class="btn ghost" on:click={close}>关闭</button>
       </div>
       <div class="field">
         <input
@@ -65,7 +64,7 @@
   }
   .rename-actions {
     display: flex;
-    justify-content: flex-end;
+    justify-content: space-between; /* 取消在左、确定在右（2026-11-24 与项目文件夹弹窗对齐） */
     gap: 8px;
   }
 </style>

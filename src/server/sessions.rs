@@ -366,7 +366,7 @@ pub(super) async fn truncate_session(
         let cp = restore_cp.clone();
         let restored = tokio::task::spawn_blocking(move || crate::recovery::restore(&ws, &cp)).await;
         match restored {
-            Ok(Ok(())) => {}
+            Ok(Ok(_)) => {}
             Ok(Err(e)) => {
                 return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("文件恢复失败: {e}") })));
             }

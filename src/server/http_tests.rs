@@ -402,6 +402,7 @@ async fn truncate_expect_guard_refuses_wrong_target() {
 /// 产物/git 面板「基线过期 → 重新以当前状态为起点」走的就是这个端点（2026-10-31）。
 #[tokio::test]
 async fn manual_checkpoint_endpoint_contract() {
+    let _serial = WORKSPACE_SWAP_LOCK.lock().await;
     let root = test_root("manual-cp");
     let ws = root.join("ws");
     std::fs::create_dir_all(&ws).expect("建工作区");
@@ -452,6 +453,189 @@ async fn manual_checkpoint_endpoint_contract() {
         let (gs, gv) = get(&app(&root), "/api/checkpoints?session=s-manual").await;
         assert_eq!(gs, StatusCode::OK);
         assert_eq!(gv["first"]["id"], id_empty, "first 应为该会话最早的检查点（空起步基线）: {gv}");
+    }
+
+    crate::tools::set_workspace_root(&prev);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 「本任务改动」不再按 write_file/edit_file 过滤（2026-11-23 实锤：本机自动化任务
+/// 的主力写法是 shell——powershell 直改 SectionTimeDialog.java 后，改动条整轮隐身，
+/// 面板显示「本任务还没有改动」）。shell 新建/改动的未跟踪文件必须进清单：
+/// 时间窗收敛交给 changed_files 的「起点快照 + 基线时间」，不看工具名。
+/// 工作区根是进程级全局，与 manual_checkpoint 串行（并行测试互换工作区会撞出
+/// 「bad object」——查的是别人家影子仓库的检查点）。
+/// 用 tokio 的异步锁（不是 std::sync::Mutex）：这些测试整段持有守卫跨 await，
+/// std 锁会被 clippy::await_holding_lock 拦下（2026-11-24 质量门）。
+static WORKSPACE_SWAP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[tokio::test]
+async fn changes_task_scope_includes_shell_written_files() {
+    let _serial = WORKSPACE_SWAP_LOCK.lock().await;
+    let root = test_root("changes-shell");
+    let ws = root.join("ws");
+    std::fs::create_dir_all(&ws).expect("建工作区");
+    let prev = crate::tools::workspace_root();
+    crate::tools::set_workspace_root(&ws);
+
+    if let Ok(bin) = crate::tools::git_exe() {
+        let git = |args: &[&str]| {
+            std::process::Command::new(&bin)
+                .args(args)
+                .current_dir(&ws)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+        };
+        let _ = git(&["init", "--quiet"]);
+        std::fs::write(ws.join("tracked.txt"), "v1\n").expect("写文件");
+        let _ = git(&["add", "tracked.txt"]);
+        let _ = git(&["commit", "--quiet", "-m", "init"]);
+
+        // 手动重拍基线（任务起点同口径）：未跟踪内容入影子基线
+        let (_s, vcp) = post(&app(&root), "/api/checkpoints?session=s-shell").await;
+        assert_eq!(vcp["ok"], Value::Bool(true), "{vcp}");
+        let base = vcp["checkpoint"]["id"].as_str().unwrap_or("").to_string();
+        assert!(!base.is_empty(), "{vcp}");
+
+        // 「shell」新建一个文件（不经 write_file/edit_file 工具，会话消息里没有痕迹）
+        std::fs::write(ws.join("shell-made.txt"), "line1\nline2\n").expect("模拟 shell 写文件");
+
+        let (gs, gv) = get(&app(&root), &format!("/api/changes?baseline={base}&origin=shadow")).await;
+        assert_eq!(gs, StatusCode::OK, "{gv}");
+        let files = gv["files"].as_array().cloned().unwrap_or_default();
+        let hit = files
+            .iter()
+            .find(|f| f["path"] == "shell-made.txt")
+            .unwrap_or_else(|| panic!("shell 写的文件必须进本任务改动: {gv}"));
+        assert_eq!(hit["adds"], Value::from(2), "行数按当前文件补: {hit}");
+    }
+
+    crate::tools::set_workspace_root(&prev);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// git 面板总览路由（2026-11-23 内容改版）：状态计数、两张改动卡、时间线
+/// 都要从 HTTP 一次带回，基线与 /api/changes 的本任务档一致。
+#[tokio::test]
+async fn git_overview_reports_counts_and_summaries() {
+    let _serial = WORKSPACE_SWAP_LOCK.lock().await;
+    let root = test_root("git-overview");
+    let ws = root.join("ws");
+    std::fs::create_dir_all(&ws).expect("建工作区");
+    let prev = crate::tools::workspace_root();
+    crate::tools::set_workspace_root(&ws);
+
+    if let Ok(bin) = crate::tools::git_exe() {
+        let git = |args: &[&str]| {
+            std::process::Command::new(&bin)
+                .args(args)
+                .current_dir(&ws)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+        };
+        let _ = git(&["init", "--quiet"]);
+        std::fs::write(ws.join("tracked.txt"), "v1\n").expect("写文件");
+        let _ = git(&["add", "tracked.txt"]);
+        let _ = git(&["commit", "--quiet", "-m", "init"]);
+
+        let (_s, vcp) = post(&app(&root), "/api/checkpoints?session=s-overview").await;
+        let base = vcp["checkpoint"]["id"].as_str().unwrap_or("").to_string();
+        assert!(!base.is_empty(), "{vcp}");
+
+        std::fs::write(ws.join("tracked.txt"), "v1\nv2\n").expect("改文件");
+        std::fs::write(ws.join("new.txt"), "a\nb\n").expect("新建文件");
+
+        let (gs, gv) = get(&app(&root), &format!("/api/git/overview?baseline={base}")).await;
+        assert_eq!(gs, StatusCode::OK, "{gv}");
+        assert_eq!(gv["staged"], Value::from(0), "{gv}");
+        assert_eq!(gv["unstaged"], Value::from(1), "{gv}");
+        assert_eq!(gv["untracked"], Value::from(1), "{gv}");
+        assert!(
+            gv["untracked_paths"].as_array().map(|a| a.iter().any(|p| p == "new.txt")).unwrap_or(false),
+            "未跟踪文件要单独列出（提交默认不勾）: {gv}"
+        );
+        assert_eq!(gv["task"]["base"], Value::String(base.clone()), "{gv}");
+        assert_eq!(gv["task"]["files"], Value::from(2), "任务卡两个文件: {gv}");
+        assert_eq!(gv["task"]["adds"], Value::from(3), "1+2 行: {gv}");
+        assert_eq!(gv["cumulative"]["files"], Value::from(2), "累计卡两个文件: {gv}");
+
+        // 累计档：已跟踪文件照常 diff，首见之后创建的文件整文件新增
+        let (cs, cv) = get(&app(&root), "/api/changes?origin=cumulative").await;
+        assert_eq!(cs, StatusCode::OK, "{cv}");
+        let arr = cv["files"].as_array().cloned().unwrap_or_default();
+        assert!(
+            arr.iter().any(|f| f["path"] == "tracked.txt" && f["status"] == "M"),
+            "已跟踪文件要按真实 diff 列出: {cv}"
+        );
+        let nf = arr.iter().find(|f| f["path"] == "new.txt").expect("新建文件要列出");
+        assert_eq!(nf["status"], "?", "首见之后创建的文件整文件新增: {nf}");
+        assert!(nf["base"].is_null(), "没有首见快照时 base 为空: {nf}");
+
+        // 任务起点检查点：/api/checkpoints 要单列 task（中途快照不能冒充任务基线）
+        let task_cp = crate::recovery::checkpoint(&ws, "任务起点", "s-overview").expect("拍任务起点").expect("应有检查点");
+        let (cs, cv) = get(&app(&root), "/api/checkpoints?session=s-overview").await;
+        assert_eq!(cs, StatusCode::OK, "{cv}");
+        assert_eq!(cv["task"]["id"], Value::String(task_cp.id), "task 要指向任务起点: {cv}");
+    }
+
+    crate::tools::set_workspace_root(&prev);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 提交后「本任务改动」要消失：pending=1 只返回仍未提交的文件；
+/// 不带 pending 的原始任务 diff 仍在（累计档的历史底子）。
+#[tokio::test]
+async fn changes_pending_drops_committed_task_files() {
+    let _serial = WORKSPACE_SWAP_LOCK.lock().await;
+    let root = test_root("changes-pending");
+    let ws = root.join("ws");
+    std::fs::create_dir_all(&ws).expect("建工作区");
+    let prev = crate::tools::workspace_root();
+    crate::tools::set_workspace_root(&ws);
+
+    if let Ok(bin) = crate::tools::git_exe() {
+        let git = |args: &[&str]| {
+            std::process::Command::new(&bin)
+                .args(args)
+                .current_dir(&ws)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+        };
+        let _ = git(&["init", "--quiet"]);
+        std::fs::write(ws.join("root.txt"), "root\n").expect("写文件");
+        let _ = git(&["add", "root.txt"]);
+        let _ = git(&["commit", "--quiet", "-m", "init"]);
+
+        let (_s, vcp) = post(&app(&root), "/api/checkpoints?session=s-pending").await;
+        let base = vcp["checkpoint"]["id"].as_str().unwrap_or("").to_string();
+        assert!(!base.is_empty(), "{vcp}");
+
+        std::fs::create_dir_all(ws.join("src")).expect("建目录");
+        std::fs::write(ws.join("src/a.txt"), "a\nb\n").expect("任务内新建文件");
+        let _ = git(&["add", "src/a.txt"]);
+        let _ = git(&["commit", "--quiet", "-m", "feat"]); // 用户提交
+
+        let (s1, v1) = get(&app(&root), &format!("/api/changes?baseline={base}&pending=1")).await;
+        assert_eq!(s1, StatusCode::OK, "{v1}");
+        assert!(
+            v1["files"].as_array().map(|a| a.is_empty()).unwrap_or(false),
+            "提交后 pending 清单应为空: {v1}"
+        );
+        let (s2, v2) = get(&app(&root), &format!("/api/changes?baseline={base}")).await;
+        assert_eq!(s2, StatusCode::OK, "{v2}");
+        assert!(
+            v2["files"].as_array().map(|a| a.iter().any(|f| f["path"] == "src/a.txt")).unwrap_or(false),
+            "原始任务 diff 仍保留（供累计/历史口径）: {v2}"
+        );
     }
 
     crate::tools::set_workspace_root(&prev);

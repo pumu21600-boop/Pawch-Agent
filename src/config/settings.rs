@@ -198,6 +198,66 @@ impl FeatureSettings {
     }
 }
 
+/// 安卓模拟器（内置插件「安卓」）配置。SDK 路径显式配置是硬要求：GB 级工具链
+/// 不许落工作区（2026-11-21 实锤装一次 SDK 刷爆 git/产物面板）。空 = 按
+/// PAWCH_AGENT_ANDROID_SDK / ANDROID_SDK_ROOT / ANDROID_HOME / 常见路径找。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AndroidSettings {
+    /// Android SDK 根目录（含 platform-tools/adb.exe 与 emulator/emulator.exe）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sdk_path: Option<String>,
+    /// 默认 AVD 名；空 = 取列表最后一个（avdmanager 建的最新）或第一个可用
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avd: Option<String>,
+    /// gRPC 控制端口（EmulatorController；只连环回）。0 = 默认 8554
+    #[serde(default)]
+    pub grpc_port: u16,
+    /// 无窗口启动（画面走 gRPC 帧流，面板内嵌）。false = 有头窗口
+    #[serde(default = "default_android_no_window")]
+    pub no_window: bool,
+    /// 模拟器内存 MB（0 = 默认 2048）
+    #[serde(default)]
+    pub memory_mb: u32,
+    /// 模拟器 CPU 核数（0 = 默认 2）
+    #[serde(default)]
+    pub cores: u32,
+    /// GPU 渲染后端："host"（默认，真 GPU 卸载；2026-11-23 实测渲染负载 CPU 15s→3.8s/8s）
+    /// 或 "swiftshader_indirect"（软件渲染；显卡驱动异常时用它，视频/动画 CPU 会打满）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<String>,
+}
+
+impl Default for AndroidSettings {
+    fn default() -> Self {
+        Self { sdk_path: None, avd: None, grpc_port: 8554, no_window: true, memory_mb: 2048, cores: 2, gpu: None }
+    }
+}
+
+fn default_android_no_window() -> bool {
+    true
+}
+
+impl AndroidSettings {
+    /// 归一化：0 值回落默认（旧 settings.json 里 grpc_port/memory_mb/cores 缺省是 0）
+    pub fn port(&self) -> u16 {
+        if self.grpc_port == 0 { 8554 } else { self.grpc_port }
+    }
+    pub fn mem(&self) -> u32 {
+        if self.memory_mb == 0 { 2048 } else { self.memory_mb }
+    }
+    pub fn cpu(&self) -> u32 {
+        if self.cores == 0 { 2 } else { self.cores }
+    }
+    /// GPU 渲染后端（emulator -gpu 的值）。host = 真机 GPU 卸载；显卡驱动异常可切
+    /// swiftshader_indirect（纯软件渲染，视频/动画 CPU 直接打满——2026-11-23 实测）。
+    pub fn gpu_mode(&self) -> &'static str {
+        match self.gpu.as_deref().map(str::trim) {
+            Some("swiftshader_indirect") | Some("swiftshader") => "swiftshader_indirect",
+            _ => "host",
+        }
+    }
+}
+
 /// 成本台账设置（插件化后由「使用统计」插件的价格设置页维护）。
 /// 单价一律以**美元 / 1M tokens** 规范存储（台账与硬闸的口径）；界面按 `currency` 显示，
 /// 人民币值按 `usd_cny_rate` 折算——切币种只换展示，不动历史账。
@@ -507,6 +567,10 @@ pub struct Settings {
     #[serde(default)]
     pub features: FeatureSettings,
 
+    /// 安卓模拟器（内置插件「安卓」）：SDK 路径/AVD/启动参数
+    #[serde(default)]
+    pub android: AndroidSettings,
+
     /// 定时任务清单（cron 唤醒无头会话；设置→定时 页签维护）
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub schedules: Vec<crate::schedule::ScheduleTask>,
@@ -680,6 +744,10 @@ impl Settings {
         }
 
         let mut s = Self::default();
+        // 安卓模拟器默认关闭（2026-11-22 用户拍板）：模拟器/SDK 是 GB 级自备环境，
+        // 没装的机器打开面板只会看到引导空态——默认关，要用的在插件页打开。
+        // 只在**全新 settings.json** 时生效；老用户文件里没有这个键就尊重文件现状。
+        s.disabled_plugins.push(crate::android::ANDROID_PLUGIN.to_string());
         let model = if seed_model.is_empty() {
             "deepseek-chat".to_string()
         } else {

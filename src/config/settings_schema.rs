@@ -388,6 +388,61 @@ pub const SCHEMA: &[SchemaEntry] = &[
         risk: "normal",
         desc: "窗口百分比 40–85；达到阈值在本轮收尾后静默压缩",
     },
+    // —— android.* 点号子路径（安卓模拟器；SDK 路径必须工作区之外）——
+    SchemaEntry {
+        path: "android.sdk_path",
+        label: "Android SDK 路径",
+        ty: "string",
+        enum_values: &[],
+        default: None,
+        risk: "normal",
+        desc: "SDK 根目录绝对路径（含 platform-tools/adb.exe 与 emulator/）。空=按 PAWCH_AGENT_ANDROID_SDK / ANDROID_SDK_ROOT / ANDROID_HOME / 常见路径找。GB 级工具链不许落工作区",
+    },
+    SchemaEntry {
+        path: "android.avd",
+        label: "默认模拟器 (AVD)",
+        ty: "string",
+        enum_values: &[],
+        default: None,
+        risk: "normal",
+        desc: "AVD 名（android 工具 list_avds 可查）。空=用列表最后一个",
+    },
+    SchemaEntry {
+        path: "android.no_window",
+        label: "无窗口启动",
+        ty: "bool",
+        enum_values: &[],
+        default: Some("true"),
+        risk: "normal",
+        desc: "true=画面走 gRPC 帧流内嵌到右栏面板；false=模拟器弹独立窗口",
+    },
+    SchemaEntry {
+        path: "android.grpc_port",
+        label: "gRPC 控制端口",
+        ty: "integer",
+        enum_values: &[],
+        default: Some("8554"),
+        risk: "normal",
+        desc: "EmulatorController 端口（只连环回）。0=默认 8554；被占用时自动顺延",
+    },
+    SchemaEntry {
+        path: "android.memory_mb",
+        label: "模拟器内存 MB",
+        ty: "integer",
+        enum_values: &[],
+        default: Some("2048"),
+        risk: "normal",
+        desc: "模拟器进程内存上限；0=默认 2048",
+    },
+    SchemaEntry {
+        path: "android.cores",
+        label: "模拟器 CPU 核数",
+        ty: "integer",
+        enum_values: &[],
+        default: Some("2"),
+        risk: "normal",
+        desc: "模拟器进程 CPU 核数；0=默认 2",
+    },
 ];
 
 /// 某 path 在不在表内。
@@ -580,7 +635,58 @@ pub(crate) fn apply_entry_value(s: &mut Settings, path: &str, v: &Value) -> Resu
             apply_role_field(r, key, v)?;
             Ok(p.to_string())
         }
+        p if p.starts_with("android.") => {
+            let key = &p["android.".len()..];
+            apply_android_field(&mut s.android, key, v)?;
+            Ok(p.to_string())
+        }
         other => Err(format!("path「{other}」不在设置 schema 表内（{}）", legal_paths_hint())),
+    }
+}
+
+/// android.<字段> 的纯落值。字符串空串 = 清除回落（与 roles 同口径）。
+fn apply_android_field(
+    a: &mut crate::config::settings::AndroidSettings,
+    key: &str,
+    v: &Value,
+) -> Result<(), String> {
+    let put_str = |dst: &mut Option<String>| -> Result<(), String> {
+        let s = v
+            .as_str()
+            .ok_or_else(|| format!("android.{key} 需要字符串"))?
+            .trim()
+            .to_string();
+        *dst = if s.is_empty() { None } else { Some(s) };
+        Ok(())
+    };
+    let put_u32 = |cur: &mut u32, default: u32| -> Result<(), String> {
+        let n = v
+            .as_u64()
+            .ok_or_else(|| format!("android.{key} 需要整数"))?;
+        if n > u32::MAX as u64 {
+            return Err(format!("android.{key} 超出范围"));
+        }
+        *cur = if n == 0 { default } else { n as u32 };
+        Ok(())
+    };
+    match key {
+        "sdk_path" => put_str(&mut a.sdk_path),
+        "avd" => put_str(&mut a.avd),
+        "no_window" => {
+            a.no_window = v.as_bool().ok_or_else(|| "android.no_window 需要 true/false".to_string())?;
+            Ok(())
+        }
+        "grpc_port" => {
+            let n = v.as_u64().ok_or_else(|| "android.grpc_port 需要整数".to_string())?;
+            if n > u16::MAX as u64 {
+                return Err("android.grpc_port 超出 0–65535".into());
+            }
+            a.grpc_port = n as u16; // 0 = 回落默认 8554（读侧 port()）
+            Ok(())
+        }
+        "memory_mb" => put_u32(&mut a.memory_mb, 2048),
+        "cores" => put_u32(&mut a.cores, 2),
+        other => Err(format!("未知 android 字段 {other}")),
     }
 }
 

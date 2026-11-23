@@ -628,6 +628,8 @@ fn config_state_json(s: &Settings, global_budget: u64) -> Value {
         "auto_suffix": active.auto_suffix,
         "roles": s.roles,
         "features": s.features,
+        // 安卓模拟器（SDK 路径/AVD/端口）——安卓面板与 android 工具读这里
+        "android": s.android,
         // 压缩线回传给前端（漏了它 applyState 会把输入框弹回默认 85）
         "compact_percent": s.compact_percent,
     })

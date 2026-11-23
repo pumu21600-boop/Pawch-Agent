@@ -66,6 +66,7 @@ mod update; // 版本更新：检查 Release / 下载（镜像回退 + SHA256）
 mod usage;
 pub(crate) mod workspace; // settings 工具的 workspace 动作复用 canon_workspace/apply_workspace
 mod webpanel;
+mod android; // 2026-11-22：安卓模拟器面板（状态/启停/SSE 帧流/坐标回传）
 
 /// HTTP 层契约测试（2026-10-30）：bin-only crate，放 crate 内用 oneshot 打 router。
 #[cfg(test)]
@@ -232,6 +233,7 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/workspace/alias", post(alias_workspace))
         .route("/api/checkpoints", get(list_checkpoints).post(create_checkpoint))
         .route("/api/git/status", get(git_status))
+        .route("/api/git/overview", get(git_overview))
         .route("/api/git/info", get(git_runtime_info))
         .route("/api/git/commit", post(git_commit))
         .route("/api/checkpoints/restore", post(restore_checkpoint))
@@ -332,6 +334,18 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/browser/open-external", post(browser_open_external))
         .route("/api/browser/devtools", post(browser_devtools))
         .route("/api/browser/tab", delete(browser_close_tab))
+        // 安卓面板（2026-11-22）：与 agent android 工具共享同一台模拟器与帧源
+        .route("/api/android/state", get(crate::server::android::android_state))
+        .route("/api/android/start", post(crate::server::android::android_start))
+        .route("/api/android/stop", post(crate::server::android::android_stop))
+        .route("/api/android/frames", get(crate::server::android::android_frames))
+        .route("/api/android/frame", get(crate::server::android::android_frame))
+        .route("/api/android/screenshot", get(crate::server::android::android_screenshot))
+        .route("/api/android/touch", post(crate::server::android::android_touch))
+        .route("/api/android/key", post(crate::server::android::android_key))
+        .route("/api/android/text", post(crate::server::android::android_text))
+        .route("/api/android/install", post(crate::server::android::android_install))
+        .route("/api/android/launch", post(crate::server::android::android_launch))
         .route("/api/workspace/files", get(list_workspace_files))
         .route("/api/workspace/file", get(read_workspace_file))
         .route("/api/workspace/dir", get(list_workspace_dir))
@@ -362,6 +376,8 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
     app = app.layer(middleware::from_fn(guard_local_only));
     // 浏览器能力闸：与 guard_local_only 同层，挡在 handler 之前
     app = app.layer(middleware::from_fn(guard_browser_plugin));
+    // 安卓能力闸：同款（插件停用 = /api/android/* 一律 403）
+    app = app.layer(middleware::from_fn(guard_android_plugin));
     // 本地访问令牌（D1）：/api/* 与 /cancel 必须带 Bearer 或同源 cookie
     app = app.layer(middleware::from_fn(auth::guard));
     // HTML 文档响应下发令牌 cookie（在 auth 外层：静态页先拿到 cookie，页面内的 fetch 才带得上）
@@ -411,6 +427,19 @@ async fn guard_browser_plugin(req: Request, next: Next) -> Response {
         return (
             StatusCode::FORBIDDEN,
             Json(json!({ "error": crate::browser::BROWSER_OFF_MSG })),
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
+/// 安卓能力闸（2026-11-22）：「安卓」插件停用时 `/api/android/*` 一律 403。
+/// 与浏览器同款：中间件拦，新加端点自动收编，不给「开关拨了能力还在」留缝。
+async fn guard_android_plugin(req: Request, next: Next) -> Response {
+    if req.uri().path().starts_with("/api/android/") && !crate::android::capability_on() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": crate::android::ANDROID_OFF_MSG })),
         )
             .into_response();
     }

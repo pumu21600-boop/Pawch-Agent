@@ -11,6 +11,10 @@
     --bg: #151412; --fg: #f3f1ec; --dim: #8a8478; --line: #332f2a; --line2: #454039;
     --card: #1c1a18; --input-bg: #1c1a18; --hover: #262320; --on: #332f2a;
     --link: #6ea8fe; --ok: #4bb543; --err: #e5534b; --warn: #e8a33d;
+    /* 选中/主按钮口径随宿主（2026-11-24）：默认文字高亮=透明底+橙字+描边；
+       宿主切「背景高亮」时由 html.sel-bg 换回浅底+普通文字（见下） */
+    --sel-fg: #c49c8d; --sel-bg: transparent;
+    --sel-line: color-mix(in srgb, #c49c8d 50%, transparent);
     color-scheme: dark;
   }
   /* 根元素也跟随主题：画布 color-scheme/兜底底色只认 html（body 被微调成透明时深色画布会露底） */
@@ -20,7 +24,17 @@
     --bg: #fffefc; --fg: #1f1d1a; --dim: #87827a; --line: #e7e2da; --line2: #d9d3c9;
     --card: #f9f5ef; --input-bg: #fffefc; --hover: #f3f0eb; --on: #efe8df;
     --link: #a46851; --ok: #1e7a3f; --err: #b3261e; --warn: #b25e09;
+    --sel-fg: #a46851;
+    --sel-line: color-mix(in srgb, #a46851 50%, transparent);
     color-scheme: light;
+  }
+  /* 底色口径（宿主「背景高亮」）：选中块与主按钮铺浅底、文字回普通色。
+     用 html.sel-bg body 而不是 html 上直接 var(--fg)：自定义属性在声明处解析，
+     html 上没有 --fg 会变成无效值（自引用坑同 trace 旧注释）。 */
+  html.sel-bg body {
+    --sel-fg: var(--fg);
+    --sel-bg: var(--on);
+    --sel-line: var(--line2);
   }
   * { box-sizing: border-box; }
   body {
@@ -57,7 +71,7 @@
   .bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
   .seg { display: inline-flex; border: 1px solid var(--line2); border-radius: 7px; overflow: hidden; }
   .seg button { border: 0; border-radius: 0; padding: 4px 12px; }
-  .seg button.on { background: var(--on); font-weight: 650; }
+  .seg button.on { background: var(--sel-bg); color: var(--sel-fg); font-weight: 650; }
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
   th, td { padding: 5px 6px; border-bottom: 1px solid var(--line); text-align: right; }
   th { color: var(--dim); font-weight: 600; white-space: nowrap; }
@@ -72,7 +86,7 @@
     border: 1px solid var(--line2); background: transparent; color: var(--fg);
   }
   button:hover { background: var(--hover); }
-  .primary { background: var(--on); font-weight: 650; }
+  .primary { background: var(--sel-bg); color: var(--sel-fg); border-color: var(--sel-line); font-weight: 650; }
   .foot { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--line); display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   .msg { font-size: 12px; }
   .foot .life { font-size: 12px; color: var(--dim); margin-left: auto; font-variant-numeric: tabular-nums; }
@@ -112,7 +126,9 @@
   .picker .pk-caret { width: 12px; height: 12px; flex: none; color: var(--dim); }
   .pk-menu {
     position: fixed; z-index: 99999; min-width: 200px; max-width: 320px; max-height: 320px; overflow-y: auto;
-    background: var(--card); border: 1px solid var(--line2); border-radius: 9px; padding: 4px;
+    /* 和宿主下拉同款透明度（92% 玻璃）：面板是 iframe，底下透出的是统计页本身 */
+    background: color-mix(in srgb, var(--card) 92%, transparent);
+    border: 1px solid var(--line2); border-radius: 9px; padding: 4px;
     box-shadow: 0 10px 26px rgb(0 0 0 / 45%);
     /* 面板是 iframe：滚到尽头别把滚动接力给外层，滚动条常显免得用户以为只有这几项 */
     overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: var(--line2) transparent;
@@ -202,6 +218,8 @@ window.addEventListener('message', (ev) => {
     // 主题跟着宿主；boot 只跑一次——重复 init 再 load 会叠加轮询、还会冲掉没保存的新行
     document.documentElement.classList.toggle('light', ((d.payload || {}).theme) === 'light'); // 画布跟主题（只认根元素）
     document.body.classList.toggle('light', ((d.payload || {}).theme) === 'light');
+    // 选中口径跟随宿主（hl=文字高亮 / bg=背景高亮），换口径宿主会重发 init
+    document.documentElement.classList.toggle('sel-bg', ((d.payload || {}).selStyle) === 'bg');
     if (!booted) { booted = true; boot(); }
   }
   if (d.type === 'pawch:response') {

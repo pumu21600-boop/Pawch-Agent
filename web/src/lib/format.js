@@ -61,6 +61,18 @@ export function gitStatusLabel(s) {
   return c || '改动';
 }
 
+/// git 面板逐行「提交归属」标签：当前未提交 > stash > 最近回滚 > 已提交 > 未跟踪。
+/// 判定只看 /api/git/overview 的当前脏集合与 /api/changes 的 tracked（是否已进 HEAD）——
+/// 任务档的 '?' 只代表「不在影子基线里」，文件可能已经在真仓库提交了，也可能是被
+/// ignore 的产物（2026-11-23 真机实锤：android/ 未跟踪目录里的源码被误标已提交）。
+export function ownBadge(tracked, path, dirtySet, stashSet, rollbackSet) {
+  if (dirtySet && dirtySet.has(path)) return '未提交';
+  if (stashSet && stashSet.has(path)) return 'stash';
+  if (rollbackSet && rollbackSet.has(path)) return '回滚';
+  if (tracked) return '已提交';
+  return '未跟踪';
+}
+
 export function webNormalizeUrl(u) {
   const s = (u || '').trim();
   if (!s) return '';

@@ -104,6 +104,11 @@ pub(crate) fn is_noise_path(p: &str) -> bool {
         if NOISE_SEGMENTS.contains(&seg) {
             return true;
         }
+        // 工具链安装目录（SDK/JDK/cmdline-tools…）：装一次上万文件，既不是交付产物，
+        // 也不该占账本上限（2026-11-21 实机：1.1 万 SDK 文件把 87 个源码挤出账本）
+        if crate::recovery::is_toolchain_dir(seg) {
+            return true;
+        }
         // Python 包装元数据目录（xxx-1.0.dist-info / xxx.egg-info）
         if seg.ends_with(".dist-info") || seg.ends_with(".egg-info") {
             return true;
@@ -187,13 +192,15 @@ fn merge(logs_root: &Path, session: &str, ws: &Path, paths: Vec<String>, backfil
             updated_ms: 0,
         };
     }
+    let mut added: Vec<String> = Vec::new();
     for p in paths {
         let p = p.replace('\\', "/");
         // 新增路径过噪声过滤：正常记账走 paths_from_changed 已滤过，检查点回溯
         // （session_changed_paths）不经过它，必须在这里再滤一道（11-14 venv 洪水
         // 就是走回溯路径涌入的）
         if safe_rel_path(&p) && !is_noise_path(&p) && !ledger.paths.iter().any(|x| x == &p) {
-            ledger.paths.push(p);
+            ledger.paths.push(p.clone());
+            added.push(p);
         }
     }
     // 存量自愈：老账本里已经躺着的噪声路径，趁重写一次性清掉
@@ -205,10 +212,31 @@ fn merge(logs_root: &Path, session: &str, ws: &Path, paths: Vec<String>, backfil
             serde_json::json!({ "kind": "artifacts.noise_dropped", "session": session, "count": before - ledger.paths.len() }),
         );
     }
-    // 上限：只留最近记录的（新路径在尾部）
+    // 上限：正常增量记账按 LRU（丢最老的）；但**一次大批量新增**不能把账本里已有的
+    // 真产物整批挤掉。2026-11-21 实锤：一次任务装 Android SDK，1.1 万个工具链文件
+    // 一次 merge 进来，drain(0..) 把前面记下的 87 个 app 源码全冲走了。
+    // 大批次（超过容量一半）= 大概率是安装/解压，从这批自己的尾部裁，旧条目不动；
+    // 小批次照旧 LRU，保证正常产物能进账本。
     if ledger.paths.len() > MAX_PATHS {
-        let drop_n = ledger.paths.len() - MAX_PATHS;
-        ledger.paths.drain(0..drop_n);
+        let overflow = ledger.paths.len() - MAX_PATHS;
+        let added_set: std::collections::HashSet<&str> = added.iter().map(String::as_str).collect();
+        let first_new = ledger
+            .paths
+            .iter()
+            .position(|p| added_set.contains(p.as_str()))
+            .unwrap_or(ledger.paths.len());
+        let new_count = ledger.paths.len() - first_new;
+        if new_count > MAX_PATHS / 2 {
+            let drop_new = overflow.min(new_count);
+            let len = ledger.paths.len();
+            ledger.paths.drain(len - drop_new..len);
+            let still = ledger.paths.len().saturating_sub(MAX_PATHS);
+            if still > 0 {
+                ledger.paths.drain(0..still);
+            }
+        } else {
+            ledger.paths.drain(0..overflow);
+        }
     }
     if backfilled {
         ledger.backfilled = true;
@@ -344,6 +372,8 @@ mod tests {
             status,
             adds: 1,
             dels: 0,
+            tracked: true,
+            base: None,
         };
         let files = vec![
             mk("fresh.txt", 'M'),
@@ -368,6 +398,10 @@ mod tests {
         assert!(is_noise_path("a/b/__pycache__/m.cpython-313.pyc"));
         assert!(is_noise_path("pkg/deepseek-1.2.dist-info/METADATA"));
         assert!(is_noise_path("libs/thing.egg-info/PKG-INFO"));
+        // 工具链安装目录（2026-11-21）：SDK/JDK 落进工作区时不能进账本
+        assert!(is_noise_path("tools/sdk/platforms/android-34/data/res/x.png"));
+        assert!(is_noise_path("tools/jdk-17.0.21/bin/java.exe"));
+        assert!(is_noise_path("cmdline-tools/latest/bin/sdkmanager.bat"));
         assert!(!is_noise_path("运营方案.md"));
         assert!(!is_noise_path("src/main.rs"), "正常源码不能误伤");
 
@@ -419,6 +453,43 @@ mod tests {
         assert!(read_in(&root, "sess-3").is_some());
         clear_in(&root, "sess-3");
         assert!(read_in(&root, "sess-3").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// 大批量新增（安装/解压洪水）不能把已有真产物挤掉（2026-11-21 真机实锤：
+    /// 1.1 万个 SDK 文件把 87 个 app 源码冲出了账本）。
+    #[test]
+    fn huge_batch_does_not_evict_existing_artifacts() {
+        let root = tmproot("cap-huge");
+        let ws = plain_ws("cap-huge-ws");
+        let real: Vec<String> = (0..80).map(|i| format!("android/src/M{i}.java")).collect();
+        record_in(&root, "sess-cap", &ws, real.clone()).unwrap();
+        // 用非噪声路径模拟「一次大批量新增」——工具链目录现在会被 is_noise_path 直接
+        // 滤掉，这里测的是上限裁剪策略本身。
+        let flood: Vec<String> = (0..6000).map(|i| format!("vendor/pkg/f{i}.dat")).collect();
+        record_in(&root, "sess-cap", &ws, flood).unwrap();
+        let l = read_in(&root, "sess-cap").unwrap();
+        assert_eq!(l.paths.len(), MAX_PATHS);
+        for p in &real {
+            assert!(l.paths.iter().any(|x| x == p), "真产物被挤掉了: {p}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// 正常小批量仍按 LRU 淘汰最老的（上限语义不变）。
+    #[test]
+    fn small_batch_still_lru() {
+        let root = tmproot("cap-small");
+        let ws = plain_ws("cap-small-ws");
+        let old: Vec<String> = (0..MAX_PATHS).map(|i| format!("old/f{i}.txt")).collect();
+        record_in(&root, "sess-lru", &ws, old).unwrap();
+        record_in(&root, "sess-lru", &ws, vec!["new/a.txt".into()]).unwrap();
+        let l = read_in(&root, "sess-lru").unwrap();
+        assert_eq!(l.paths.len(), MAX_PATHS);
+        assert!(l.paths.iter().any(|p| p == "new/a.txt"), "新条目照常进入");
+        assert!(!l.paths.iter().any(|p| p == "old/f0.txt"), "最老的被淘汰");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&ws);
     }

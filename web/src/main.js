@@ -58,6 +58,37 @@ window.addEventListener('unhandledrejection', (e) => {
   });
 });
 
+// 主线程卡顿哨兵（2026-11-23）：200ms 一跳，两跳间隔超过 600ms = 主线程被某个长
+// 任务占住——「任务跑着的时候点了没反应」类问题从此有硬数据可查（卡多久、什么档位）。
+// 后台标签页的定时器被浏览器节流成 ≥1s，不算卡顿：hidden 时只重置锚点不报警。
+let lastBeat = performance.now();
+let wasHidden = false; // 恢复可见的第一拍不计（后台节流留下的间隔不是卡顿）
+setInterval(() => {
+  const now = performance.now();
+  const gap = now - lastBeat;
+  lastBeat = now;
+  if (document.hidden) {
+    wasHidden = true;
+    return;
+  }
+  if (wasHidden) {
+    wasHidden = false;
+    return;
+  }
+  if (gap < 600) return;
+  const bucket = gap < 1200 ? '0.6-1.2s' : gap < 3000 ? '1.2-3s' : gap < 8000 ? '3-8s' : '>8s';
+  reportClientError({
+    kind: 'main-stall',
+    level: 'warn',
+    message: `主线程卡顿 ~${Math.round(gap)}ms（${bucket}）`,
+    stack: '',
+    file: 'main.js 主线程哨兵',
+    line: 0,
+    col: 0,
+    url: location.href,
+  });
+}, 200);
+
 // Svelte 5 入口：mount() 取代 Svelte 4 的 new App()（034 迁移轮）。
 // 组件仍按 legacy 语法编译（无 runes），行为不变。
 const app = mount(App, { target: document.getElementById('app') });

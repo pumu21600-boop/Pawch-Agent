@@ -7,8 +7,9 @@
   // 样式：本轮聊天样式留在 App 以 :global 命中本组件（类名全 app 唯一），后续轮机械下沉。
   import { createEventDispatcher } from 'svelte';
   import { md, highlightText } from '../md.js';
-  import { fmtDurCn, messageParts, buildMessageBlocks, completedHasProcess, processSummary, processIsLive, toolMeta, parseArgs, prettyArgs, userMsgHtml } from '../chat.js';
+  import { fmtDurCn, messageParts, buildMessageBlocks, completedHasProcess, processSummary, processIsLive, toolMeta, parseArgs, prettyArgs, userMsgHtml, finalAnswerText } from '../chat.js';
   import { riskLabelFor } from '../format.js';
+  import MsgCopyButton from './MsgCopyButton.svelte';
   const dispatch = createEventDispatcher();
 
   export let messageChunks = [];
@@ -262,10 +263,11 @@
                 <div class="user-text">{@html userMsgHtml(m.content)}</div>
               {/if}
               {#if m.convs && m.convs.length}
-                <!-- 引用对话只在气泡上挂 chip（正文发送时已整块拼给模型，不上屏刷屏） -->
+                <!-- 引用只在气泡上挂 chip（正文发送时已整块拼给模型，不上屏刷屏）：
+                     kind='quote' 是引用某条回答，其余是引用整个对话 -->
                 <div class="msg-convs">
                   {#each m.convs as cv}
-                    <span class="conv-tag" title={`已把对话「${cv.title}」作为上下文发给模型`}>对话 · {cv.title}</span>
+                    <span class="conv-tag" title={cv.kind === 'quote' ? '已把这条回答作为引用附在消息里' : `已把对话「${cv.title}」作为上下文发给模型`}>{cv.kind === 'quote' ? '回答' : '对话'} · {cv.title}</span>
                   {/each}
                 </div>
               {/if}
@@ -284,6 +286,9 @@
               <div class="msg-meta user-meta">
                 {#if m.ts}<span class="msg-ts">{fmtTs(m.ts)}</span>{/if}
                 <span class="msg-acts" on:click|stopPropagation>
+                  {#if m.content}
+                    <MsgCopyButton text={m.content} label="复制这条消息" />
+                  {/if}
                   <button class="msg-act" title="回滚：文件恢复到这条消息之前，并删掉这条和它之后的所有消息" aria-label="回滚" on:click|stopPropagation={() => dispatch('rollback', m)}>
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/></svg>
                   </button>
@@ -296,7 +301,7 @@
                   <button class="msg-act" title="删除这条消息（同一问答的另一半保留；不可恢复）" aria-label="删除" on:click|stopPropagation={() => dispatch('delete', m)}>
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
                   </button>
-                  <button class="msg-act" title="多选消息：批量删除或生成上下文摘录" aria-label="多选" on:click|stopPropagation={() => dispatch('enterselect')}>
+                  <button class="msg-act" title="多选消息：批量删除" aria-label="多选" on:click|stopPropagation={() => dispatch('enterselect')}>
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><path d="M14 6.5h7"/><path d="M14 17.5h7"/></svg>
                   </button>
                 </span>
@@ -308,6 +313,7 @@
           {/if}
         {:else if m.role === 'assistant'}
           {@const shots = shotsFromParts(messageParts(m))}
+          {@const answer = finalAnswerText(m)}
           <div class="msg assistant" data-mid={m.id} class:selecting={msgSelectMode} on:click={() => dispatch('selectrow', m)}>
             {#if msgSelectMode && !m.streaming}
               <span class="msg-check" title="选中这条回复">
@@ -432,6 +438,13 @@
                                     <span class="tool-subject" title={tm.subject}>{tm.subject}</span>
                                   {/if}
                                 {/if}
+                                {#if it.adds !== null && it.adds !== undefined}
+                                  <!-- 本次改动增删行数（write_file/edit_file 结果前缀解析而来） -->
+                                  <span class="tool-diff">
+                                    <span class="tool-diff-add">+{it.adds}</span>
+                                    <span class="tool-diff-del">-{it.dels}</span>
+                                  </span>
+                                {/if}
                                 <span class="tool-status {it.status}">
                                   {#if it.status === 'running'}<span class="tool-spin"></span>
                                   {:else if it.status === 'ok'}<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>
@@ -513,16 +526,26 @@
                 <div class="typing"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></div>
               {/if}
             </div>
-            {#if m.ts || (m.stats && !m.streaming)}
+            {#if m.ts || (!m.streaming && (m.stats || answer))}
             <div class="msg-meta">
               {#if m.ts}<span class="msg-ts">{fmtTs(m.ts)}</span>{/if}
-              {#if m.stats && !m.streaming}
-                <!-- 信息卡入口：首 token 延迟/输出耗时/渠道/模型/tokens/缓存命中。
-                     放回答下方右下角 -->
+              {#if (!m.streaming && !msgSelectMode && answer) || (m.stats && !m.streaming)}
+                <!-- 回答操作：复制 / 引用这条回答 / 详细信息（复制与引用只对收尾态出现，
+                     流式期间文本还在变；多选态让位给勾选） -->
                 <span class="msg-acts" on:click|stopPropagation>
-                  <button class="msg-act" title="这条回复的详细信息" aria-label="回答详情" on:click|stopPropagation={() => dispatch('stats', m)}>
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><path d="M12 8h.01"/></svg>
-                  </button>
+                  {#if !m.streaming && !msgSelectMode && answer}
+                    <MsgCopyButton text={answer} label="复制这条回答" />
+                    <button class="msg-act" title="引用这条回答：附到输入区，随下一条消息一起带给模型" aria-label="引用" on:click|stopPropagation={() => dispatch('quote', m)}>
+                      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M6.5 5.5C4.6 5.5 3 7.1 3 9c0 1.9 1.6 3.5 3.5 3.5.3 0 .6 0 .9-.1-.6 1.9-2 3.3-3.9 3.9l.6 1.8c3.4-1.1 5.6-4 5.6-7.6V9c0-1.9-1.6-3.5-3.5-3.5Z"/><path d="M17.5 5.5C15.6 5.5 14 7.1 14 9s1.6 3.5 3.5 3.5c.3 0 .6 0 .9-.1-.6 1.9-2 3.3-3.9 3.9l.6 1.8c3.4-1.1 5.6-4 5.6-7.6V9c0-1.9-1.6-3.5-3.5-3.5Z"/></svg>
+                    </button>
+                  {/if}
+                  {#if m.stats && !m.streaming}
+                    <!-- 信息卡入口：首 token 延迟/输出耗时/渠道/模型/tokens/缓存命中。
+                         放回答下方右下角 -->
+                    <button class="msg-act" title="这条回复的详细信息" aria-label="回答详情" on:click|stopPropagation={() => dispatch('stats', m)}>
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><path d="M12 8h.01"/></svg>
+                    </button>
+                  {/if}
                 </span>
               {/if}
             </div>
