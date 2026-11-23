@@ -93,11 +93,11 @@
 
 ## 界面预览
 
-![聊天与内置浏览器](docs/assets/ui-chat.jpg)
+![聊天与内置浏览器](docs/assets/ui-chat-v2.jpg)
 
-![记忆库星图](docs/assets/ui-galaxy.jpg)
+![记忆库星图](docs/assets/ui-galaxy-v2.jpg)
 
-![用量台账](docs/assets/ui-usage.png)
+![用量台账](docs/assets/ui-usage-v2.png)
 
 ---
 
