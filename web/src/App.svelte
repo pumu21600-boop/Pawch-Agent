@@ -100,6 +100,7 @@
   let settingsOpen = false;
   let autoSaveTimer = null;
   let pendingSave = null; // autoSave 挂起的字段（切换配置前 flush 用）
+  let inFlightSave = null; // 正在 PUT 的字段：页面卸载时 beacon 补一发，防导航打断（2026-11-24）
   let approvalMode = (() => {
     // 三档（2026-10-03 并三档：sandbox 档取消，旧值迁移 read-only）；旧档名自动迁移
     const map = { suggest: 'read-only', sandbox: 'read-only', 'auto-edit': 'auto', 'full-auto': 'auto', local: 'full-access' };
@@ -679,6 +680,8 @@
     document.addEventListener('keydown', thinkHotkey);
     // 刷新/关页前把正在跑的会话快照进 sessionStorage（重载后由 loadSession 兜回来）
     window.addEventListener('beforeunload', stashLiveState);
+    // 设置字段的防抖尾巴别被一次刷新吃掉（beacon 兜底）
+    window.addEventListener('pagehide', flushPendingSaveOnHide);
     // 输入框上方 dock（审批/提问/任务清单）长高时，聊天区底部留白跟着长：
     // footer 是绝对定位浮层，固定 170px 留白会让展开的清单盖住最后几条消息。
     let dockRo = null;
@@ -710,6 +713,7 @@
       document.removeEventListener('click', closeMenusOnOutside);
       document.removeEventListener('keydown', thinkHotkey);
       window.removeEventListener('beforeunload', stashLiveState);
+      window.removeEventListener('pagehide', flushPendingSaveOnHide);
     };
   });
 
@@ -1506,6 +1510,7 @@
   }
 
   async function sendSettings(body) {
+    inFlightSave = body;
     try {
       const r = await fetch('/api/settings', {
         method: 'PUT',
@@ -1524,7 +1529,31 @@
     } catch (e) {
       settingsMsg = `保存失败: ${e}`;
       return false;
+    } finally {
+      inFlightSave = null;
     }
+  }
+
+  // 刷新/关窗兜底：防抖未到点的字段、正在 PUT 的请求都再送一发 keepalive fetch。
+  // 普通 fetch 会被导航直接打断（改完马上点「重新加载界面」就是这一下丢的）；
+  // keepalive 由浏览器在页面卸载后继续送达，支持 PUT + JSON + 同源 cookie
+  // （sendBeacon 只发 POST，这个端点是 PUT，实测 405——2026-11-24 同类排查）。
+  function flushPendingSaveOnHide() {
+    const typedKey = apiKey.trim();
+    const base = pendingSave || inFlightSave;
+    if (!base && !typedKey) return;
+    const body = { ...(base || {}) };
+    if (typedKey) body.api_key = typedKey;
+    pendingSave = null;
+    clearTimeout(autoSaveTimer);
+    try {
+      fetch('/api/settings', {
+        method: 'PUT',
+        keepalive: true,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }).catch(() => {});
+    } catch {}
   }
 
   async function clearKey() {

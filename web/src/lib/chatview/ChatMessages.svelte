@@ -108,12 +108,31 @@
 
     // 调用方在收尾态取最后一张摊开，中途一律不摊；要看中间的走工具行点主语开侧栏预览。
   // 只认工作区图片，别的链接不放。
-  function shotsFromParts(parts) {
+  // 回答正文里已经用 markdown 展示过的同一张图不再自动铺一遍（2026-11-24 用户实测：
+  // 回答里嵌了截图，收尾又补了最后一张，同图在气泡里出现两次）。
+  function embeddedShotUrls(m) {
+    const urls = new Set();
+    const re = /!\[[^\]]*\]\((\/api\/workspace\/[^)\s]+)\)/g;
+    for (const hit of String(finalAnswerText(m) || '').matchAll(re)) {
+      urls.add(hit[1]);
+      try {
+        urls.add(decodeURIComponent(hit[1]));
+      } catch {}
+    }
+    return urls;
+  }
+  function shotsFromParts(parts, embedded = new Set()) {
     const out = [];
     for (const p of parts || []) {
       if (p.type !== 'tool' || !p.preview || !p.preview.includes('/api/workspace/')) continue;
       const m = /!\[[^\]]*\]\((\/api\/workspace\/[^)\s]+)\)/.exec(p.preview);
-      if (m && !out.includes(m[1])) out.push(m[1]);
+      if (!m) continue;
+      let decoded = m[1];
+      try {
+        decoded = decodeURIComponent(m[1]);
+      } catch {}
+      if (embedded.has(m[1]) || embedded.has(decoded)) continue; // 正文已经展示了这张
+      if (!out.includes(m[1])) out.push(m[1]);
     }
     return out;
   }
@@ -312,7 +331,7 @@
           </div>
           {/if}
         {:else if m.role === 'assistant'}
-          {@const shots = shotsFromParts(messageParts(m))}
+          {@const shots = shotsFromParts(messageParts(m), embeddedShotUrls(m))}
           {@const answer = finalAnswerText(m)}
           <div class="msg assistant" data-mid={m.id} class:selecting={msgSelectMode} on:click={() => dispatch('selectrow', m)}>
             {#if msgSelectMode && !m.streaming}

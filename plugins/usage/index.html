@@ -444,9 +444,9 @@ function drawRows() {
         <span class="pk-label">${esc(pickerLabel(r))}</span>
         <svg class="pk-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
       </button></td>
-      <td><input type="number" step="0.0001" min="0" value="${toDisplay(r.prompt)}" onchange="setP(${i}, 'prompt', this.value)" /></td>
-      <td><input type="number" step="0.0001" min="0" value="${toDisplay(r.cached)}" onchange="setP(${i}, 'cached', this.value)" /></td>
-      <td><input type="number" step="0.0001" min="0" value="${toDisplay(r.completion)}" onchange="setP(${i}, 'completion', this.value)" /></td>
+      <td><input type="number" step="0.0001" min="0" value="${toDisplay(r.prompt)}" oninput="setP(${i}, 'prompt', this.value)" /></td>
+      <td><input type="number" step="0.0001" min="0" value="${toDisplay(r.cached)}" oninput="setP(${i}, 'cached', this.value)" /></td>
+      <td><input type="number" step="0.0001" min="0" value="${toDisplay(r.completion)}" oninput="setP(${i}, 'completion', this.value)" /></td>
       <td><button title="删除这一行" onclick="delRow(${i})">×</button></td>
     </tr>`).join('');
   if (keep && keep.col >= 0) {
@@ -539,21 +539,53 @@ function delRow(i) { rows.splice(i, 1); drawRows(); }
 function setP(i, k, v) { rows[i][k] = toUsd(v); }
 
 async function save() {
-  const bad = rows.find((r) => !r.provider.trim() || !r.model.trim());
+  // 以输入框里的值为准：onchange 依赖失焦，少数操作序列下 rows 还是旧值，
+  // 保存就等于把旧价再写一遍——刷新后看起来像「设置没生效」（2026-11-24 用户报）。
+  syncInputsFromDom();
+  const sent = rows.map((r) => ({ provider: r.provider.trim(), model: r.model.trim(), prompt: r.prompt, cached: r.cached, completion: r.completion }));
+  const bad = sent.find((r) => !r.provider || !r.model);
   if (bad) { say('有行的渠道或模型 id 是空的——补上或删掉该行', false); return; }
   try {
     const r = await req('usage.prices.save', {
-      prices: rows.map((r) => ({ provider: r.provider.trim(), model: r.model.trim(), prompt: r.prompt, cached: r.cached, completion: r.completion })),
+      prices: sent,
       currency: 'CNY',
       usd_cny_rate: 1,
     });
-    say(r.recomputed ? `已保存，历史 ${r.recomputed.records} 条已按新价重算（仍有 ${r.recomputed.unpriced} 条未匹配到价格）` : '已保存', true);
+    // 读回核对：服务端回的同形价格若与提交的不一致，宁可报错也不要谎报「已保存」
+    const echoed = Array.isArray(r.prices) ? r.prices : [];
+    const mismatch = echoed.length !== sent.length || sent.some((row, i) => !samePrice(row, echoed[i]));
     await loadPrices();
     await refreshUsage();
     await refreshModels();
+    if (mismatch) {
+      say('保存后读回的价格与提交的不一致：服务端可能没有写入，请重试；反复出现请重启服务', false);
+      return;
+    }
+    say(r.recomputed ? `已保存，历史 ${r.recomputed.records} 条已按新价重算（仍有 ${r.recomputed.unpriced} 条未匹配到价格）` : '已保存', true);
   } catch (e) {
     say(String(e.message || e), false);
   }
+}
+
+/// 保存前把三列数字输入框的当前值同步回 rows（见 save 的注释）
+function syncInputsFromDom() {
+  [...document.querySelectorAll('#rows tr')].forEach((tr, i) => {
+    const r = rows[i];
+    if (!r) return;
+    const ins = tr.querySelectorAll('input[type=number]');
+    if (ins[0]) r.prompt = toUsd(ins[0].value);
+    if (ins[1]) r.cached = toUsd(ins[1].value);
+    if (ins[2]) r.completion = toUsd(ins[2].value);
+  });
+}
+
+function samePrice(a, b) {
+  return !!a && !!b
+    && a.provider === b.provider
+    && a.model === b.model
+    && Math.abs((a.prompt || 0) - (b.prompt || 0)) < 1e-9
+    && Math.abs((a.cached || 0) - (b.cached || 0)) < 1e-9
+    && Math.abs((a.completion || 0) - (b.completion || 0)) < 1e-9;
 }
 
 </script>
